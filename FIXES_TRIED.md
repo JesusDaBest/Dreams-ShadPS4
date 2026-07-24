@@ -1,0 +1,133 @@
+# Fixes Tried
+
+## Real Fixes or High-Value Progress
+
+### 1. Dreams crash-draw interception
+- Added Dreams-specific handling for the recurring crash-draw path at `0x300400000`
+- This was one of the first changes that turned the problem from an instant wall into something debuggable
+
+### 2. Same-buffer synthetic flips
+- Added a Dreams-specific same-buffer synthetic flip path
+- This helped Dreams move past early present starvation instead of stopping after the first few real flips
+
+### 3. Better bootstrap behavior
+- The bootstrap nudging logic was adjusted so Dreams can more reliably reach later startup stages and `flip_snapshot gen=4`
+
+### 4. Host flip-snapshot presenter override
+- Wired the existing Dreams flip-snapshot host-frame path into the real VideoOut flow
+- This means the main presentation path can now use the captured Dreams snapshot directly instead of always depending on the fragile guest image path
+
+### 5. CPU-only synthetic bootstrap completion
+- Converted the dangerous later bootstrap submit into a CPU-only completion path once the flip snapshot generation is established
+- This removed the old crash around the synthetic `flip_arg=4` handoff and allowed automated runs to stay alive much longer
+
+### 6. Post-intro stage identification
+- Confirmed the later-stage render target `0x302ef0000`
+- This was a major milestone because it proved Dreams was progressing beyond the older intro bottleneck
+
+### 7. Post-EOF `GfxEOP` suppression
+- Added Dreams-specific suppression for post-EOF `GfxEOP` timeout wakes
+- This matters because reintroducing those wakes repeatedly pushed Dreams back into the old bad late-tail route
+
+### 8. Post-EOF 10-bit tail dispatch disable
+- Disabled the special path that was still re-allowing the dangerous post-EOF 10-bit tail dispatch
+- This was the first step that produced a clean non-crashing timeout run on Friday, July 24, 2026
+
+### 9. Blank tracked 10-bit EOF detection
+- Added a narrow EOF-only check for whether the tracked 10-bit source is actually blank
+- This avoided the earlier too-broad probe that disturbed pre-EOF timing
+
+### 10. EOF AV snapshot fallback
+- When the tracked 10-bit EOF source is blank, the presenter can now prefer the Dreams AV snapshot host frame
+- This proved that the emulator does have usable AV host-frame content even when the tracked guest source stays black
+
+### 11. Disable post-EOF same-buffer keepalive submissions
+- The same-buffer monitor used to keep issuing post-EOF synthetic keepalive submissions
+- That repeatedly reopened the bad `0x85f67046` -> `0xff751373` -> access-violation path
+- Disabling that post-EOF keepalive path produced the current best stable baseline:
+  - `2026-07-23_190421_2026-07-24_eof_guest_buffer_probe`
+
+### 12. Status-only acknowledgment for skipped post-EOF submit-and-flip
+- Dreams-specific post-EOF submit-and-flip skipping is now acknowledged through VideoOut status bookkeeping instead of the older patched-submit probe
+- This preserves the no-crash baseline more reliably than trying to fake more GPU-side progress at that point
+
+### 13. EOF current-buffer blank probe
+- Added an EOF-only probe for the active current 10-bit buffer in addition to the tracked source probe
+- This confirmed that the main alternate EOF candidate at `0x300400000` is also blank during stable runs
+- That matters because it rules out the simpler theory that the presenter was just choosing the wrong already-rendered 10-bit guest surface
+
+### 14. Pre-AV CPU-only bootstrap extension
+- The same-buffer bootstrap path used to switch away from CPU-only synthetic completion as soon as tracked source capture appeared
+- Extending the CPU-only path through the whole pre-AV bootstrap window produced a new Friday, July 24, 2026 full-timeout archive:
+  - `2026-07-23_192254_2026-07-24_preav_cpu_only_bootstrap_probe`
+- That run still ended in the same known EOF idle overlay loop, but it avoided the old early flip-8/9 crash fork on that attempt
+
+## High-Value Failed or Incomplete Experiments
+
+### Forced EOF transition
+- Forcing Dreams video EOF did move execution into the later `0x302ef0000` stage
+- That was useful evidence
+- It also caused device loss when used too crudely
+
+### Main presenter redraw/current-buffer refresh attempts
+- Several attempts to force main-window redraw/update after recovery reintroduced Vulkan device loss
+- These experiments were useful because they showed the issue is not solved by simply refreshing harder
+
+### CPU-only post-intro fallback variants
+- CPU-only fallback changes were tested to see whether GPU copy work was the real submit killer
+- Those tests did not fully remove the device-loss path
+
+### Narrow draw/dispatch skips around the post-intro batch
+- Multiple increasingly tight skip rules were used to binary-search the failing batch
+- These reduced uncertainty, but the final crash still survives, which means the remaining bad actor is earlier or broader than one obvious tail draw
+
+### Stable black-bootstrap branch
+- The latest branch no longer immediately crashes in the same spot
+- It currently stalls in a black-frame bootstrap loop with only three real flip snapshots and then repeated CPU-only synthetic completions
+- That is useful progress, but it is not a real rendering fix yet
+
+### EOF guest-flip reroute
+- Rerouting real EOF guest flips through the synthetic completion path made Dreams crash earlier
+- This was backed out and is now considered a known bad direction
+
+### Post-EOF wake budget / limited synthetic wake experiments
+- Reintroducing bounded wakeups after EOF looked tempting, but it repeatedly reopened the same late crash path
+- This was backed out in favor of strict suppression
+
+### Capped EOF synthetic submit-done behavior
+- Allowing a limited number of EOF synthetic submit-done completions also reopened the unstable route
+- This was removed
+
+### Broad blank-tracked-source probe
+- The first version of the blank 10-bit tracked-source check ran too early and disturbed pre-EOF timing
+- Narrowing it to EOF-only fixed that regression
+
+### Post-EOF same-buffer keepalive submissions
+- These were useful for proving Dreams wanted more visible progress after EOF
+- In practice they repeatedly fed the bad late-tail route and caused `0xC0000005` crashes
+- They are now disabled on the best current baseline
+
+### Late-tail tracked-takeover probe dispatch passthrough
+- A narrow Friday, July 24, 2026 probe temporarily re-allowed late tracked-takeover setup dispatches at high flip generations
+- This immediately reintroduced the guest-side `0xC0000005` crash without producing a nonblank EOF guest buffer
+- It is now considered a known-bad route
+
+### Post-EOF `0x853f753d` setup dispatch passthrough
+- A second narrow probe temporarily re-allowed the skipped `0x853f753d` `2x2x12` post-EOF setup dispatch
+- This also immediately reintroduced the guest-side `0xC0000005` crash without making the EOF guest buffers nonblank
+- It is now considered a known-bad route
+
+## What Was Learned From The Failed Experiments
+- The remaining blocker is real emulator GPU/presentation logic, not user setup confusion
+- The `0x302ef0000` stage is important, but it is not the only piece
+- Removing the synthetic-flip crash does not automatically restore real visible content
+- A blank tracked 10-bit EOF source does not mean Dreams produced nothing; AV host frames can still exist
+- A blank tracked 10-bit EOF source plus a blank active current EOF buffer means the missing content is not simply sitting in the obvious guest-present candidates
+- Reopening post-EOF guest-visible flip progress too aggressively is one of the easiest ways to reintroduce the crash
+- Switching the pre-AV bootstrap from CPU-only to GPU-visible synthetic progress too early may contribute to the old early flake/crash path
+
+## Current Most Useful Next Direction
+- Keep the new no-crash post-EOF baseline intact
+- Push the AV-backed EOF handoff into a real gameplay-rendering takeover instead of reintroducing post-EOF synthetic keepalive churn or narrow compute re-allow probes
+- Keep the extended pre-AV CPU-only bootstrap change while measuring whether it really reduces the early flip-8/9 crash frequency
+- Revisit the guarded `0x300400000` / crash-draw / late-tail cluster only from the stable Friday, July 24, 2026 baseline
