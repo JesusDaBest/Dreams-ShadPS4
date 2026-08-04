@@ -5,8 +5,9 @@ This repository tracks a live source-level investigation into getting `Dreams` (
 Current status:
 - `Not playable yet`
 - Intro-stage progress is real and repeatable
-- The best Friday, July 24, 2026 baseline can survive the full automated harness window without crashing, although reconfirm runs are still flaky
-- The current hard blocker is the post-intro / post-EOF handoff into real gameplay rendering
+- Audio and EOF AV host-frame presentation both work
+- As of Tuesday, August 4, 2026, the main blocker is the post-EOF compute handoff around `0x853f753d` -> `0xff751373`
+- The latest runs no longer fail at the old Sony-logo stage, but they still exit on the same guest-side read fault after the intro/EOF transition
 
 What is confirmed:
 - Dreams does boot and execute well past the very first logo path
@@ -15,6 +16,8 @@ What is confirmed:
 - Extending CPU-only synthetic bootstrap completion through the pre-AV tracked-source stage now looks like a real stability improvement
 - The real VideoOut path can now use Dreams AV host-frame presentation after EOF when the tracked 10-bit source is blank
 - The obvious EOF 10-bit guest-present candidates are both blank during the best stable runs, so the blocker is deeper than "wrong buffer chosen"
+- The post-EOF `0xff751373` tail shader can arrive with dummy buffers (`addr=0x1`) and dummy `1x1` images (`addr=0x0`)
+- The post-EOF `0x853f753d` setup shader still has dummy buffers, but it does bind a real storage image (`R32G32Uint`, `8x8x48`) before the crash
 - The remaining blocker is still emulator GPU/presentation logic, not "missing source code" or a simple config issue
 
 What this repo contains:

@@ -62,6 +62,25 @@
   - `2026-07-23_192254_2026-07-24_preav_cpu_only_bootstrap_probe`
 - That run still ended in the same known EOF idle overlay loop, but it avoided the old early flip-8/9 crash fork on that attempt
 
+### 15. EOF AV snapshot fallback refinement
+- The presenter fallback was tightened so EOF can prefer AV host frames when the tracked 10-bit source is present but blank
+- This is now confirmed in real runs through repeated:
+  - `Prepared Dreams AV host frame 1280x720 format=R8G8B8A8Unorm`
+  - `eof_av_snapshot`
+
+### 16. Disabled the old `0xff751373` custom shader-patch path
+- The old local patch path for `0xff751373` was forcing a minimal compute layout and skipping normal runtime descriptor binds
+- That path is now disabled in source so current crashes are observed against the real compiled shader path again
+
+### 17. EOF `GfxEOP` timeout bridge re-enabled through EOF
+- The Dreams-specific timeout bridge was allowed to keep fabricating/synthesizing `GfxEOP` progress after EOF instead of suppressing those wakes
+- This changed the late state from a pure post-EOF timeout starvation loop back into a real tail-compute execution path
+- That was useful because it exposed the current real tail-resource problem instead of only hiding it behind empty waits
+
+### 18. `0xff751373` null-descriptor EOF tail skip
+- A narrow skip was added for the exact post-EOF case where `0xff751373` reaches the tail with only dummy buffers and null `1x1` image bindings
+- This now works and shows up as a real `skip shader_a=0xff751373 dims=8x8x48` tail event instead of forcing the shader to run on obviously bad descriptors
+
 ## High-Value Failed or Incomplete Experiments
 
 ### Forced EOF transition
@@ -117,6 +136,20 @@
 - This also immediately reintroduced the guest-side `0xC0000005` crash without making the EOF guest buffers nonblank
 - It is now considered a known-bad route
 
+### Real `0xff751373` tail execution with dummy descriptors
+- Once the old custom shader-patch path was disabled and EOF `GfxEOP` timeout bridging was allowed through EOF, `0xff751373` executed on real pipeline state again
+- Diagnostics on Tuesday, August 4, 2026 showed:
+  - all three buffers effectively dummy at `addr=0x1`
+  - sampled/storage image bindings collapsed to null `1x1` images at `addr=0x0`
+- Letting that path execute is now considered a known-bad route
+
+### Skipping only `0xff751373` is not enough by itself
+- Even after the null-descriptor skip for `0xff751373`, the same guest-side read fault still occurs
+- The last tail then reduces back to:
+  - `dispatch-direct shader_a=0x853f753d dims=2x2x12`
+  - `skip shader_a=0xff751373 dims=8x8x48`
+- That means `0x853f753d` is still part of the remaining blocker
+
 ## What Was Learned From The Failed Experiments
 - The remaining blocker is real emulator GPU/presentation logic, not user setup confusion
 - The `0x302ef0000` stage is important, but it is not the only piece
@@ -125,6 +158,10 @@
 - A blank tracked 10-bit EOF source plus a blank active current EOF buffer means the missing content is not simply sitting in the obvious guest-present candidates
 - Reopening post-EOF guest-visible flip progress too aggressively is one of the easiest ways to reintroduce the crash
 - Switching the pre-AV bootstrap from CPU-only to GPU-visible synthetic progress too early may contribute to the old early flake/crash path
+- The post-EOF tail is not one single bad shader:
+  - `0xff751373` can clearly be wrong because it receives dummy/null descriptors
+  - but skipping only `0xff751373` still leaves the same final read fault
+- `0x853f753d` is now the next highest-value suspect because it still executes at the final tail with dummy buffers but a real storage image bound
 
 ## Current Most Useful Next Direction
 - Keep the new no-crash post-EOF baseline intact

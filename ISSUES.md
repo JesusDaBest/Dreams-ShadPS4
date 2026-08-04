@@ -5,6 +5,13 @@
 - The best branch can stay alive for the full automated harness window, but reconfirm runs are still flaky
 - The game still does not move from the intro/EOF handoff into a known-good playable gameplay scene
 
+## 1a. The post-EOF compute tail still has invalid descriptor state
+- As of Tuesday, August 4, 2026, `0xff751373` can reach the tail with:
+  - all three buffers effectively at `addr=0x1`
+  - null `1x1` image bindings at `addr=0x0`
+- `0x853f753d` also reaches the same tail with dummy buffers, although it still has a real storage image bound
+- This is currently the highest-value technical blocker inside the post-EOF handoff
+
 ## 2. The visible EOF 10-bit guest candidates are still blank
 - The current baseline repeatedly records `nonzero=0/256` on the tracked `0x2ffc00000` 10-bit EOF source
 - It also records `nonzero=0/256` on the active alternate current buffer `0x300400000`
@@ -18,11 +25,14 @@
 ## 4. Some Dreams-specific skip logic may still be too aggressive
 - The stable branch avoids the old late crash
 - It may also still be suppressing work that is needed for the post-intro takeover into real rendering
+- At the same time, allowing the wrong late tail work to execute immediately reopens the same crash
+- The remaining work needs to separate "bad null-descriptor tail work" from "real work we still need"
 
 ## 5. Reopening the old crash route is still easy if the wrong path is reintroduced
 - The bad route still comes back if post-EOF same-buffer keepalives, wake budgets, or related synthetic follow-up work are reintroduced
 - Narrow late-tail and `0x853f753d` post-EOF compute re-allow probes also reintroduce the bad route immediately
 - That makes the current stable baseline important to preserve while debugging the next stage
+- Letting the real `0xff751373` tail execute on its dummy/null descriptor set is now also a known-bad route
 
 ## 6. Early pre-AV launches are still flaky
 - Extending CPU-only bootstrap through the full pre-AV stage helped one Friday, July 24, 2026 harness run reach a clean timeout again
