@@ -54,6 +54,9 @@ git clone --branch dreams-dev --single-branch https://github.com/JesusDaBest/Dre
 The current source snapshot is commit `fc3d1b8a526dff7f9edc1c17f4fcc61f220ec954`. Using the branch
 is easier than manually applying the cumulative patch.
 
+This custom branch includes emulator-wide changes. Use a dedicated portable `user` folder and run
+the build only with Dreams; see [DEVELOPMENT.md](DEVELOPMENT.md#keep-other-games-isolated).
+
 ## Patch base
 
 The August 17 snapshot is a cumulative working-tree patch against upstream shadPS4 commit

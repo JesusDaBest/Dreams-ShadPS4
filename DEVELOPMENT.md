@@ -16,6 +16,24 @@ git switch -c my-dreams-work
 
 Then follow the normal shadPS4 build instructions included in that source tree.
 
+## Keep other games isolated
+
+The branch contains some emulator-wide changes, so it is not guaranteed to behave like official
+shadPS4 for games other than Dreams. Downloading or forking the source cannot affect existing games,
+but running the custom build can share saves, settings, trophies, and shader caches with another
+shadPS4 installation.
+
+For safe testing:
+
+1. Keep the Dreams build in its own folder and use it only for `CUSA04301`.
+2. Create an empty folder named `user` in that build's working directory.
+3. Start shadPS4 with that folder as its current working directory.
+4. Keep using an official or normal shadPS4 build for every other game.
+
+The local `user` folder makes shadPS4 keep this build's configuration, saves, trophies, logs, and
+caches separate. Developers must provide their own legal firmware and game setup inside that
+isolated environment.
+
 ## Starting point
 
 - Source branch: `dreams-dev`
