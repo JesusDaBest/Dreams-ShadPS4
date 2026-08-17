@@ -1,40 +1,46 @@
 # Open Issues
 
-## 1. Post-intro / post-EOF handoff still does not reach gameplay
-- Current hard blocker on the Friday, July 24, 2026 baseline
-- The best branch can stay alive for the full automated harness window, but reconfirm runs are still flaky
-- The game still does not move from the intro/EOF handoff into a known-good playable gameplay scene
+## 1. Scene records are not published
 
-## 1a. The post-EOF compute tail still has invalid descriptor state
-- As of Tuesday, August 4, 2026, `0xff751373` can reach the tail with:
-  - all three buffers effectively at `addr=0x1`
-  - null `1x1` image bindings at `addr=0x0`
-- `0x853f753d` also reaches the same tail with dummy buffers, although it still has a real storage image bound
-- This is currently the highest-value technical blocker inside the post-EOF handoff
+The current highest-priority blocker is the zero record count entering producer shader
+`0x2bfebd3c`. The queue and supporting buffers are empty, which leaves traversal indirect work at
+zero. Find the compute/CPU stage that should populate the SRT field at `+0x64` and establish whether
+the missing update is caused by a skipped dispatch, bad descriptor, unsupported shader operation,
+or synchronization error.
 
-## 2. The visible EOF 10-bit guest candidates are still blank
-- The current baseline repeatedly records `nonzero=0/256` on the tracked `0x2ffc00000` 10-bit EOF source
-- It also records `nonzero=0/256` on the active alternate current buffer `0x300400000`
-- That means the obvious guest-present surfaces still are not the real visible content source at EOF
+## 2. Intro video and audio still present at roughly 1-2 FPS
 
-## 3. AV host frames exist, but the handoff after them is still incomplete
-- The current baseline does prepare and present Dreams AV host frames after EOF
-- That is real progress
-- It still does not produce a clean transition into live gameplay rendering
+Removing explicit per-dispatch GPU waits eliminated one proven stall source but did not make the
+latest test smooth. The intro is now invisible while its audio is extremely delayed. This must be
+profiled independently from scene traversal because the slowdown happens before scene work exists.
 
-## 4. Some Dreams-specific skip logic may still be too aggressive
-- The stable branch avoids the old late crash
-- It may also still be suppressing work that is needed for the post-intro takeover into real rendering
-- At the same time, allowing the wrong late tail work to execute immediately reopens the same crash
-- The remaining work needs to separate "bad null-descriptor tail work" from "real work we still need"
+## 3. Indirect ordered traversal is not exact
 
-## 5. Reopening the old crash route is still easy if the wrong path is reintroduced
-- The bad route still comes back if post-EOF same-buffer keepalives, wake budgets, or related synthetic follow-up work are reintroduced
-- Narrow late-tail and `0x853f753d` post-EOF compute re-allow probes also reintroduce the bad route immediately
-- That makes the current stable baseline important to preserve while debugging the next stage
-- Letting the real `0xff751373` tail execute on its dummy/null descriptor set is now also a known-bad route
+Direct Dreams traversal can be split into ordered one-workgroup dispatches. Production indirect
+dispatch cannot use the same CPU dimension readback without catastrophic stalls, so it currently
+falls back to native `dispatchIndirect`. A GPU-only ordered scheme will be needed when traversal
+receives nonzero work.
 
-## 6. Early pre-AV launches are still flaky
-- Extending CPU-only bootstrap through the full pre-AV stage helped one Friday, July 24, 2026 harness run reach a clean timeout again
-- Some reconfirm launches can still fall back into the older early heap/device-loss route around the flip-8/9 handoff
-- That means pre-AV stability improved, but is not yet fully pinned down
+## 4. Startup-screen behavior has regressed between builds
+
+All three startup screens were visible in one known-good build, but the newest test no longer shows
+the intro. Avoid solving the scene queue by reintroducing blank-frame or AV presentation regressions.
+
+## 5. Tutorial bypass is only a test aid
+
+Progression flags can skip known tutorial requirements, but they do not create missing scene data.
+Do not mistake save editing for a rendering fix or ship a user save as part of the source patch.
+
+## 6. Online functionality is outside the current target
+
+The current target is a usable offline game. Community servers and historical Dreams content are
+not expected to work. Offline service stubs must still preserve the state transitions needed to
+enter the homespace and DreamShaping interfaces.
+
+## Historical issues to keep in regression coverage
+
+- Blank tracked and active 10-bit EOF surfaces
+- Invalid descriptors around `0x853f753d` and `0xff751373`
+- Post-EOF same-buffer keepalives reopening `0xC0000005`
+- Early flip/bootstrap device-loss paths
+- Repeated low-FPS Preferences warning loop

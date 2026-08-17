@@ -1,5 +1,54 @@
 # Fixes Tried
 
+## August 14-17 Main-Menu/Tutorial Branch
+
+### Confirmed progress
+
+- Reached the real Dreams intro, Continue, consent/EULA, and Preferences flow.
+- Entered tutorial logic and spawned a controllable imp.
+- Added real-time pacing for `/Mm-Dreams-logo.mp4`.
+- Reset AAC decoder state before reinitialization.
+- Restored scheduled blank-frame presentation for the startup pages.
+- Added narrow Dreams runtime guards for the repeated low-FPS Preferences warning at guest offset
+  `0x948810` and a scene gate at `0x9c44f7`.
+- Added offline NP, WebApi, presence, DNS, socket, and service-resolution compatibility needed to
+  move startup forward without live Dreams servers.
+- Added/fixed Dreams shader support for dynamic `S_SETPC`, control-flow masks, `mbcnt`, DS 64-bit
+  atomics, mixed runtime descriptors, metadata images, and unreachable CFG blocks.
+- Implemented `DS_ORDERED_COUNT` translation, counter tracking, scratch state, and a serialized
+  direct traversal path.
+- Confirmed compute GDS-to-memory release carries live values in the observed path.
+- Removed unconditional traversal `scheduler.Finish()` calls from production execution. These waits
+  were a proven source of artificial 1 FPS behavior.
+
+### Current incomplete results
+
+- The newest intro test is still invisible and has severely lagged audio, so another stall or AV
+  presentation bug remains.
+- The tutorial is still black except for a tiny fragment and the imp.
+- Queue producer `0x2bfebd3c` receives zero scene records; downstream traversal consequently has no
+  work.
+- Production indirect traversal uses native dispatch because CPU readback plus one-dispatch-per-
+  workgroup ordering is prohibitively slow.
+
+### Ruled out or corrected
+
+- The queue is not known to contain thousands of failed Gaussian splats; the captured queue is
+  empty.
+- The black tutorial is not explained only by missing online scene downloads. Local tutorial logic
+  and imp data are present.
+- A generic missing compute `RELEASE_MEM` GDS copy is not supported by the capture; increasing GDS
+  values reached memory correctly.
+- Tutorial progression save flags can bypass onboarding state, but they do not repair rendering.
+- Broad diagnostics are not valid performance tests because they intentionally force GPU waits.
+
+### Most useful next direction
+
+- Trace the writer of the producer record count at `SRT + 0x64` without full GPU stalls.
+- Profile intro decode/presentation independently of scene traversal.
+- Preserve the known-good three-screen startup scheduling while working on the scene queue.
+- Design a GPU-only ordered indirect traversal path after nonzero scene records are restored.
+
 ## Real Fixes or High-Value Progress
 
 ### 1. Dreams crash-draw interception
