@@ -32,6 +32,7 @@ This repository tracks a source-level investigation into running `Dreams` (`CUSA
 
 ## Repository contents
 
+- [DEVELOPMENT.md](DEVELOPMENT.md): easiest way to copy the current source and continue work
 - [STATUS.md](STATUS.md): current user-visible and technical state
 - [DISCOVERIES.md](DISCOVERIES.md): detailed evidence and conclusions
 - [FIXES_TRIED.md](FIXES_TRIED.md): fixes, experiments, and regressions
@@ -39,6 +40,19 @@ This repository tracks a source-level investigation into running `Dreams` (`CUSA
 - [REPRO.md](REPRO.md): reproduction and diagnostic notes
 - `patches/dreams-focused-20260817-current.patch`: latest complete source snapshot
 - `patches/`: older investigation snapshots retained for comparison
+
+## Continue development
+
+The [`dreams-dev`](https://github.com/JesusDaBest/Dreams-ShadPS4/tree/dreams-dev) branch contains a
+complete standalone copy of the current patched shadPS4 source. Developers can fork it or clone it
+directly and make changes in their own copy:
+
+```bash
+git clone --branch dreams-dev --single-branch https://github.com/JesusDaBest/Dreams-ShadPS4.git
+```
+
+The current source snapshot is commit `fc3d1b8a526dff7f9edc1c17f4fcc61f220ec954`. Using the branch
+is easier than manually applying the cumulative patch.
 
 ## Patch base
 
