@@ -2,6 +2,16 @@
 
 ## August 14-17 Main-Menu/Tutorial Branch
 
+### Full-screen 3D rendering confirmed
+
+- Decoded `COMPUTE_PGM_RSRC2.TG_SIZE_EN` and initialized the requested compute workgroup-info SGPR.
+- Removed the last undefined scalar value from indirect-argument shader `0x90272fc4`.
+- Changed its output from 897 zero draw commands to 897 nonzero commands, 504 with instances.
+- Removed invalid mask-shadow restoration from numeric lane reads/writes.
+- Implemented selected-lane `V_WRITELANE_B32` behavior and contiguous subgroup sprite compaction.
+- Confirmed full-screen characters, backgrounds, flecks, UI, and the imp at 30 FPS in a clean run.
+- Kept diagnostic GPU waits disabled for performance validation.
+
 ### Confirmed progress
 
 - Reached the real Dreams intro, Continue, consent/EULA, and Preferences flow.
@@ -21,13 +31,12 @@
 - Removed unconditional traversal `scheduler.Finish()` calls from production execution. These waits
   were a proven source of artificial 1 FPS behavior.
 
-### Current incomplete results
+### Earlier incomplete results, now superseded
 
-- The newest intro test is still invisible and has severely lagged audio, so another stall or AV
-  presentation bug remains.
-- The tutorial is still black except for a tiny fragment and the imp.
-- Queue producer `0x2bfebd3c` receives zero scene records; downstream traversal consequently has no
-  work.
+- A heavily instrumented run made the intro invisible and audio severely lagged.
+- The tutorial was black except for a tiny fragment and the imp before the lane-mask repair.
+- One capture showed queue producer `0x2bfebd3c` receiving zero scene records. A later recovered
+  scene delivered one live record through the GPU pipeline.
 - Production indirect traversal uses native dispatch because CPU readback plus one-dispatch-per-
   workgroup ordering is prohibitively slow.
 
@@ -42,12 +51,12 @@
 - Tutorial progression save flags can bypass onboarding state, but they do not repair rendering.
 - Broad diagnostics are not valid performance tests because they intentionally force GPU waits.
 
-### Most useful next direction
+### Most useful next direction after the 3D repair
 
-- Trace the writer of the producer record count at `SRT + 0x64` without full GPU stalls.
-- Profile intro decode/presentation independently of scene traversal.
-- Preserve the known-good three-screen startup scheduling while working on the scene queue.
-- Design a GPU-only ordered indirect traversal path after nonzero scene records are restored.
+- Validate tutorial, sculpting, gadgets, saved scenes, and premade Dreams.
+- Profile intro decode/presentation independently if clean repeated launches still regress.
+- Preserve the known-good startup and full-screen 3D paths while reducing diagnostics.
+- Design a GPU-only ordered indirect traversal path if multi-workgroup ordering failures appear.
 
 ## Real Fixes or High-Value Progress
 

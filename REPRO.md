@@ -3,7 +3,7 @@
 ## Setup
 
 - Windows
-- Local Release build of shadPS4 with the August 17 cumulative patch
+- Local Release build of shadPS4 with the August 17 3D-rendering patch
 - Game serial `CUSA04301`
 - Per-game GPU readback mode `2`
 - Pipeline cache disabled while iterating on shader behavior
@@ -17,19 +17,16 @@ save data.
 1. Launch Dreams using the patched shadPS4 build.
 2. Let the intro/startup path proceed; do not use automated controller input.
 3. Pass Continue and Preferences if they appear.
-4. Enter the tutorial or use an already progressed personal save.
-5. Observe whether the scene remains black, whether a small top-left fragment appears, and whether
-   the imp spawns.
+4. Enter the tutorial, creation content, or an offline collection such as `Mm Characters`.
+5. Confirm that UI and 3D content cover the full screen and that the FPS overlay reaches 30 FPS.
 6. Preserve the log immediately after the failing scene because the next launch overwrites it.
 
-## Expected current symptoms
+## Expected current result
 
-- Intro timing is approximately correct, but presentation is extremely slow.
-- Intro video may be invisible while audio advances at roughly 1-2 FPS.
-- Startup screens have rendered in older builds, so a permanently black startup screen is a
-  regression rather than the desired baseline.
-- Tutorial logic can continue and the imp can respond even while scene geometry is black.
-- The low-FPS Preferences warning may recur without the Dreams-specific guard.
+- Full-screen 3D menu content, flecks, UI, and the imp render correctly.
+- The validated `Mm Characters` screen runs at the 30 FPS cap with diagnostics disabled.
+- A black screen, top-edge render sliver, or 1 FPS menu is a regression or a diagnostic-mode result.
+- Broad playability is still unverified; record the exact scene and action for any remaining fault.
 
 ## Diagnostic modes
 
@@ -47,6 +44,7 @@ They are evidence-gathering modes only and must not be used for performance vali
 
 - Producer `0x2bfebd3c` record count and SRT address
 - Contents and modification state of producer buffers
+- Indirect-argument shader `0x90272fc4` command counts and undefined IR values
 - Traversal `0xb535c6c8` indirect dimensions
 - GDS input base/total before traversal
 - Unexpected `scheduler.Finish()` calls before the intro or presentation
@@ -55,7 +53,7 @@ They are evidence-gathering modes only and must not be used for performance vali
 
 ## Patch base
 
-Apply `patches/dreams-focused-20260817-current.patch` to upstream commit
+Apply `patches/dreams-focused-20260817-3d-rendering.patch` to upstream commit
 `555c458c9fdd33cb4686492374519c7bb112a891`.
 
 The patch is an investigation snapshot, not a minimal upstream-ready series.

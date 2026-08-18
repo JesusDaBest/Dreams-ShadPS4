@@ -1,18 +1,14 @@
 # Open Issues
 
-## 1. Scene records are not published
+## 1. Validate the 3D fix across gameplay paths
 
-The current highest-priority blocker is the zero record count entering producer shader
-`0x2bfebd3c`. The queue and supporting buffers are empty, which leaves traversal indirect work at
-zero. Find the compute/CPU stage that should populate the SRT field at `+0x64` and establish whether
-the missing update is caused by a skipped dispatch, bad descriptor, unsupported shader operation,
-or synchronization error.
+Full-screen 3D menu content now renders at 30 FPS. Replay the tutorial, sculpt stamping, gadgets,
+saved creations, and several premade Dreams to identify any scene classes that still fail or crash.
 
-## 2. Intro video and audio still present at roughly 1-2 FPS
+## 2. Recheck intro video and audio on repeated clean launches
 
-Removing explicit per-dispatch GPU waits eliminated one proven stall source but did not make the
-latest test smooth. The intro is now invisible while its audio is extremely delayed. This must be
-profiled independently from scene traversal because the slowdown happens before scene work exists.
+The validated 3D run reached 30 FPS with diagnostic waits disabled. Intro pacing should be retested
+separately over several launches to distinguish any remaining AV bug from diagnostic slowdown.
 
 ## 3. Indirect ordered traversal is not exact
 
@@ -21,10 +17,11 @@ dispatch cannot use the same CPU dimension readback without catastrophic stalls,
 falls back to native `dispatchIndirect`. A GPU-only ordered scheme will be needed when traversal
 receives nonzero work.
 
-## 4. Startup-screen behavior has regressed between builds
+## 4. Reduce the source to upstream-quality fixes
 
-All three startup screens were visible in one known-good build, but the newest test no longer shows
-the intro. Avoid solving the scene queue by reintroducing blank-frame or AV presentation regressions.
+The development snapshot contains extensive gated diagnostics and compatibility experiments. Split
+the confirmed workgroup, lane, compaction, and presentation fixes into reviewable changes and audit
+their behavior in games other than Dreams.
 
 ## 5. Tutorial bypass is only a test aid
 
@@ -39,6 +36,8 @@ enter the homespace and DreamShaping interfaces.
 
 ## Historical issues to keep in regression coverage
 
+- Zero scene records and zero indirect geometry commands
+- Black output or a colored render sliver at the top edge
 - Blank tracked and active 10-bit EOF surfaces
 - Invalid descriptors around `0x853f753d` and `0xff751373`
 - Post-EOF same-buffer keepalives reopening `0xC0000005`

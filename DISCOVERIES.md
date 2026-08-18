@@ -1,6 +1,31 @@
 # Detailed Discoveries
 
-## Scene publication is empty before traversal
+## Full-screen 3D rendering breakthrough
+
+The black/top-edge presentation failure and missing flecks were separate symptoms in the same
+shader pipeline. The decisive clean run rendered complete `Mm Characters` content at 30 FPS.
+
+The strongest evidence came from the indirect geometry argument shader `0x90272fc4`:
+
+- before the final fix: 897 command slots scanned, all zero;
+- after the final fix: 897 nonzero commands, 504 with active instances;
+- the shader's post-SSA IR changed from one undefined `U32` to no undefined values;
+- that value came from a missing compute workgroup-info SGPR requested by
+  `COMPUTE_PGM_RSRC2.TG_SIZE_EN`.
+
+shadPS4 already initialized compute user-data and enabled workgroup-ID SGPRs, but did not decode or
+initialize the following packed workgroup-info SGPR. Dreams extracted its ordered-append field while
+building M0 for `DS_ORDERED_COUNT`. Leaving the SGPR undefined poisoned the counter address and
+prevented draw-command generation.
+
+The complete visible repair also required:
+
+- removing invalid mask-shadow restoration from numeric `V_READLANE_B32` and `V_WRITELANE_B32`;
+- implementing selected-lane semantics for SPIR-V `V_WRITELANE_B32`;
+- coherent canonical SGPR reads for thread-bit masks in `0x90272fc4`;
+- subgroup-leader allocation for contiguous sprite-compaction output.
+
+## Scene publication zero-record capture was historical
 
 The strongest current capture follows the compute chain into Dreams' scene queue producer:
 
@@ -13,9 +38,10 @@ The strongest current capture follows the compute chain into Dreams' scene queue
 - The queue at `0x2e3ae0000` was all zero. Supporting producer buffers 3 and 4 were also all zero.
 - Buffer 2 was GPU-modified, so it could not be safely interpreted using the same CPU scan.
 
-The following traversal dispatch has an indirect X dimension of zero and GDS input total/base zero.
-The black tutorial is therefore currently best explained by missing scene/object publication, not
-by thousands of Gaussian splats failing to rasterize.
+That capture accurately described its moment but not the final recovered scene. Later tracing found
+`records=1`, the exact saved record in sprite-occlusion input, generated downstream records, and a
+live graphics consumer. The remaining zero-output point was the indirect-argument shader described
+above.
 
 ## `DS_ORDERED_COUNT` semantics matter
 
