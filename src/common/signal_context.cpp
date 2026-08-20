@@ -31,6 +31,48 @@ void* GetRip(void* ctx) {
 #endif
 }
 
+void IncrementRip(void* ctx, u64 length) {
+#if defined(_WIN32)
+    ((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rip += length;
+#elif defined(__APPLE__) && defined(ARCH_X86_64)
+    ((ucontext_t*)ctx)->uc_mcontext->__ss.__rip += length;
+#elif defined(__APPLE__) && defined(ARCH_ARM64)
+    ((ucontext_t*)ctx)->uc_mcontext->__ss.__pc += length;
+#elif defined(__FreeBSD__)
+    ((ucontext_t*)ctx)->uc_mcontext.mc_rip += length;
+#elif defined(ARCH_X86_64)
+    ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RIP] += length;
+#else
+#error "Unsupported architecture"
+#endif
+}
+
+#ifdef ARCH_X86_64
+void SetRdi(void* ctx, u64 value) {
+#if defined(_WIN32)
+    ((EXCEPTION_POINTERS*)ctx)->ContextRecord->Rdi = value;
+#elif defined(__APPLE__)
+    ((ucontext_t*)ctx)->uc_mcontext->__ss.__rdi = value;
+#elif defined(__FreeBSD__)
+    ((ucontext_t*)ctx)->uc_mcontext.mc_rdi = value;
+#else
+    ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RDI] = value;
+#endif
+}
+
+void SetR10(void* ctx, u64 value) {
+#if defined(_WIN32)
+    ((EXCEPTION_POINTERS*)ctx)->ContextRecord->R10 = value;
+#elif defined(__APPLE__)
+    ((ucontext_t*)ctx)->uc_mcontext->__ss.__r10 = value;
+#elif defined(__FreeBSD__)
+    ((ucontext_t*)ctx)->uc_mcontext.mc_r10 = value;
+#else
+    ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_R10] = value;
+#endif
+}
+#endif
+
 bool IsWriteError(void* ctx) {
 #if defined(_WIN32)
     return ((EXCEPTION_POINTERS*)ctx)->ExceptionRecord->ExceptionInformation[0] == 1;

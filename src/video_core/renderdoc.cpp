@@ -7,6 +7,7 @@
 #include "video_core/renderdoc.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <renderdoc_app.h>
 
 #ifdef _WIN32
@@ -98,9 +99,22 @@ void StartCapture() {
         return;
     }
 
+    if (capture_state == CaptureState::Idle) {
+        const char* trigger_file = std::getenv("SHADPS4_RENDERDOC_CAPTURE_TRIGGER_FILE");
+        if (trigger_file != nullptr && trigger_file[0] != '\0') {
+            std::error_code error;
+            if (std::filesystem::remove(trigger_file, error)) {
+                LOG_WARNING(Common, "RenderDoc capture triggered by {}", trigger_file);
+                capture_state = CaptureState::Triggered;
+            }
+        }
+    }
+
     if (capture_state == CaptureState::Triggered) {
         rdoc_api->StartFrameCapture(nullptr, nullptr);
-        capture_state = CaptureState::InProgress;
+        const u32 capturing = rdoc_api->IsFrameCapturing();
+        LOG_WARNING(Common, "RenderDoc IsFrameCapturing returned {} after start", capturing);
+        capture_state = capturing != 0 ? CaptureState::InProgress : CaptureState::Idle;
     }
 }
 
@@ -110,7 +124,9 @@ void EndCapture() {
     }
 
     if (capture_state == CaptureState::InProgress) {
-        rdoc_api->EndFrameCapture(nullptr, nullptr);
+        const u32 ended = rdoc_api->EndFrameCapture(nullptr, nullptr);
+        LOG_WARNING(Common, "RenderDoc EndFrameCapture returned {}; captures={}", ended,
+                    rdoc_api->GetNumCaptures());
         capture_state = CaptureState::Idle;
     }
 }

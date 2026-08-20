@@ -423,7 +423,96 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 
 #ifdef _WIN32
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
-                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CPU_ROOT_TRACE")) {
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_PENDING_RETIREMENT_HANDOFF")) {
+                constexpr u64 DreamsRetirementWatermarkWriteOffset = 0x9aaf51;
+                constexpr std::array<u8, 6> ExpectedBytes = {0x89, 0x05, 0xf1,
+                                                              0x9b, 0xb2, 0x03};
+                auto* watermark_write = reinterpret_cast<u8*>(
+                    base_virtual_addr + DreamsRetirementWatermarkWriteOffset);
+                if (DreamsRetirementWatermarkWriteOffset + ExpectedBytes.size() <= base_size &&
+                    std::memcmp(watermark_write, ExpectedBytes.data(), ExpectedBytes.size()) == 0) {
+                    *watermark_write = 0xcc;
+                    LOG_WARNING(Core_Linker,
+                                "Applied focused Dreams retirement-watermark write guard");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams retirement-watermark write guard did not match this "
+                                "executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_STAMP_TRACE")) {
+                constexpr std::array<std::pair<u64, u8>, 46> DreamsStampTracePoints{{
+                    {0x71bba4, 0x48}, // Inspect the async model-compute queue.
+                    {0x71bd3a, 0x4c}, // Dequeue an async model-compute job.
+                    {0x71be68, 0x48}, // Begin processing the dequeued model.
+                    {0x71bed9, 0xe8}, // Parse the primary model stream.
+                    {0x71bf1b, 0x0f}, // Enter the primary model-stream loop.
+                    {0x71c022, 0xe8}, // Parse the alternate model stream.
+                    {0x71c06b, 0x8a}, // Enter the alternate model-stream loop.
+                    {0x71c148, 0x48}, // Finish model-stream traversal.
+                    {0x71c175, 0xe8}, // Build the model resource payload.
+                    {0x71c17d, 0x48}, // Return from model resource construction.
+                    {0x71c188, 0xe8}, // Lock the model resource registry.
+                    {0x71c18d, 0xe8}, // Query the worker thread identifier.
+                    {0x71c192, 0x48}, // Begin model resource lookup.
+                    {0x71c5fe, 0x48}, // Enter auxiliary resource allocation.
+                    {0x71c60d, 0xe8}, // Allocate the auxiliary resource.
+                    {0x7204b6, 0x49}, // Scan the auxiliary resource pool.
+                    {0x720500, 0x48}, // Select a free resource-pool bit.
+                    {0x720513, 0x8b}, // Enter the resource-retirement path.
+                    {0x7205e0, 0x48}, // Wait for an older resource generation.
+                    {0x7205e6, 0xe8}, // Sleep on the model-worker condition.
+                    {0x7205eb, 0x8b}, // Resume after a generation change.
+                    {0x720650, 0x41}, // Reclaim a retired resource handle.
+                    {0x7208e3, 0x48}, // Fail resource-handle allocation.
+                    {0x7208f8, 0xba}, // Commit a free resource handle.
+                    {0x12850c1, 0xe8}, // Enter Dreams' CSG voxel compute pass.
+                    {0x12803c0, 0x48}, // Retry a rejected CSG voxel replay.
+                    {0x1281f5e, 0x48}, // Inspect the completed CSG replay result.
+                    {0x1281f6e, 0x41}, // Read the CSG replay output count.
+                    {0x1281f7e, 0xe9}, // Reject and retry the CSG replay result.
+                    {0x1287bd0, 0x55}, // Enter the CSG GPU completion wait.
+                    {0x1287bf2, 0xe8}, // Submit the CSG completion marker.
+                    {0x1287bf7, 0x8b}, // Return from completion-marker submission.
+                    {0x1287c60, 0xc7}, // Begin one GPU completion wait iteration.
+                    {0x1287c83, 0xe8}, // Wait for the CSG GPU event.
+                    {0x1287c88, 0x49}, // Read the CSG GPU completion value.
+                    {0x1287d23, 0x44}, // Publish the next CSG completion target.
+                    {0x1287e1b, 0xe8}, // Emit the CSG completion write packet.
+                    {0x1287e20, 0x48}, // Finish emitting the completion packet.
+                    {0x9c469f, 0x48}, // Publish the active scene root.
+                    {0x9c47d4, 0x66}, // Promote a pending resource.
+                    {0x71c622, 0x41}, // Assign an auxiliary resource index.
+                    {0x71c8b8, 0x41}, // Assign a primary resource index.
+                    {0x71cd98, 0x43}, // Assign a resource table entry.
+                    {0x72aa3e, 0x89}, // Create a resource table entry.
+                    {0x72aa94, 0x48}, // Signal the async model-compute worker.
+                    {0x729da5, 0x41}, // Retire a resource table entry.
+                }};
+                bool trace_points_match = true;
+                for (const auto [offset, expected] : DreamsStampTracePoints) {
+                    if (offset >= base_size ||
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) != expected) {
+                        trace_points_match = false;
+                        break;
+                    }
+                }
+                if (trace_points_match) {
+                    for (const auto [offset, expected] : DreamsStampTracePoints) {
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) = 0xcc;
+                    }
+                    LOG_WARNING(Core_Linker, "Applied focused Dreams stamp-resource trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams stamp-resource trace did not match this executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CPU_ROOT_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_STAMP_TRACE")) {
                 constexpr u64 DreamsRecordBuilderOffset = 0x8b7380;
                 constexpr u64 DreamsActiveMapOffset = 0x8b81c4;
                 constexpr std::array<std::pair<u64, u8>, 10> DreamsBuilderPhases{{
@@ -446,6 +535,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                     {0x13d68f7, 0x8b},
                 }};
                 constexpr u64 DreamsHighDispatchOffset = 0x101e400;
+                constexpr u64 DreamsReplayResultInspectOffset = 0x1281f5e;
                 constexpr u64 DreamsSceneGateTraceOffset = 0x9c44b4;
                 constexpr u64 DreamsRootPublishTraceOffset = 0x9c469f;
                 constexpr u64 DreamsResourcePromotionOffset = 0x9c47d4;
@@ -512,6 +602,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                     reinterpret_cast<u8*>(base_virtual_addr + DreamsGlobalRecordOffset);
                 auto* high_dispatch =
                     reinterpret_cast<u8*>(base_virtual_addr + DreamsHighDispatchOffset);
+                auto* replay_result_inspect =
+                    reinterpret_cast<u8*>(base_virtual_addr + DreamsReplayResultInspectOffset);
                 auto* scene_gate_trace =
                     reinterpret_cast<u8*>(base_virtual_addr + DreamsSceneGateTraceOffset);
                 auto* root_publish_trace =
@@ -568,7 +660,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                         break;
                     }
                 }
-                if (DreamsHighDispatchOffset < base_size && *record_builder == ExpectedByte &&
+                if (DreamsReplayResultInspectOffset < base_size &&
+                    *replay_result_inspect == 0x48 && *record_builder == ExpectedByte &&
                     *active_map == ExpectedActiveMapByte &&
                     *stroke_lookup == ExpectedStrokeLookupByte &&
                     *record_gate == ExpectedRecordGateByte &&
@@ -604,6 +697,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                         *reinterpret_cast<u8*>(base_virtual_addr + offset) = BreakpointByte;
                     }
                     *high_dispatch = BreakpointByte;
+                    *replay_result_inspect = BreakpointByte;
                     *scene_gate_trace = BreakpointByte;
                     *root_publish_trace = BreakpointByte;
                     *resource_promotion = BreakpointByte;
@@ -680,6 +774,42 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                                 "Dreams slowdown-warning guard did not match this executable");
                 }
             }
+
+#ifdef _WIN32
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_OFFLINE_LIMITS_TRACE")) {
+                constexpr u64 DreamsOfflineLimitsResponseOffset = 0x5676c0;
+                constexpr std::array<u8, 4> ExpectedBytes = {0x48, 0x8b, 0x72, 0x08};
+                auto* limits_response = reinterpret_cast<u8*>(
+                    base_virtual_addr + DreamsOfflineLimitsResponseOffset);
+                if (DreamsOfflineLimitsResponseOffset + ExpectedBytes.size() <= base_size &&
+                    std::memcmp(limits_response, ExpectedBytes.data(), ExpectedBytes.size()) ==
+                        0) {
+                    *limits_response = 0xcc;
+                    LOG_WARNING(Core_Linker, "Applied Dreams offline-limits response trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams offline-limits response trace did not match this "
+                                "executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SAVE_QUOTA_DEEP_TRACE")) {
+                constexpr u64 DreamsSaveQuotaInputsOffset = 0x552c76;
+                constexpr u8 ExpectedByte = 0x44;
+                constexpr u8 BreakpointByte = 0xcc;
+                auto* quota_inputs =
+                    reinterpret_cast<u8*>(base_virtual_addr + DreamsSaveQuotaInputsOffset);
+                if (DreamsSaveQuotaInputsOffset < base_size && *quota_inputs == ExpectedByte) {
+                    *quota_inputs = BreakpointByte;
+                    LOG_WARNING(Core_Linker, "Applied Dreams save-quota input trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams save-quota input trace did not match this executable");
+                }
+            }
+#endif
 
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
                 IsEnvironmentFlagEnabled("SHADPS4_DREAMS_DEFER_ACTIVE_RETIREMENT")) {

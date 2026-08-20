@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <thread>
@@ -28,6 +30,10 @@
 #include "save_instance.h"
 #include "save_memory.h"
 
+#ifdef _WIN32
+#include <intrin.h>
+#endif
+
 namespace fs = std::filesystem;
 namespace chrono = std::chrono;
 
@@ -48,6 +54,29 @@ using OrbisSaveDataBlocks = u64;
 constexpr u32 OrbisSaveDataBlockSize = 32768; // 32 KiB
 constexpr u32 OrbisSaveDataBlocksMin2 = 96;   // 3MiB
 constexpr u32 OrbisSaveDataBlocksMax = 32768; // 1 GiB
+
+struct SaveDataDiskUsage {
+    u64 bytes{};
+    u64 blocks{};
+};
+
+static SaveDataDiskUsage GetSaveDataDiskUsage(const fs::path& path) {
+    SaveDataDiskUsage usage;
+    if (!fs::exists(path)) {
+        return usage;
+    }
+
+    for (const auto& entry : fs::recursive_directory_iterator(path)) {
+        if (!fs::is_regular_file(entry.path())) {
+            continue;
+        }
+        const u64 size = fs::file_size(entry.path());
+        usage.bytes += size;
+        usage.blocks += size / OrbisSaveDataBlockSize;
+        usage.blocks += size % OrbisSaveDataBlockSize != 0;
+    }
+    return usage;
+}
 
 // Maximum size for a mount point "/savedataN", where N is a number
 constexpr size_t OrbisSaveDataMountPointDataMaxsize = 16;
@@ -314,6 +343,45 @@ static bool g_initialized = false;
 static std::string g_game_serial;
 static u32 g_fw_ver;
 static std::array<std::optional<SaveInstance>, 16> g_mount_slots;
+
+static bool DreamsSaveQuotaTraceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_SAVE_QUOTA_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+#ifdef _WIN32
+static void TraceDreamsSaveQuotaCall(const void* direct, const void* return_slot) {
+    static std::atomic<u32> trace_count{};
+    const u32 trace_index = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (trace_index >= 32) {
+        return;
+    }
+
+    const auto* stack = reinterpret_cast<const u64*>(return_slot);
+    std::array<u64, 12> guest_callers{};
+    u32 caller_count = 0;
+    for (u32 i = 0; i < 256 && caller_count < guest_callers.size(); ++i) {
+        const u64 candidate = stack[i];
+        const bool in_main = candidate >= 0x05770000 && candidate < 0x07400000;
+        const bool in_game_module = candidate >= 0x80000000 && candidate < 0x100000000;
+        const bool in_system_module = candidate >= 0x800000000 && candidate < 0x900000000;
+        if (in_main || in_game_module || in_system_module) {
+            guest_callers[caller_count++] = candidate;
+        }
+    }
+
+    LOG_WARNING(Lib_SaveData,
+                "Dreams save quota stack #{} direct={} guest={:#x},{:#x},{:#x},{:#x},{:#x},"
+                "{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                trace_index, direct, guest_callers[0], guest_callers[1], guest_callers[2],
+                guest_callers[3], guest_callers[4], guest_callers[5], guest_callers[6],
+                guest_callers[7], guest_callers[8], guest_callers[9], guest_callers[10],
+                guest_callers[11]);
+}
+#endif
 
 static void initialize() {
     g_initialized = true;
@@ -834,17 +902,16 @@ Error PS4_SYSV_ABI sceSaveDataDirNameSearch(const OrbisSaveDataDirNameSearchCond
             ASSERT_MSG(false, "Failed to read SFO");
         }
 
-        const u64 size = Common::FS::GetDirectorySize(dir_path);
+        const SaveDataDiskUsage usage = GetSaveDataDiskUsage(dir_path);
         const u64 total = SaveInstance::GetMaxBlockFromSFO(sfo);
-        const u64 used_blocks = (size + OrbisSaveDataBlockSize - 1) / OrbisSaveDataBlockSize;
 
         map_dir_sfo.emplace(dir_name, std::move(sfo));
-        map_free_size.emplace(dir_name, total > used_blocks ? total - used_blocks : 0);
+        map_free_size.emplace(dir_name, total > usage.blocks ? total - usage.blocks : 0);
         map_max_blocks.emplace(dir_name, total);
 
         LOG_WARNING(Lib_SaveData,
                     "Save-data quota search: title={} dir={} bytes={} blocks={} freeBlocks={}",
-                    title_id, dir_name, size, total, map_free_size.at(dir_name));
+                    title_id, dir_name, usage.bytes, total, map_free_size.at(dir_name));
     }
 
 #define PROJ(x) [&](const auto& v) { return x; }
@@ -999,6 +1066,11 @@ int PS4_SYSV_ABI sceSaveDataGetMountedSaveDataCount() {
 
 Error PS4_SYSV_ABI sceSaveDataGetMountInfo(const OrbisSaveDataMountPoint* mountPoint,
                                            OrbisSaveDataMountInfo* info) {
+#ifdef _WIN32
+    if (g_game_serial == "CUSA04301" && DreamsSaveQuotaTraceEnabled()) {
+        TraceDreamsSaveQuotaCall(__builtin_return_address(0), _AddressOfReturnAddress());
+    }
+#endif
     if (!g_initialized) {
         LOG_INFO(Lib_SaveData, "called without initialize");
         return setNotInitializedError();
@@ -1012,14 +1084,14 @@ Error PS4_SYSV_ABI sceSaveDataGetMountInfo(const OrbisSaveDataMountPoint* mountP
     for (const auto& instance : g_mount_slots) {
         if (instance.has_value() && instance->GetMountPoint() == mount_point_str) {
             const u64 blocks = instance->GetMaxBlocks();
-            const u64 size = Common::FS::GetDirectorySize(instance->GetSavePath());
-            const u64 used_blocks =
-                (size + OrbisSaveDataBlockSize - 1) / OrbisSaveDataBlockSize;
+            const SaveDataDiskUsage usage = GetSaveDataDiskUsage(instance->GetSavePath());
+            const u64 free_blocks = blocks > usage.blocks ? blocks - usage.blocks : 0;
             info->blocks = blocks;
-            info->freeBlocks = blocks > used_blocks ? blocks - used_blocks : 0;
+            info->freeBlocks = free_blocks;
             LOG_WARNING(Lib_SaveData,
-                        "Save-data mount quota: mount={} bytes={} blocks={} freeBlocks={}",
-                        mount_point_str, size, info->blocks, info->freeBlocks);
+                        "Save-data mount quota: mount={} bytes={} usedBlocks={} field0={} field1={}",
+                        mount_point_str, usage.bytes, usage.blocks, info->blocks,
+                        info->freeBlocks);
             return Error::OK;
         }
     }

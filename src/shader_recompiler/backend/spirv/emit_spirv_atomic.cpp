@@ -410,9 +410,7 @@ Id EmitBufferAtomicFMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 }
 
 Id EmitBufferAtomicInc32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    const bool is_dreams_sprite_cull =
-        ctx.info.pgm_hash == DreamsCompat::SpriteCullShader ||
-        ctx.info.pgm_hash == DreamsCompat::SpriteCullShaderAlt;
+    const bool is_dreams_sprite_cull = DreamsCompat::IsSpriteCullShader(ctx.info.pgm_hash);
     if (is_dreams_sprite_cull && ctx.buffers[handle].buffer_type == BufferType::GdsBuffer) {
         // These shaders add a lane prefix to the returned counter base. Reserve the active
         // subgroup once; incrementing from every host lane double-counts and leaves holes.

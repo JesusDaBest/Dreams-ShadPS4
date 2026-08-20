@@ -624,8 +624,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
     auto patch = GetShaderPatch(info.pgm_hash, info.stage, perm_idx, "spv");
     const bool dreams_sprite_patch = std::getenv("SHADPS4_DREAMS_SPRITE_SHADER_PATCH") &&
-                                      (info.pgm_hash == Shader::DreamsCompat::SpriteCullShader ||
-                                       info.pgm_hash == Shader::DreamsCompat::SpriteCullShaderAlt);
+                                      Shader::DreamsCompat::IsSpriteCullShader(info.pgm_hash);
     const bool is_patched = patch && (EmulatorSettings.IsPatchShaders() || dreams_sprite_patch);
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.stage, info.pgm_hash);
@@ -734,8 +733,7 @@ std::string PipelineCache::GetShaderName(Shader::Stage stage, u64 hash,
 void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage,
                                size_t perm_idx, std::string_view ext) {
     if (!EmulatorSettings.IsDumpShaders() && hash != 0x2bfebd3c && hash != 0x692f0f7f &&
-        hash != 0x3937a849 && hash != Shader::DreamsCompat::SpriteCullShader &&
-        hash != Shader::DreamsCompat::SpriteCullShaderAlt) {
+        hash != 0x3937a849 && !Shader::DreamsCompat::IsSpriteCullShader(hash)) {
         return;
     }
 

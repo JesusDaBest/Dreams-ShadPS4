@@ -262,13 +262,23 @@ void EmitDreamsTraversalCompletion(EmitContext& ctx) {
     const Id base =
         ctx.OpLoad(ctx.U32[1], BufferU32Pointer(ctx, gds, ctx.ConstU32(u32{320})));
     const Id output_count = MinU32(
-        ctx, ctx.OpLoad(ctx.U32[1], BufferU32Pointer(ctx, gds, ctx.ConstU32(u32{2}))),
+        ctx,
+        ctx.OpLoad(ctx.U32[1],
+                   BufferU32Pointer(ctx, gds,
+                                    ctx.ConstU32(DreamsCompat::TraversalOutputCounterIndex))),
         3145728);
     const Id secondary_count = MinU32(
-        ctx, ctx.OpLoad(ctx.U32[1], BufferU32Pointer(ctx, gds, ctx.ConstU32(u32{4}))),
+        ctx,
+        ctx.OpLoad(ctx.U32[1],
+                   BufferU32Pointer(ctx, gds,
+                                    ctx.ConstU32(DreamsCompat::TraversalSecondaryCounterIndex))),
         1048576);
     const Id compact_count = MinU32(
-        ctx, ctx.OpLoad(ctx.U32[1], BufferU32Pointer(ctx, gds, ctx.ConstU32(u32{6}))), 16384);
+        ctx,
+        ctx.OpLoad(ctx.U32[1],
+                   BufferU32Pointer(ctx, gds,
+                                    ctx.ConstU32(DreamsCompat::TraversalCompactCounterIndex))),
+        16384);
 
     const Id next_base = ctx.OpIAdd(ctx.U32[1], base, total);
     const Id has_next = ctx.OpUGreaterThanEqual(ctx.U1[1], output_count, next_base);

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -98,6 +99,9 @@ public:
 
     /// Copies an image back to its guest-memory layout.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
+
+    /// Writes an image's linear GPU contents for targeted renderer diagnostics.
+    void DumpImageLinear(ImageId image_id, const std::filesystem::path& path);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);

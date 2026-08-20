@@ -3,6 +3,8 @@
 
 #include <xxhash.h>
 
+#include <fstream>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -108,6 +110,35 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                                                           writeback_size);
             });
     }
+}
+
+void TextureCache::DumpImageLinear(ImageId image_id, const std::filesystem::path& path) {
+    Image& image = slot_images[image_id];
+    auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+    const u32 linear_size = image.info.pitch * image.info.size.height * image.info.size.depth *
+                            image.info.resources.layers * (image.info.num_bits / 8);
+    const auto [download, offset] = download_buffer.Map(linear_size);
+    download_buffer.Commit();
+    std::array image_download{vk::BufferImageCopy{
+        .bufferOffset = offset,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    }};
+    image.Download(image_download, download_buffer.Handle(), offset, linear_size);
+    scheduler.Finish();
+
+    std::ofstream stream{path, std::ios::binary | std::ios::trunc};
+    stream.write(reinterpret_cast<const char*>(download), linear_size);
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {

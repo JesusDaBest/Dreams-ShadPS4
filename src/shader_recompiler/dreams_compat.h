@@ -15,7 +15,11 @@ constexpr u64 CompactScatterShader = 0xd4532ff4;
 constexpr u64 SceneCompactShader = 0x3937a849;
 constexpr u64 SpriteCullShader = 0xfd2a2c3b;
 constexpr u64 SpriteCullShaderAlt = 0xe4dcd599;
+constexpr u64 SpriteCullShaderCusa04301 = 0x0ffa5e6b;
 constexpr u64 IndirectArgsShader = 0x90272fc4;
+constexpr u32 TraversalOutputCounterIndex = 2;
+constexpr u32 TraversalCompactCounterIndex = 6;
+constexpr u32 TraversalSecondaryCounterIndex = 4;
 constexpr u32 QueueProducerCounterIndex = 0x508;
 constexpr u32 TraversalCompletionIndex = 16383;
 
@@ -34,5 +38,10 @@ constexpr u32 OrderedScratchDwords =
 
 constexpr u32 OrderedClearOffsetBytes = TraversalCompletionIndex * sizeof(u32);
 constexpr u32 OrderedClearSizeBytes = sizeof(u32);
+
+constexpr bool IsSpriteCullShader(u64 hash) {
+    return hash == SpriteCullShader || hash == SpriteCullShaderAlt ||
+           hash == SpriteCullShaderCusa04301;
+}
 
 } // namespace Shader::DreamsCompat

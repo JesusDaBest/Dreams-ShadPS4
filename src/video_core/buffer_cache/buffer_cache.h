@@ -71,6 +71,10 @@ public:
     ~BufferCache();
 
     /// Returns a pointer to GDS device local buffer.
+    [[nodiscard]] Buffer* GetGdsBuffer() noexcept {
+        return &gds_buffer;
+    }
+
     [[nodiscard]] const Buffer* GetGdsBuffer() const noexcept {
         return &gds_buffer;
     }

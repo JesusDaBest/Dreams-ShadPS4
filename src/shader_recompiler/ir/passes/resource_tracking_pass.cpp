@@ -756,7 +756,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
 void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
                                 Descriptors& descriptors, const Profile& profile) {
     const u32 binding = descriptors.Add(BufferResource{
-        .used_types = IR::Type::U32 | IR::Type::U64,
+        .used_types = IR::Type::U32,
         .inline_cbuf = AmdGpu::Buffer::Null(),
         .buffer_type = BufferType::GdsBuffer,
         .is_written = true,
@@ -861,6 +861,7 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
         case IR::Opcode::SharedAtomicIAdd64:
             inst.ReplaceUsesWith(
                 ir.BufferAtomicIAdd(handle, address_qwords, IR::U64{inst.Arg(1)}, {}));
+            buffer.used_types |= IR::Type::U64;
             break;
         case IR::Opcode::SharedAtomicISub32:
             inst.ReplaceUsesWith(ir.BufferAtomicISub(handle, address_dwords, inst.Arg(1), {}));
@@ -877,6 +878,7 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
             const bool is_signed = inst.GetOpcode() == IR::Opcode::SharedAtomicSMin64;
             inst.ReplaceUsesWith(
                 ir.BufferAtomicIMin(handle, address_qwords, IR::U64{inst.Arg(1)}, is_signed, {}));
+            buffer.used_types |= IR::Type::U64;
             break;
         }
         case IR::Opcode::SharedAtomicSMax32:
@@ -891,6 +893,7 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
             const bool is_signed = inst.GetOpcode() == IR::Opcode::SharedAtomicSMax64;
             inst.ReplaceUsesWith(
                 ir.BufferAtomicIMax(handle, address_qwords, IR::U64{inst.Arg(1)}, is_signed, {}));
+            buffer.used_types |= IR::Type::U64;
             break;
         }
         case IR::Opcode::SharedAtomicInc32:

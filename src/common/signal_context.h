@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/arch.h"
 #include "common/types.h"
 
 namespace Common {
@@ -12,6 +13,12 @@ void* GetXmmPointer(void* ctx, u8 index);
 void* GetRip(void* ctx);
 
 void IncrementRip(void* ctx, u64 length);
+
+#ifdef ARCH_X86_64
+void SetRdi(void* ctx, u64 value);
+
+void SetR10(void* ctx, u64 value);
+#endif
 
 bool IsWriteError(void* ctx);
 

@@ -76,6 +76,7 @@ struct InfoPersistent {
     bool has_fetch_shader{};
     bool has_bitwise_xor{};
     bool uses_dma{};
+    bool uses_ordered_count{};
 
     InfoPersistent() = default;
     InfoPersistent(Stage stage_, LogicalStage l_stage_, u64 pgm_hash_)
