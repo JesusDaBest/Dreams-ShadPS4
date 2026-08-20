@@ -1,52 +1,72 @@
 # Continue Development
 
-## Easiest option
+## Recommended source branch
 
-Fork this GitHub repository, select the `dreams-dev-3d-rendering` branch, and create a new branch from it. This
-gives each developer an independent copy of the complete current shadPS4 source without affecting
-the original investigation branch.
-
-To clone the source snapshot directly:
+The `dreams-dev-20260819-experimental` branch is a complete source snapshot of the August 19
+investigation state. It includes the same tracked source changes as the cumulative patch, including
+unfinished diagnostics and the malformed-geometry candidate.
 
 ```bash
-git clone --branch dreams-dev-3d-rendering --single-branch https://github.com/JesusDaBest/Dreams-ShadPS4.git
+git clone --branch dreams-dev-20260819-experimental --single-branch https://github.com/JesusDaBest/Dreams-ShadPS4.git
 cd Dreams-ShadPS4
 git switch -c my-dreams-work
 ```
 
-Then follow the normal shadPS4 build instructions included in that source tree.
+The older `dreams-dev-3d-rendering` branch is retained for comparison, but its August 17 description
+overstates the rendering result. Do not use it as evidence that 3D was solved.
+
+## Exact starting state
+
+- Game: `CUSA04301`
+- Status: not playable
+- UI/imp/grid/gadgets: partially working
+- Sculpt and paint/fleck geometry: missing or malformed
+- Tweak panels: can be black
+- Camera movement: generated geometry can jitter
+- Current candidate: restores Vulkan dispatch-base correctness and exposes oversized grey geometry
+- Primary blocker: incomplete guest-wave ordering for `DS_ORDERED_COUNT`
+
+Read [STATUS.md](STATUS.md), [DISCOVERIES.md](DISCOVERIES.md), and [ISSUES.md](ISSUES.md) before
+changing rendering code. They distinguish confirmed corrections from observations and failed
+experiments.
+
+## Patch workflow
+
+Developers with upstream commit `555c458c9fdd33cb4686492374519c7bb112a891` can instead apply:
+
+```bash
+git apply --check patches/dreams-focused-20260819-experimental.patch
+git apply patches/dreams-focused-20260819-experimental.patch
+```
+
+Patch SHA-256:
+
+```text
+CCAE708A596A9F40833E027A12723C5698452CA8596FD0E1DE1D1F9F4E1B5E60
+```
+
+The patch was verified with `git apply --check` against that exact base.
 
 ## Keep other games isolated
 
-The branch contains some emulator-wide changes, so it is not guaranteed to behave like official
-shadPS4 for games other than Dreams. Downloading or forking the source cannot affect existing games,
-but running the custom build can share saves, settings, trophies, and shader caches with another
-shadPS4 installation.
+The snapshot contains emulator-wide changes and has not been regression-tested against other
+games. Downloading or building it cannot alter other installations, but running it against the same
+user directory can share saves, settings, trophies, logs, and caches.
 
-For safe testing:
+1. Keep the experimental build in a dedicated folder.
+2. Create an empty folder named `user` inside that folder.
+3. Start shadPS4 with the dedicated folder as its working directory.
+4. Use the snapshot only for `CUSA04301`.
+5. Keep a verified save backup before any save-data experiment.
 
-1. Keep the Dreams build in its own folder and use it only for `CUSA04301`.
-2. Create an empty folder named `user` in that build's working directory.
-3. Start shadPS4 with that folder as its current working directory.
-4. Keep using an official or normal shadPS4 build for every other game.
+No game files, firmware, keys, user configuration, credentials, or saves are included.
 
-The local `user` folder makes shadPS4 keep this build's configuration, saves, trophies, logs, and
-caches separate. Developers must provide their own legal firmware and game setup inside that
-isolated environment.
+## Development discipline
 
-## Starting point
-
-- Source branch: `dreams-dev-3d-rendering`
-- Snapshot commit: `3e5e23a54d339fdff53f619aece871737426c5bf`
-- Game serial used for testing: `CUSA04301`
-- Current result: full-screen 3D menu content renders at 30 FPS; broad playability is unverified
-- Technical priorities: [ISSUES.md](ISSUES.md)
-- Detailed evidence: [DISCOVERIES.md](DISCOVERIES.md)
-
-## Alternative patch workflow
-
-Developers who already have shadPS4 commit `555c458c9fdd33cb4686492374519c7bb112a891`
-can apply `patches/dreams-focused-20260817-3d-rendering.patch` instead. The branch is recommended because
-it avoids base-version and patch-application mistakes.
-
-Game files, firmware, keys, user configuration, and save data are intentionally not included.
+- Change one rendering variable at a time.
+- Keep a known scene and camera position for comparisons.
+- Record executable/source identity for every screenshot or log.
+- Treat nonzero draw commands as evidence, not proof of correct geometry.
+- Never call a result fixed until visible output and regression checks pass.
+- Keep broad diagnostics disabled during performance measurements.
+- Preserve the earlier stable executable separately from experimental candidates.

@@ -1,45 +1,57 @@
 # Open Issues
 
-## 1. Validate the 3D fix across gameplay paths
+## 1. Implement guest-ordered `DS_ORDERED_COUNT`
 
-Full-screen 3D menu content now renders at 30 FPS. Replay the tutorial, sculpt stamping, gadgets,
-saved creations, and several premade Dreams to identify any scene classes that still fail or crash.
+The current backend keeps the counter address but loses the M0 logical-wave fields and treats the
+operation as a normal atomic. Preserve guest wave identity and implement `wave_release` and
+`wave_done` without a GPU scheduling deadlock.
 
-## 2. Recheck intro video and audio on repeated clean launches
+This is the primary blocker because restoring valid Vulkan dispatch-base behavior changed missing
+geometry into visible but incorrectly positioned geometry.
 
-The validated 3D run reached 30 FPS with diagnostic waits disabled. Intro pacing should be retested
-separately over several launches to distinguish any remaining AV bug from diagnostic slowdown.
+## 2. Make sculpt and paint geometry stable and visible
 
-## 3. Indirect ordered traversal is not exact
+Validate one fixed creation scene. A sculpt preview, placed sculpt, and paint stroke must remain
+visible and selectable while the camera moves. Do not accept nonzero indirect command counts alone.
 
-Direct Dreams traversal can be split into ordered one-workgroup dispatches. Production indirect
-dispatch cannot use the same CPU dimension readback without catastrophic stalls, so it currently
-falls back to native `dispatchIndirect`. A GPU-only ordered scheme will be needed when traversal
-receives nonzero work.
+## 3. Preserve UI and gadget rendering
 
-## 4. Reduce the source to upstream-quality fixes
+Tweak panels can be black and geometry can jitter. Any ordered-count correction must preserve the
+currently working imp, grid, UI, gadget placement, and gadget logic.
 
-The development snapshot contains extensive gated diagnostics and compatibility experiments. Split
-the confirmed workgroup, lane, compaction, and presentation fixes into reviewable changes and audit
-their behavior in games other than Dreams.
+## 4. Repair intro presentation and audio timing
 
-## 5. Tutorial bypass is only a test aid
+The decoder produces frames, but some current runs show black video and severely delayed audio.
+Test this separately from the geometry path with diagnostics disabled.
 
-Progression flags can skip known tutorial requirements, but they do not create missing scene data.
-Do not mistake save editing for a rendering fix or ship a user save as part of the source patch.
+## 5. Investigate the trigger-zone host exception
 
-## 6. Online functionality is outside the current target
+Selecting a trigger zone reproduced host exception `0xe06d7363`. Capture the exception message and
+native stack before assigning it to rendering, save data, or gadget logic.
 
-The current target is a usable offline game. Community servers and historical Dreams content are
-not expected to work. Offline service stubs must still preserve the state transitions needed to
-enter the homespace and DreamShaping interfaces.
+## 6. Reduce diagnostics and isolate upstream-quality changes
 
-## Historical issues to keep in regression coverage
+The snapshot contains thousands of lines of gated tracing and several emulator-wide experiments.
+Separate confirmed corrections from diagnostics before upstream review. Audit all generalized
+changes against games other than Dreams.
 
-- Zero scene records and zero indirect geometry commands
-- Black output or a colored render sliver at the top edge
-- Blank tracked and active 10-bit EOF surfaces
-- Invalid descriptors around `0x853f753d` and `0xff751373`
-- Post-EOF same-buffer keepalives reopening `0xC0000005`
-- Early flip/bootstrap device-loss paths
-- Repeated low-FPS Preferences warning loop
+## 7. Verify offline ownership and content boundaries
+
+Local content can load without live Dreams servers, but PSN entitlement/demo behavior and community
+content are not verified. Do not imply that offline stubs restore discontinued online services.
+
+## Regression coverage
+
+- false `4 GB used / 1 GB limit` save state;
+- black Continue/EULA/Preferences pages;
+- invisible or severely delayed intro;
+- zero indirect geometry commands;
+- nonzero commands with malformed positions;
+- colored top-edge dot or compressed render strip;
+- black tweak panels;
+- angle-dependent grey lines;
+- camera-relative geometry jitter;
+- missing sculpt previews, placed sculpts, paint/flecks, and characters;
+- gadget placement or logic regression;
+- forced diagnostics reducing execution to roughly 1 FPS;
+- post-EOF and gadget-selection crashes.
