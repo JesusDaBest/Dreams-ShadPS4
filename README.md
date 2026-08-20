@@ -58,7 +58,7 @@ a general shadPS4 build.
 
 The cumulative August 19 patch applies to upstream commit
 `555c458c9fdd33cb4686492374519c7bb112a891`. Its SHA-256 is
-`CCAE708A596A9F40833E027A12723C5698452CA8596FD0E1DE1D1F9F4E1B5E60`.
+`A7C1863086220579483BA4D4F9DB3E68F40E9B7BF4780D9B1CCF7F036460AEAF`.
 
 This repository contains no game files, firmware, keys, PSN credentials, user saves, or proprietary
 Dreams content.

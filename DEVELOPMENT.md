@@ -42,7 +42,7 @@ git apply patches/dreams-focused-20260819-experimental.patch
 Patch SHA-256:
 
 ```text
-CCAE708A596A9F40833E027A12723C5698452CA8596FD0E1DE1D1F9F4E1B5E60
+A7C1863086220579483BA4D4F9DB3E68F40E9B7BF4780D9B1CCF7F036460AEAF
 ```
 
 The patch was verified with `git apply --check` against that exact base.
