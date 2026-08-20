@@ -1,121 +1,169 @@
 # Detailed Discoveries
 
-## Full-screen 3D rendering breakthrough
+## Correction to the August 17 conclusion
 
-The black/top-edge presentation failure and missing flecks were separate symptoms in the same
-shader pipeline. The decisive clean run rendered complete `Mm Characters` content at 30 FPS.
+The August 17 snapshot described full-screen 3D rendering at 30 FPS as confirmed. Later repeated
+tests contradicted that conclusion: sculpts, paint/flecks, and characters remained absent; tweak
+panels could be black; and some output was compressed, malformed, or unstable. The 897-command
+capture remains useful evidence, but it does not establish correct geometry.
 
-The strongest evidence came from the indirect geometry argument shader `0x90272fc4`:
+The current evidence supports a narrower conclusion: Dreams reaches the indirect geometry path,
+but its ordered traversal output is not generated with correct guest semantics.
 
-- before the final fix: 897 command slots scanned, all zero;
-- after the final fix: 897 nonzero commands, 504 with active instances;
-- the shader's post-SSA IR changed from one undefined `U32` to no undefined values;
-- that value came from a missing compute workgroup-info SGPR requested by
-  `COMPUTE_PGM_RSRC2.TG_SIZE_EN`.
+## Dispatch-base correctness regression
 
-shadPS4 already initialized compute user-data and enabled workgroup-ID SGPRs, but did not decode or
-initialize the following packed workgroup-info SGPR. Dreams extracted its ordered-append field while
-building M0 for `DS_ORDERED_COUNT`. Leaving the SGPR undefined poisoned the counter address and
-prevented draw-command generation.
+Dreams traversal shader `0xb535c6c8` is submitted in ordered direct batches using
+`vkCmdDispatchBase`. The source had lost the compute-pipeline flag required when base workgroup IDs
+are nonzero.
 
-The complete visible repair also required:
+The August 19 source now:
 
-- removing invalid mask-shadow restoration from numeric `V_READLANE_B32` and `V_WRITELANE_B32`;
-- implementing selected-lane semantics for SPIR-V `V_WRITELANE_B32`;
-- coherent canonical SGPR reads for thread-bit masks in `0x90272fc4`;
-- subgroup-leader allocation for contiguous sprite-compaction output.
+- records `uses_ordered_count` during shader-info collection;
+- creates those compute pipelines with `VK_PIPELINE_CREATE_DISPATCH_BASE_BIT`; and
+- keeps the existing direct traversal `vkCmdDispatchBase` path.
 
-## Scene publication zero-record capture was historical
+This correction produced the first repeatable visible change tied to one isolated code change:
+previously missing geometry became oversized grey shapes. Those shapes jittered when the camera
+moved, so the records or positions were still wrong. The correction is retained because the old
+pipeline/command combination was invalid and hid the next failure.
 
-The strongest current capture follows the compute chain into Dreams' scene queue producer:
+## `DS_ORDERED_COUNT` is not an ordinary atomic
 
-- Producer shader `0x2bfebd3c` repeatedly reports `records=0`.
-- Its flattened user-data buffer has 82 dwords.
-- Relevant values include `f18=0x2`, `f22=0x5fff`, and
-  `f36-45=0xcab83900,0x2,0xcab82f00,0x2,0,0,0,0,1,0`.
-- Producer SRT addresses alternated around `0x243202...` and `0x245202...`.
-- The record count is flattened entry 41, matching the field at `SRT + 0x64`.
-- The queue at `0x2e3ae0000` was all zero. Supporting producer buffers 3 and 4 were also all zero.
-- Buffer 2 was GPU-modified, so it could not be safely interpreted using the same CPU scan.
+AMD's RDNA instruction-set documentation defines `DS_ORDERED_COUNT` as a wave-ordered operation.
+Requests may reach GDS in arbitrary execution order, but are processed in guest wave-creation order.
+The operation is issued once per wave.
 
-That capture accurately described its moment but not the final recovered scene. Later tracing found
-`records=1`, the exact saved record in sprite-occlusion input, generated downstream records, and a
-live graphics consumer. The remaining zero-output point was the indirect-argument shader described
-above.
+Important encoded state:
 
-## `DS_ORDERED_COUNT` semantics matter
+- M0 high 16 bits: ordered-count base in dwords;
+- M0 low 16 bits: wave-crawler increment and logical wave ID;
+- `offset0`: selects the ordered counter;
+- `offset1` bit 0: `wave_release`;
+- `offset1` bit 1: `wave_done`;
+- `offset1` bits 5:4: counter operation.
 
-Dreams uses `DS_ORDERED_COUNT` in shader `0xb535c6c8`. The operation is not equivalent to a plain
-atomic increment. It uses one of multiple ordered counters and returns offsets in guest wavefront
-creation order.
+Reference: [AMD RDNA 3.5 Instruction Set Architecture](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna35_instruction_set_architecture.pdf).
 
-The current branch adds:
+The current shadPS4 implementation is incomplete:
 
-- instruction translation and IR support;
-- correct first-active-lane source handling;
-- M0/GDS index tracking;
-- enlarged private GDS scratch for ordered entries;
-- a serialized direct-dispatch path for the Dreams traversal shader;
-- completion handling used by the Dreams-specific path.
+- translation broadcasts the source from the first active guest lane;
+- resource tracking derives the GDS counter from M0 high bits and `offset0`;
+- resource tracking then discards M0 low bits containing guest logical-wave ordering data;
+- SPIR-V emission uses a host-subgroup leader and a normal atomic exchange/add/increment;
+- decoded `wave_release` and `wave_done` bits do not drive an ordered guest-wave queue.
 
-Upstream PR `#2899` was also reviewed during this investigation. It identified Dreams as the game
-requiring the opcode, but its simple shared-atomic implementation was closed because it did not
-model real ordering semantics.
+Serializing host workgroups does not solve this because multiple guest waves inside one workgroup
+can still reach the atomics in the wrong order. A global GPU spin loop is also unsafe without a
+scheduling proof: later waves can occupy execution resources while an earlier wave has not run,
+causing deadlock.
 
-## GDS transfer evidence
+## Ordered-count instructions captured in Dreams
 
-An earlier interpretation that GDS snapshots were all zero was incorrect. Exact capture lines show
-successful data propagation at GDS byte offset `0xc00`:
+Traversal shader `0xb535c6c8` contains four relevant operations:
 
-- Snapshot 21: `64,0,0,...`
-- Target `0xd049fb84` dispatch: third value reached `1866`
-- Snapshot 22: third value `5557`
-- Snapshot 23: third value `11121`
-- Snapshot 24: third value `16545`
+| PC | Source | Destination | `offset0` | `offset1` | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `0x126c` | `v2` | `v2` | `0x08` | `0x01` | release |
+| `0x1294` | `v1` | `v23` | `0x18` | `0x01` | release |
+| `0x12b4` | `v1` | `v22` | `0x0c` | `0x01` | release |
+| `0x12cc` | `v1` | `v21` | `0x10` | `0x03` | release and done |
 
-This confirms that compute shader writes can become visible to `GdsMemStore` transfer in the tested
-path. Old Dreams PR `#798` changes for compute release-memory, pipe-aware notifications, and queue
-setup are represented in modern shadPS4 code.
+This pattern is consistent with several ordered allocations followed by completion of one guest
+wave. It makes the ignored logical-wave ID and completion state directly relevant to Dreams rather
+than merely theoretical ISA details.
 
-## The 1 FPS diagnostic trap
+## Geometry draw and producer evidence
 
-The Dreams traversal workaround used to call `scheduler.Finish()` before every traversal dispatch,
-including roughly ten empty indirect traversal submissions per frame. That serialized the GPU and
-produced an artificial 1 FPS failure.
+The most expensive captured draw was:
 
-Normal execution no longer performs those CPU readbacks or full GPU waits. Expensive traversal
-dimension reads and ordered-counter snapshots are now limited to explicit diagnostic modes.
+- type: indexed indirect;
+- draw ordinal: 315 in that capture;
+- vertex shader: `0xd25db925`;
+- fragment shader: `0x3f6e1a00`;
+- maximum command count: 897;
+- indirect stride: 20 bytes;
+- measured time: approximately 46.327 ms.
 
-The latest user test is nevertheless still extremely slow and has invisible intro video, which
-proves at least one additional AV/presenter or synchronization bottleneck remains.
+This is the sprite/fleck geometry draw. It connects the traversal/compaction output to the missing
+sculpt and paint presentation. It is not evidence that the draw should be skipped, capped, or
+replaced by conventional triangle rendering.
 
-## Intro and startup behavior
+Earlier traces found two different states:
 
-- Decode reaches EOF and produces frames.
-- The Dreams logo video is paced by wall time.
-- A catch-up presentation loop made the intro effectively invisible and was removed.
-- The startup `Press X`, consent/EULA, and Preferences pages rendered correctly together in a known
-  good build.
-- Later changes regressed the intro to invisible video with severely lagged audio. Preserve the
-  known-good startup scheduling behavior while isolating the remaining slowdown.
+- an early state where all 897 indirect command slots were zero; and
+- a later state with 897 nonzero commands, 504 with active instances.
 
-## Offline and service behavior
+The later count did not guarantee valid positions or record ordering. The August 19 malformed grey
+geometry demonstrates why command nonzero counts alone are insufficient validation.
 
-Dreams attempts presence, NP WebApi, DNS, and service resolution during startup. The branch includes
-offline-safe responses and selected failure behavior so missing live services do not trap startup.
-This is enough for investigation without the original Dreams online servers, but it does not
-recreate community content or PSN entitlements.
+Other relevant shader IDs:
 
-## Earlier post-EOF descriptor findings
+- traversal: `0xb535c6c8`;
+- queue producer: `0x2bfebd3c`;
+- scene compaction: `0x3937a849`;
+- indirect arguments: `0x90272fc4`;
+- sprite/fleck geometry vertex stage: `0xd25db925`.
 
-The previous branch found that:
+## What the scene tests established
 
-- `0xff751373` could execute with buffers at `addr=0x1` and null `1x1` images at `addr=0x0`;
-- `0x853f753d` could have dummy buffers while still binding a real `R32G32Uint` `8x8x48` storage
-  image;
-- both obvious 10-bit EOF guest surfaces were blank;
-- AV host frames were valid even when those guest surfaces were blank;
-- post-EOF synthetic keepalive submissions repeatedly reopened a guest read fault.
+- Local tutorial and creation logic exists; the black result is not explained solely by unavailable
+  online scene downloads.
+- The imp moves and reacts, UI navigation works, and gadget logic can execute.
+- Gadgets can render and were eventually placeable.
+- Sculpt and paint placement can produce audio feedback while leaving no visible/selectable result.
+- A thin colored strip or dot changes with scene content, and moving a colored imp through the
+  affected corner can tint the whole output briefly. This is consistent with valid pixels being
+  generated with corrupt positioning or extent, not with the entire renderer being idle.
+- Looking down in creation scenes can expose grey lines or shapes at angle-dependent positions.
+- The dispatch-base correction expanded that evidence into visible but oversized grey geometry.
 
-Those results should remain available for regression comparison, but they are no longer the most
-immediate blocker on the current main-menu/tutorial branch.
+## Save-space accounting
+
+Dreams reported `4.00 GB` local usage against a `1.00 GB` limit even with zero creations shown.
+The emulator used host directory byte size divided by the PS4 block size and subtracted it from an
+unsigned block count. Sparse/allocation behavior and rounding could make used blocks exceed the
+declared maximum, underflowing free space.
+
+The corrected path:
+
+- counts regular files recursively;
+- rounds each file to a 32 KiB PS4 save block;
+- clamps free blocks to zero rather than allowing unsigned underflow; and
+- uses the same calculation for directory search and mounted-save information.
+
+After this correction the tested profile could create another scene. This is a save-API correction,
+not a host disk-space workaround, and it does not increase the game's real 1 GiB save limit.
+
+## Startup, offline behavior, and performance
+
+- Startup has reached the real Dreams intro, Continue, consent/EULA, Preferences, tutorial logic,
+  DreamShaping, and local creations.
+- Earlier builds displayed all three startup pages correctly; later experiments regressed some of
+  them to black.
+- The intro decoder reaches EOF and produces host frames, but current presentation can be black and
+  audio can be severely delayed.
+- Offline NP/WebApi/DNS/service behavior is sufficient to reach tested local content. Community
+  servers and PSN entitlement behavior are not recreated.
+- Broad diagnostics and repeated `scheduler.Finish()` calls can create artificial 1 FPS behavior.
+  The earlier stable scene was approximately 15-16 FPS; the malformed-geometry candidate was about
+  12 FPS in one captured scene.
+
+## Crash evidence
+
+Selecting a trigger-zone gadget produced a host exception record with code `0xe06d7363`. That is a
+Microsoft C++ exception code, but the available record contains no useful guest stack or exception
+message. It is preserved as a reproducible symptom, not assigned to the 3D renderer without further
+evidence.
+
+## Highest-value next implementation
+
+Preserve M0 low-bit logical-wave data through IR and implement ordered-count release/done behavior
+in guest wave order. Validate it against one fixed scene using command contents and visible output,
+not only command counts. A candidate passes only if:
+
+1. tweak panels remain visible;
+2. geometry does not move when only the camera changes;
+3. a sculpt preview and placed sculpt are visible and selectable;
+4. paint/fleck strokes render;
+5. gadgets and existing UI remain correct; and
+6. performance is measured with all forced-wait diagnostics disabled.

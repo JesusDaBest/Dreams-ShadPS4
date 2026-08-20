@@ -1,15 +1,76 @@
 # Fixes Tried
 
+## August 19 correction and current experiments
+
+The previous section called full-screen 3D rendering confirmed. Later repeat tests invalidated that
+claim. The 897 nonzero command result is retained as evidence that data reached the indirect draw,
+not as proof that sculpt/fleck geometry was correct.
+
+### Confirmed corrections
+
+- Restored `VK_PIPELINE_CREATE_DISPATCH_BASE_BIT` for compute pipelines that execute
+  `vkCmdDispatchBase` with nonzero base groups.
+- Added `uses_ordered_count` collection so the pipeline requirement follows shader behavior rather
+  than a title-only check.
+- Corrected save quota accounting to count rounded 32 KiB file blocks and clamp unsigned
+  subtraction. The tested false `4 GB used / 1 GB limit` state cleared and scene creation resumed.
+- Kept expensive diagnostics behind environment variables or one-shot trigger files.
+- Built and launched the resulting Release executable successfully.
+
+### Result that is useful but not fixed
+
+- Before the dispatch-base correction, sculpt/fleck geometry was invisible.
+- After it, large grey stepped shapes appeared in the same scene.
+- Those shapes changed position or jittered with camera movement.
+- Tweak-menu surfaces remained black.
+- Therefore the correction exposed malformed ordered geometry; it did not make 3D correct.
+
+### Ordered-count work that remains incomplete
+
+- The translator correctly selects the first active guest lane.
+- Counter indexing uses M0 high bits plus `offset0`.
+- M0 low-bit logical-wave information is still discarded.
+- SPIR-V emission still uses ordinary host-subgroup atomic operations.
+- `wave_release` and `wave_done` are decoded but do not advance a guest-ordered queue.
+- Direct host workgroup serialization does not guarantee wave order inside a workgroup.
+- Indirect traversal ordering remains optional/diagnostic and is too slow when implemented with CPU
+  readback and per-workgroup waits.
+
+### Experiments that did not solve rendering
+
+- Changing readback modes did not make sculpts or paint visible.
+- Lowering output resolution did not repair geometry.
+- Switching present mode did not repair geometry.
+- Enabling Vulkan validation once coincided with a correct intro, but the result did not persist and
+  was not established as causal.
+- Forcing storage barriers, changing ordered batch sizes, serializing traversal, and testing native
+  indirect dispatch changed performance or artifacts without producing stable sculpts.
+- Shader/input/command traces showed data reaching later stages, but receiving records is not the
+  same as generating correct positions.
+- Save/tutorial bypasses changed progression only and never repaired rendering.
+
+### User-visible state established by repeated tests
+
+- UI, imp, grid, and gadgets can render.
+- Gadgets became placeable and their logic worked.
+- Sculpt/paint placement could produce a sound without visible/selectable geometry.
+- Characters were not visible in the tested current scenes.
+- Some scenes produced a colored dot or strip at the top edge.
+- Grey lines appeared at angle-dependent camera positions.
+- Intro video/audio and startup pages can regress independently of the sculpt path.
+- Trigger-zone selection reproduced host exception `0xe06d7363`; no root cause is assigned yet.
+
 ## August 14-17 Main-Menu/Tutorial Branch
 
-### Full-screen 3D rendering confirmed
+### August 17 provisional 3D result (superseded)
 
 - Decoded `COMPUTE_PGM_RSRC2.TG_SIZE_EN` and initialized the requested compute workgroup-info SGPR.
 - Removed the last undefined scalar value from indirect-argument shader `0x90272fc4`.
 - Changed its output from 897 zero draw commands to 897 nonzero commands, 504 with instances.
 - Removed invalid mask-shadow restoration from numeric lane reads/writes.
 - Implemented selected-lane `V_WRITELANE_B32` behavior and contiguous subgroup sprite compaction.
-- Confirmed full-screen characters, backgrounds, flecks, UI, and the imp at 30 FPS in a clean run.
+- One run appeared to show full-screen characters, backgrounds, flecks, UI, and the imp at 30 FPS,
+  but later repeat tests contradicted the interpretation.
 - Kept diagnostic GPU waits disabled for performance validation.
 
 ### Confirmed progress
@@ -51,11 +112,11 @@
 - Tutorial progression save flags can bypass onboarding state, but they do not repair rendering.
 - Broad diagnostics are not valid performance tests because they intentionally force GPU waits.
 
-### Most useful next direction after the 3D repair
+### Most useful next direction after the provisional August 17 result
 
 - Validate tutorial, sculpting, gadgets, saved scenes, and premade Dreams.
 - Profile intro decode/presentation independently if clean repeated launches still regress.
-- Preserve the known-good startup and full-screen 3D paths while reducing diagnostics.
+- Preserve the known-good startup path and use the August 17 output only as a regression comparison.
 - Design a GPU-only ordered indirect traversal path if multi-workgroup ordering failures appear.
 
 ## Real Fixes or High-Value Progress
