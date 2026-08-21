@@ -1,0 +1,31 @@
+diff --git a/include/sirit/sirit.h b/include/sirit/sirit.h
+index 3d406de..c4e910f 100644
+--- a/include/sirit/sirit.h
++++ b/include/sirit/sirit.h
+@@ -1279,6 +1279,9 @@ public:
+     // the group.
+     Id OpGroupNonUniformBroadcast(Id result_type, Id scope, Id value, Id id);
+ 
++    /// Return the value from the invocation selected independently by each invocation.
++    Id OpGroupNonUniformShuffle(Id result_type, Id scope, Id value, Id id);
++
+     // Result is the Value of the invocation from the active invocation with the lowest id
+     // in the group to all active invocations in the group.
+     Id OpGroupNonUniformBroadcastFirst(Id result_type, Id scope, Id value);
+diff --git a/src/instructions/group.cpp b/src/instructions/group.cpp
+index 3d044cf..c468344 100644
+--- a/src/instructions/group.cpp
++++ b/src/instructions/group.cpp
+@@ -42,6 +42,12 @@ Id Module::OpGroupNonUniformBroadcast(Id result_type, Id scope, Id value, Id id)
+                  << id << EndOp{};
+ }
+ 
++Id Module::OpGroupNonUniformShuffle(Id result_type, Id scope, Id value, Id id) {
++    code->Reserve(6);
++    return *code << OpId{spv::Op::OpGroupNonUniformShuffle, result_type} << scope << value << id
++                 << EndOp{};
++}
++
+ Id Module::OpGroupNonUniformBroadcastFirst(Id result_type, Id scope, Id value) {
+     code->Reserve(5);
+     return *code << OpId{spv::Op::OpGroupNonUniformBroadcastFirst, result_type} << scope << value

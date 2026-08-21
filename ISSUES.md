@@ -1,41 +1,54 @@
 # Open Issues
 
-## 1. Implement guest-ordered `DS_ORDERED_COUNT`
+## 1. Find the first large-root scene-cache resource rejection
 
-The current backend keeps the counter address but loses the M0 logical-wave fields and treats the
-operation as a normal atomic. Preserve guest wave identity and implement `wave_release` and
-`wave_done` without a GPU scheduling deadlock.
+The 5,133–5,134-object sculpt root is scheduled, but its builder remains at sentinel identity with
+two empty incremental tables. Test the conditional cache bootstrap while preserving guest
+`+0x8b7bc0`. Log the first `0xffff` resource and follow its object/resource provenance.
 
-This is the primary blocker because restoring valid Vulkan dispatch-base behavior changed missing
-geometry into visible but incorrectly positioned geometry.
+Do not skip the check: it exits before cache mutation and makes next-frame retry safe.
 
-## 2. Make sculpt and paint geometry stable and visible
+## 2. Make the large root publish CPU render records
 
-Validate one fixed creation scene. A sculpt preview, placed sculpt, and paint stroke must remain
-visible and selectable while the camera moves. Do not accept nonzero indirect command counts alone.
+All captured type-1 entries and paired records came from 52-object sky/menu roots. The large root
+must reach the model/output builder and contribute records before GPU traversal can render it.
+Validate cache commit, enumerated count, model output count, and paired publication in that order.
 
-## 3. Preserve UI and gadget rendering
+## 3. Complete guest-ordered `DS_ORDERED_COUNT`
 
-Tweak panels can be black and geometry can jitter. Any ordered-count correction must preserve the
-currently working imp, grid, UI, gadget placement, and gadget logic.
+The counter address is now correct: M0's high field is a dword base and only `OFFSET0` is divided by
+four. The backend still loses M0 logical-wave fields and treats release/done as ordinary atomics.
+Implement guest wave ordering without a GPU scheduling deadlock after the CPU producer is live.
 
-## 4. Repair intro presentation and audio timing
+## 4. Make sculpt and paint geometry stable and selectable
 
-The decoder produces frames, but some current runs show black video and severely delayed audio.
-Test this separately from the geometry path with diagnostics disabled.
+Validate one fixed scene. A sculpt preview, placed sculpt, and paint stroke must remain visible and
+selectable while the camera moves. Do not accept nonzero command counts or corrupted cube pixels
+as success.
 
-## 5. Investigate the trigger-zone host exception
+## 5. Preserve UI, gadget, and sky-fleck rendering
+
+Any producer, cache, or ordered-count change must preserve the currently working imp, grid, UI,
+gadget placement/logic, and sky/menu flecks. Tweak panels must not become black.
+
+## 6. Repair intro presentation and audio timing
+
+The decoder produces frames, but some runs show black video and severely delayed audio. Test this
+separately from sculpt rendering with forced-wait diagnostics disabled.
+
+## 7. Investigate the trigger-zone host exception
 
 Selecting a trigger zone reproduced host exception `0xe06d7363`. Capture the exception message and
 native stack before assigning it to rendering, save data, or gadget logic.
 
-## 6. Reduce diagnostics and isolate upstream-quality changes
+## 8. Split research diagnostics from production fixes
 
-The snapshot contains thousands of lines of gated tracing and several emulator-wide experiments.
-Separate confirmed corrections from diagnostics before upstream review. Audit all generalized
-changes against games other than Dreams.
+The checkpoint mixes confirmed corrections with thousands of lines of gated breakpoints, captures,
+waits, and title-specific experiments. Separate generic fixes from diagnostic code before any
+upstream submission. The Sirit shuffle addition also needs a real dependency fork/commit rather
+than a standalone patch.
 
-## 7. Verify offline ownership and content boundaries
+## 9. Verify offline ownership and content boundaries
 
 Local content can load without live Dreams servers, but PSN entitlement/demo behavior and community
 content are not verified. Do not imply that offline stubs restore discontinued online services.
@@ -45,13 +58,15 @@ content are not verified. Do not imply that offline stubs restore discontinued o
 - false `4 GB used / 1 GB limit` save state;
 - black Continue/EULA/Preferences pages;
 - invisible or severely delayed intro;
+- sentinel cache identity with empty incremental tables;
+- large root absent from type-1 and paired records;
 - zero indirect geometry commands;
-- nonzero commands with malformed positions;
+- correct address with invisible sculpt;
+- intentionally wrong address with dark/fragmented/flickering cubes;
 - colored top-edge dot or compressed render strip;
 - black tweak panels;
-- angle-dependent grey lines;
-- camera-relative geometry jitter;
-- missing sculpt previews, placed sculpts, paint/flecks, and characters;
-- gadget placement or logic regression;
-- forced diagnostics reducing execution to roughly 1 FPS;
-- post-EOF and gadget-selection crashes.
+- camera-relative jitter;
+- missing sculpt preview, placed sculpt, paint/flecks, and characters;
+- gadget or sky-fleck regression;
+- forced diagnostics reducing execution to roughly 1 FPS; and
+- post-EOF or gadget-selection crashes.
