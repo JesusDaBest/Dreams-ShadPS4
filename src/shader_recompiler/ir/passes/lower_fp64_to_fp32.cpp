@@ -118,6 +118,8 @@ static IR::Opcode Replace(IR::Opcode op) {
         return IR::Opcode::FPIsInf32;
     case IR::Opcode::ConvertS32F64:
         return IR::Opcode::ConvertS32F32;
+    case IR::Opcode::ConvertU32F64:
+        return IR::Opcode::ConvertU32F32;
     case IR::Opcode::ConvertF32F64:
         return IR::Opcode::Identity;
     case IR::Opcode::ConvertF64F32:

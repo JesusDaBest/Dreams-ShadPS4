@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <ranges>
 
+#include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -29,6 +30,15 @@ using Shader::Output;
 using Shader::Stage;
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
+
+static bool ForceDreamsLdsMemoryBarrier(u64 hash) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("SHADPS4_DREAMS_48A_LDS_BARRIER");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled && Shader::DreamsCompat::NeedsDreamsLdsBarrier(hash) &&
+           Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
 
 constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
@@ -247,6 +257,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.cs_info.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
                                     cs_pgm.IsTgidEnabled(2)};
         info.cs_info.tg_size_enable = cs_pgm.settings.tg_size_en;
+        // COMPUTE_DISPATCH_INITIATOR.ORDERED_APPEND_ENBL makes the hardware append a
+        // workgroup-info SGPR even when TG_SIZE_EN is clear.
+        info.cs_info.ordered_append_enable = (cs_pgm.dispatch_initiator & (1U << 3)) != 0;
         info.cs_info.shared_memory_size = cs_pgm.SharedMemSize();
         break;
     }
@@ -615,9 +628,23 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");
 
+    if (info.pgm_hash == 0x7ba4de5d &&
+        std::getenv("SHADPS4_DREAMS_GATHER_INFLATE_LDS") != nullptr) {
+        LOG_WARNING(Render_Vulkan, "Dreams diagnostic: inflating GatherVoxelsChunk LDS {} -> {}",
+                    runtime_info.cs_info.shared_memory_size, profile.max_shared_memory_size);
+        runtime_info.cs_info.shared_memory_size = profile.max_shared_memory_size;
+    }
+
+    auto shader_profile = profile;
+    if (ForceDreamsLdsMemoryBarrier(info.pgm_hash)) {
+        shader_profile.needs_lds_barriers = true;
+        LOG_WARNING(Render_Vulkan, "Dreams diagnostic: forcing LDS memory barrier for shader {:#x}",
+                    info.pgm_hash);
+    }
     const auto ir_program =
-        Shader::TranslateProgram(code, code_data, pools, info, runtime_info, profile);
-    auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+        Shader::TranslateProgram(code, code_data, pools, info, runtime_info, shader_profile);
+    auto spv =
+        Shader::Backend::SPIRV::EmitSPIRV(shader_profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.stage, perm_idx, "spv");
 
     vk::ShaderModule module;
@@ -625,7 +652,10 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     auto patch = GetShaderPatch(info.pgm_hash, info.stage, perm_idx, "spv");
     const bool dreams_sprite_patch = std::getenv("SHADPS4_DREAMS_SPRITE_SHADER_PATCH") &&
                                       Shader::DreamsCompat::IsSpriteCullShader(info.pgm_hash);
-    const bool is_patched = patch && (EmulatorSettings.IsPatchShaders() || dreams_sprite_patch);
+    const bool dreams_gather_patch = std::getenv("SHADPS4_DREAMS_GATHER_SHADER_PATCH") &&
+                                     info.pgm_hash == 0x7ba4de5d;
+    const bool is_patched =
+        patch && (EmulatorSettings.IsPatchShaders() || dreams_sprite_patch || dreams_gather_patch);
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.stage, info.pgm_hash);
         module = CompileSPV(*patch, instance.GetDevice());

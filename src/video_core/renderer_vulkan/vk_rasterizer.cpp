@@ -10,6 +10,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -45,7 +46,11 @@ static constexpr VAddr DreamsTraversalCompletionOffset =
 static bool OrderDreamsIndirectTraversal() {
     static const bool enabled = [] {
         const char* value = std::getenv("SHADPS4_DREAMS_ORDER_INDIRECT");
-        return value != nullptr && std::string_view{value} == "1";
+        // DS_ORDERED_COUNT must observe wave-creation order. The traversal shader has exactly one
+        // 64-lane guest wave per workgroup, so dispatching indirect workgroups individually is a
+        // safe (if slower) way to provide that ordering without a cross-workgroup GPU spin lock.
+        // Keep an explicit opt-out for regression testing.
+        return value == nullptr || std::string_view{value} != "0";
     }();
     return enabled;
 }
@@ -63,11 +68,105 @@ static u32 DreamsTraversalBatchSize() {
     return batch_size;
 }
 
+static bool OrderDreamsSceneCompact() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_SCENE_COMPACT_ORDERED");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool OrderDreamsVisibilityList(u64 shader_hash) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_VISIBILITY_LIST_ORDERED");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+           (shader_hash == Shader::DreamsCompat::VisibilityListCompactShader ||
+            shader_hash == Shader::DreamsCompat::VisibilityListCompactShaderAlt);
+}
+
+static bool StabilizeDreamsGraphicsBuffers() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_GRAPHICS_BUFFER_STABILIZE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool StabilizeDreamsComputeIndirectBuffers() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_COMPUTE_INDIRECT_STABILIZE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool PrewarmDreamsD25BdaTransforms() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_D25_BDA_PREWARM");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool PrewarmDreamsVs370BdaTransforms() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_VS370_BDA_PREWARM");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool PrewarmDreamsDccBdaConstants() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_DCC_BDA_PREWARM");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static void ApplyDreamsGraphicsBufferBarrier(Scheduler& scheduler) {
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    scheduler.EndRendering();
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+}
+
+static void ApplyDreamsComputeIndirectBufferBarrier(Scheduler& scheduler) {
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    scheduler.EndRendering();
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+}
+
+static bool TraceDreamsGatherStages() {
+    static const bool enabled =
+        std::getenv("SHADPS4_DREAMS_GATHER_STAGE_TRACE") != nullptr;
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
 static void DispatchDreamsTraversalOrdered(vk::CommandBuffer cmdbuf, u32 dim_x, u32 dim_y,
-                                           u32 dim_z) {
+                                           u32 dim_z, u32 forced_batch_size = 0) {
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
     };
     const vk::DependencyInfo dependency{
         .memoryBarrierCount = 1,
@@ -75,7 +174,8 @@ static void DispatchDreamsTraversalOrdered(vk::CommandBuffer cmdbuf, u32 dim_x, 
     };
 
     bool first = true;
-    const u32 batch_size = DreamsTraversalBatchSize();
+    const u32 batch_size =
+        forced_batch_size != 0 ? forced_batch_size : DreamsTraversalBatchSize();
     for (u32 z = 0; z < dim_z; ++z) {
         for (u32 y = 0; y < dim_y; ++y) {
             for (u32 x = 0; x < dim_x; x += batch_size) {
@@ -235,7 +335,7 @@ struct RecentComputeDispatch {
     u32 dim_z{};
 };
 
-static std::array<RecentComputeDispatch, 32> g_recent_compute_dispatches{};
+static std::array<RecentComputeDispatch, 256> g_recent_compute_dispatches{};
 static u32 g_recent_compute_dispatch_index{};
 static u64 g_compute_dispatch_sequence{};
 
@@ -271,6 +371,20 @@ static bool TraceDreamsDiagnostics() {
         return value != nullptr && std::string_view{value} == "1";
     }();
     return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool TraceDreamsModelRecord() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_MODEL_RECORD_TRACE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool OverlapsDreamsModelConfigGds(const VAddr address, const u64 size) {
+    constexpr VAddr ModelConfigGdsBegin = 704 * sizeof(u32);
+    constexpr VAddr ModelConfigGdsEnd = 729 * sizeof(u32);
+    return size != 0 && address < ModelConfigGdsEnd && ModelConfigGdsBegin < address + size;
 }
 
 static bool TraceDreamsOrderedCounters() {
@@ -310,6 +424,83 @@ static bool TraceDreamsVisibilityCounts() {
     }();
     return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
 }
+
+static bool TraceDreamsVisibilityLists() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_VISIBILITY_LIST_TRACE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static u32 DreamsVisibilityListTraceLimit() {
+    static const u32 limit = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_VISIBILITY_LIST_TRACE_LIMIT");
+        if (value == nullptr || value[0] == '\0') {
+            return 16U;
+        }
+        char* end{};
+        const u64 parsed = std::strtoull(value, &end, 10);
+        return end != value ? static_cast<u32>(std::clamp<u64>(parsed, 1, 64)) : 16U;
+    }();
+    return limit;
+}
+
+static u32 g_dreams_visibility_list_trace_remaining{};
+static u32 g_dreams_visibility_list_trace_ordinal{};
+static bool g_dreams_visibility_list_trace_initialized{};
+
+static bool ConsumeDreamsVisibilityListTraceRequest() {
+    if (!TraceDreamsVisibilityLists()) {
+        return false;
+    }
+
+    const char* trigger_file =
+        std::getenv("SHADPS4_DREAMS_VISIBILITY_LIST_TRACE_TRIGGER_FILE");
+    if (trigger_file != nullptr && trigger_file[0] != '\0') {
+        std::error_code error;
+        if (std::filesystem::remove(trigger_file, error)) {
+            g_dreams_visibility_list_trace_remaining = DreamsVisibilityListTraceLimit();
+            LOG_WARNING(Render_Vulkan, "Dreams visibility list trace armed for {} dispatches",
+                        g_dreams_visibility_list_trace_remaining);
+        }
+    } else if (!g_dreams_visibility_list_trace_initialized) {
+        g_dreams_visibility_list_trace_initialized = true;
+        g_dreams_visibility_list_trace_remaining = DreamsVisibilityListTraceLimit();
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams visibility list trace auto-armed for {} dispatches",
+                    g_dreams_visibility_list_trace_remaining);
+    }
+
+    if (g_dreams_visibility_list_trace_remaining == 0) {
+        return false;
+    }
+    --g_dreams_visibility_list_trace_remaining;
+    return true;
+}
+
+static u64 HashDreamsTraceWords(std::span<const u32> words) {
+    u64 hash = 1469598103934665603ULL;
+    for (const u32 word : words) {
+        hash ^= word;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+struct DreamsVisibilityListConsumerSnapshot {
+    bool valid{};
+    u32 ordinal{};
+    u64 shader_hash{};
+    u64 dispatch_sequence{};
+    VAddr output_base{};
+    u32 active_records{};
+    u32 sampled_records{};
+    u64 output_hash{};
+    std::vector<u32> words;
+};
+
+static DreamsVisibilityListConsumerSnapshot g_dreams_visibility_list_consumer_snapshot{};
 
 static bool g_dreams_visibility_count_trace_active{};
 
@@ -402,12 +593,330 @@ static constexpr u64 DreamsFleckFragmentShader = 0xdcc325c2;
 static constexpr u64 DreamsSpriteGeometryVertexShader = 0xd25db925;
 static constexpr u64 DreamsSpriteGeometryVertexShaderAlt = 0x3706083c;
 
+static void ApplyDreamsDccBdaPrewarm(const GraphicsPipeline* pipeline,
+                                     Core::MemoryManager* memory,
+                                     VideoCore::BufferCache& buffer_cache) {
+    if (!PrewarmDreamsDccBdaConstants()) {
+        return;
+    }
+
+    const Shader::Info* fragment_info{};
+    for (const auto* shader : pipeline->GetStages()) {
+        if (shader != nullptr && shader->l_stage == Shader::LogicalStage::Fragment) {
+            fragment_info = shader;
+            break;
+        }
+    }
+    if (fragment_info == nullptr || fragment_info->pgm_hash != DreamsFleckFragmentShader) {
+        return;
+    }
+
+    constexpr VAddr GuestAddressLimit = VAddr{1} << 48;
+    constexpr u64 ConstantBlockSize = 16;
+    const bool has_user_data = fragment_info->user_data.size() >= 5;
+    VAddr root_base{};
+    u32 selector{};
+    u64 block_offset{};
+    VAddr constant_address{};
+    bool address_in_range{};
+    bool mapped{};
+    bool registered_before{};
+    bool registered_after{};
+    bool gpu_modified{};
+    VideoCore::BufferId buffer_id{};
+    std::array<u32, ConstantBlockSize / sizeof(u32)> words{};
+
+    if (has_user_data) {
+        root_base = (VAddr{fragment_info->user_data[0]} |
+                     (VAddr{fragment_info->user_data[1]} << 32)) &
+                    (GuestAddressLimit - 1);
+        selector = fragment_info->user_data[4];
+        block_offset = u64{selector} * ConstantBlockSize;
+        address_in_range =
+            root_base != 0 && block_offset <= GuestAddressLimit - root_base &&
+            ConstantBlockSize <= GuestAddressLimit - (root_base + block_offset);
+        if (address_in_range) {
+            constant_address = root_base + block_offset;
+            mapped = memory->IsValidMapping(constant_address, ConstantBlockSize);
+        }
+        if (mapped) {
+            registered_before =
+                buffer_cache.IsRegionRegistered(constant_address, ConstantBlockSize);
+            gpu_modified = buffer_cache.IsRegionGpuModified(constant_address, ConstantBlockSize);
+            // Dynamic ReadConst has no ordinary descriptor to register this guest page. Register
+            // and synchronize it before BindResources builds the shader's BDA page table.
+            buffer_id = buffer_cache.FindBuffer(constant_address, ConstantBlockSize);
+            buffer_cache.SynchronizeBuffersInRange(constant_address, ConstantBlockSize);
+            registered_after =
+                buffer_cache.IsRegionRegistered(constant_address, ConstantBlockSize);
+            std::memcpy(words.data(), std::bit_cast<const void*>(constant_address),
+                        ConstantBlockSize);
+        }
+    }
+
+    static u32 log_count{};
+    if (log_count < 32) {
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams dcc BDA prewarm #{} root={:#x} selector={} address={:#x}+{:#x} "
+            "userdata={} in_range={} mapped={} registered_before={} registered_after={} "
+            "gpu_modified={} buffer_id={} words={:#010x},{:#010x},{:#010x},{:#010x}",
+            ++log_count, root_base, selector, constant_address, ConstantBlockSize, has_user_data,
+            address_in_range, mapped, registered_before, registered_after, gpu_modified,
+            buffer_id.index, words[0], words[1], words[2], words[3]);
+    }
+}
+
 static bool TraceDreamsFleckRendering() {
     static const bool enabled = [] {
         const char* value = std::getenv("SHADPS4_DREAMS_FLECK_TRACE");
         return value != nullptr && std::string_view{value} == "1";
     }();
     return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool TraceDreamsTemporalImages() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_TEMPORAL_IMAGE_TRACE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static u32 DreamsTemporalImageTraceLimit() {
+    static const u32 limit = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_TEMPORAL_IMAGE_TRACE_LIMIT");
+        if (value == nullptr || value[0] == '\0') {
+            return 16U;
+        }
+        char* end{};
+        const u64 parsed = std::strtoull(value, &end, 10);
+        return end != value ? static_cast<u32>(std::clamp<u64>(parsed, 2, 32)) : 16U;
+    }();
+    return limit;
+}
+
+static u32 g_dreams_temporal_image_trace_remaining{};
+static u32 g_dreams_temporal_image_trace_ordinal{};
+static bool g_dreams_temporal_image_trace_initialized{};
+
+static bool ConsumeDreamsTemporalImageTraceRequest() {
+    if (!TraceDreamsTemporalImages()) {
+        return false;
+    }
+
+    const char* trigger_file =
+        std::getenv("SHADPS4_DREAMS_TEMPORAL_IMAGE_TRACE_TRIGGER_FILE");
+    if (trigger_file != nullptr && trigger_file[0] != '\0') {
+        std::error_code error;
+        if (std::filesystem::remove(trigger_file, error)) {
+            g_dreams_temporal_image_trace_remaining = DreamsTemporalImageTraceLimit();
+            LOG_WARNING(Render_Vulkan, "Dreams temporal image trace armed for {} dispatches",
+                        g_dreams_temporal_image_trace_remaining);
+        }
+    } else if (!g_dreams_temporal_image_trace_initialized) {
+        g_dreams_temporal_image_trace_initialized = true;
+        g_dreams_temporal_image_trace_remaining = DreamsTemporalImageTraceLimit();
+        LOG_WARNING(Render_Vulkan, "Dreams temporal image trace auto-armed for {} dispatches",
+                    g_dreams_temporal_image_trace_remaining);
+    }
+
+    if (g_dreams_temporal_image_trace_remaining == 0) {
+        return false;
+    }
+    --g_dreams_temporal_image_trace_remaining;
+    return true;
+}
+
+struct DreamsTemporalContentImage {
+    bool valid{};
+    bool written{};
+    u32 binding{};
+    u32 array_size{};
+    VideoCore::ImageId image_id{};
+    u64 image_uid{};
+    VAddr descriptor_base{};
+    u32 descriptor_width{};
+    u32 descriptor_height{};
+    u32 descriptor_depth{};
+    u32 descriptor_pitch{};
+    VAddr guest_base{};
+    u64 guest_size{};
+    u32 cached_width{};
+    u32 cached_height{};
+    u32 cached_depth{};
+    u32 cached_pitch{};
+    u32 bits{};
+    u32 image_format{};
+    u32 tile_mode{};
+    u32 view_format{};
+    u32 base_level{};
+    u32 levels{};
+    u32 base_layer{};
+    u32 layers{};
+    u64 linear_size{};
+    u32 flattened_index{};
+};
+
+struct DreamsTemporalContentChainKey {
+    VAddr image_a{};
+    VAddr image_b{};
+    u32 width{};
+    u32 height{};
+    u32 pitch{};
+
+    bool operator==(const DreamsTemporalContentChainKey&) const = default;
+};
+
+struct DreamsTemporalContentChain {
+    DreamsTemporalContentChainKey key;
+    u32 dispatches{};
+};
+
+struct DreamsTemporalContentCaptureState {
+    bool active{};
+    u32 remaining{};
+    u32 ordinal{};
+    std::filesystem::path output_dir;
+    std::vector<DreamsTemporalContentChain> chains;
+};
+
+static DreamsTemporalContentCaptureState g_dreams_temporal_content_capture{};
+
+static bool EnableDreamsTemporalContentCapture() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_TEMPORAL_CONTENT_CAPTURE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static u32 DreamsTemporalContentCaptureLimit() {
+    static const u32 limit = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_TEMPORAL_CONTENT_CAPTURE_LIMIT");
+        if (value == nullptr || value[0] == '\0') {
+            return 4U;
+        }
+        char* end{};
+        const u64 parsed = std::strtoull(value, &end, 10);
+        return end != value ? static_cast<u32>(std::clamp<u64>(parsed, 4, 8)) : 4U;
+    }();
+    return limit;
+}
+
+static bool BeginDreamsTemporalContentCaptureDispatch() {
+    auto& capture = g_dreams_temporal_content_capture;
+    if (!EnableDreamsTemporalContentCapture()) {
+        return false;
+    }
+
+    if (!capture.active) {
+        const char* trigger_file =
+            std::getenv("SHADPS4_DREAMS_TEMPORAL_CONTENT_CAPTURE_TRIGGER_FILE");
+        const char* output_dir =
+            std::getenv("SHADPS4_DREAMS_TEMPORAL_CONTENT_CAPTURE_DIR");
+        if (trigger_file == nullptr || trigger_file[0] == '\0' || output_dir == nullptr ||
+            output_dir[0] == '\0') {
+            return false;
+        }
+        std::error_code error;
+        if (!std::filesystem::remove(trigger_file, error)) {
+            return false;
+        }
+
+        capture.output_dir = output_dir;
+        std::filesystem::create_directories(capture.output_dir, error);
+        if (error) {
+            LOG_ERROR(Render_Vulkan,
+                      "Failed to create Dreams temporal content capture directory {}: {}",
+                      capture.output_dir.string(), error.message());
+            return false;
+        }
+
+        std::ofstream dispatches{capture.output_dir / "dispatches.tsv", std::ios::trunc};
+        std::ofstream images{capture.output_dir / "images.tsv", std::ios::trunc};
+        if (!dispatches || !images) {
+            LOG_ERROR(Render_Vulkan,
+                      "Failed to initialize Dreams temporal content capture metadata in {}",
+                      capture.output_dir.string());
+            return false;
+        }
+        dispatches << "ordinal\tdispatch_sequence\tchain\tchain_dispatch\tchain_key_a\t"
+                      "chain_key_b\tdim_x\tdim_y\tdim_z\tsrt28_flat44_width_max\t"
+                      "srt29_flat45_height_max\tsrt30_flat46_uv_scale_x\t"
+                      "srt31_flat47_uv_scale_y\tsrt32_flat48_history_weight\n";
+        images << "ordinal\tdispatch_sequence\tchain\tphase\trole\tbinding\tarray_size\t"
+                  "valid\twritten\timage_id\timage_uid\tdescriptor_base\t"
+                  "descriptor_width\tdescriptor_height\tdescriptor_depth\t"
+                  "descriptor_pitch\tguest_base\tguest_size\tcached_width\t"
+                  "cached_height\tcached_depth\tcached_pitch\tbits\timage_format\t"
+                  "tile_mode\tview_format\tbase_level\tlevels\tbase_layer\tlayers\t"
+                  "linear_size\tfile\n";
+
+        capture.active = true;
+        capture.remaining = DreamsTemporalContentCaptureLimit();
+        capture.ordinal = 0;
+        capture.chains.clear();
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams temporal content capture armed for {} dispatches in {}",
+                    capture.remaining, capture.output_dir.string());
+    }
+
+    return capture.remaining != 0;
+}
+
+static std::pair<u32, u32> AssignDreamsTemporalContentChain(
+    const std::array<DreamsTemporalContentImage, 4>& images) {
+    const auto image_address = [](const DreamsTemporalContentImage& image) {
+        return image.valid ? image.guest_base : image.descriptor_base;
+    };
+    const VAddr output = image_address(images[0]);
+    const VAddr history = image_address(images[1]);
+    const DreamsTemporalContentChainKey key{
+        .image_a = std::min(output, history),
+        .image_b = std::max(output, history),
+        .width = images[0].descriptor_width,
+        .height = images[0].descriptor_height,
+        .pitch = images[0].descriptor_pitch,
+    };
+    auto& chains = g_dreams_temporal_content_capture.chains;
+    auto chain = std::ranges::find(chains, key, &DreamsTemporalContentChain::key);
+    if (chain == chains.end()) {
+        chain = chains.insert(chains.end(), {.key = key});
+    }
+    return {static_cast<u32>(std::distance(chains.begin(), chain)) + 1, ++chain->dispatches};
+}
+
+static void WriteDreamsTemporalContentImageMetadata(
+    u32 ordinal, u64 dispatch_sequence, u32 chain, std::string_view phase,
+    std::string_view role, const DreamsTemporalContentImage& image,
+    const std::filesystem::path& filename) {
+    std::ofstream stream{g_dreams_temporal_content_capture.output_dir / "images.tsv",
+                         std::ios::app};
+    stream << ordinal << '\t' << dispatch_sequence << '\t' << chain << '\t' << phase << '\t'
+           << role << '\t' << image.binding << '\t' << image.array_size << '\t' << image.valid
+           << '\t' << image.written << '\t' << image.image_id.index << '\t' << image.image_uid
+           << '\t' << image.descriptor_base << '\t' << image.descriptor_width << '\t'
+           << image.descriptor_height << '\t' << image.descriptor_depth << '\t'
+           << image.descriptor_pitch << '\t' << image.guest_base << '\t' << image.guest_size
+           << '\t' << image.cached_width << '\t' << image.cached_height << '\t'
+           << image.cached_depth << '\t' << image.cached_pitch << '\t' << image.bits << '\t'
+           << image.image_format << '\t' << image.tile_mode << '\t' << image.view_format << '\t'
+           << image.base_level << '\t' << image.levels << '\t' << image.base_layer << '\t'
+           << image.layers << '\t' << image.linear_size << '\t' << filename.filename().string()
+           << '\n';
+}
+
+static void FinishDreamsTemporalContentCaptureDispatch() {
+    auto& capture = g_dreams_temporal_content_capture;
+    if (capture.remaining != 0) {
+        --capture.remaining;
+    }
+    if (capture.remaining == 0) {
+        capture.active = false;
+        LOG_WARNING(Render_Vulkan, "Dreams temporal content capture complete: {}",
+                    capture.output_dir.string());
+    }
 }
 
 static bool ForceDreamsStorageDependencies() {
@@ -520,6 +1029,19 @@ static std::optional<std::filesystem::path> ConsumeDreamsVisibilityTargetDumpReq
         return std::nullopt;
     }
     return output;
+}
+
+static u32 DreamsVisibilityTargetDumpCount() {
+    static const u32 count = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_VISIBILITY_TARGET_DUMP_COUNT");
+        if (value == nullptr || value[0] == '\0') {
+            return 1U;
+        }
+        char* end{};
+        const u64 parsed = std::strtoull(value, &end, 10);
+        return end != value ? static_cast<u32>(std::clamp<u64>(parsed, 1, 64)) : 1U;
+    }();
+    return count;
 }
 
 static bool IsDreamsFleckPipeline(const GraphicsPipeline* pipeline) {
@@ -749,11 +1271,13 @@ static void TraceDreamsSceneGraphicsDraw(bool indirect, bool indexed,
 static bool TrackDreamsBufferWriters() {
     return TraceDreamsBufferDependencies() || TraceDreamsProducerSources() ||
            TraceDreamsSceneStream() || TraceDreamsFleckRendering() ||
-           TraceDreamsVisibilityCounts();
+           TraceDreamsVisibilityCounts() || TraceDreamsVisibilityLists() ||
+           TraceDreamsModelRecord();
 }
 
 static bool TrackDreamsImageWriters() {
-    return TraceDreamsProducerSources() || TraceDreamsFleckRendering();
+    return TraceDreamsProducerSources() || TraceDreamsFleckRendering() ||
+           TraceDreamsTemporalImages();
 }
 
 static bool OverlapsDreamsRange(VAddr lhs_base, u64 lhs_size, VAddr rhs_base, u64 rhs_size) {
@@ -998,10 +1522,15 @@ static void TraceComputeShader(const Shader::Info& info, bool indirect, u32 dim_
     TraceDreamsComputeWindow(info, indirect, dim_x, dim_y, dim_z);
 
     static const bool enabled = std::getenv("SHADPS4_TRACE_COMPUTE") != nullptr;
+    static const u64 start_sequence = [] {
+        const char* value = std::getenv("SHADPS4_TRACE_COMPUTE_START");
+        return value != nullptr ? std::strtoull(value, nullptr, 0) : u64{0};
+    }();
     static u32 count{};
-    if (enabled && count++ < 4096) {
-        LOG_WARNING(Render_Vulkan, "Compute dispatch hash={:#x} dims={}x{}x{}", info.pgm_hash,
-                    dim_x, dim_y, dim_z);
+    if (enabled && g_compute_dispatch_sequence >= start_sequence && count++ < 4096) {
+        LOG_WARNING(Render_Vulkan,
+                    "Compute dispatch sequence={} hash={:#x} indirect={} dims={}x{}x{}",
+                    g_compute_dispatch_sequence, info.pgm_hash, indirect, dim_x, dim_y, dim_z);
     }
 }
 
@@ -1011,26 +1540,37 @@ static bool ShouldProfileCompute() {
     return enabled && count++ < 512;
 }
 
+static u32 g_dreams_gpu_profile_remaining{};
+static u32 g_dreams_gpu_profile_ordinal{};
+
+static void ArmDreamsGpuProfile() {
+    g_dreams_gpu_profile_remaining = 512;
+    g_dreams_gpu_profile_ordinal = 0;
+}
+
+static bool ProfileDreamsGpuAfterGather() {
+    static const bool enabled =
+        std::getenv("SHADPS4_DREAMS_GPU_PROFILE_AFTER_GATHER") != nullptr;
+    return enabled;
+}
+
 static u32 ConsumeDreamsGpuProfileEvent() {
     if (Common::ElfInfo::Instance().GameSerial() != "CUSA04301") {
         return 0;
     }
-    static u32 remaining{};
-    static u32 ordinal{};
     const char* trigger_file = std::getenv("SHADPS4_DREAMS_GPU_PROFILE_TRIGGER_FILE");
     if (trigger_file != nullptr && trigger_file[0] != '\0') {
         std::error_code error;
         if (std::filesystem::remove(trigger_file, error)) {
-            remaining = 512;
-            ordinal = 0;
+            ArmDreamsGpuProfile();
             LOG_WARNING(Render_Vulkan, "Dreams one-shot GPU profile started");
         }
     }
-    if (remaining == 0) {
+    if (g_dreams_gpu_profile_remaining == 0) {
         return 0;
     }
-    --remaining;
-    return ++ordinal;
+    --g_dreams_gpu_profile_remaining;
+    return ++g_dreams_gpu_profile_ordinal;
 }
 
 static bool ShouldProfileDreamsTraversal(const Shader::Info& info) {
@@ -1235,6 +1775,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                                 regs.num_instances.NumInstances(), 0, 0, 0, 0);
 
     PrepareRenderState(pipeline);
+    ApplyDreamsDccBdaPrewarm(pipeline, memory, buffer_cache);
     if (!BindResources(pipeline)) {
         return;
     }
@@ -1273,12 +1814,34 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     ordinal, regs.num_indices, regs.num_instances.NumInstances(), index_offset);
     }
 
+    const bool stabilize_graphics_buffers = StabilizeDreamsGraphicsBuffers();
+    if (stabilize_graphics_buffers) {
+        // BeginRendering and the graphics-only ranges can grow cache buffers after shader
+        // descriptors were first resolved. Settle those ranges without changing access state,
+        // then refresh only the shader buffer descriptors against the final cache union.
+        buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers, true);
+        if (is_indexed) {
+            buffer_cache.BindIndexBuffer(index_offset, buffer_barriers, true);
+        }
+        const u32 changed_handles = RefreshBufferResources(pipeline, true);
+        static u32 dreams_graphics_stabilize_direct_log_count{};
+        if ((changed_handles != 0 || dreams_graphics_stabilize_direct_log_count == 0) &&
+            dreams_graphics_stabilize_direct_log_count++ < 64) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams graphics stabilization direct indexed={} changed_handles={}",
+                        is_indexed, changed_handles);
+        }
+    }
+
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     }
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    if (stabilize_graphics_buffers) {
+        ApplyDreamsGraphicsBufferBarrier(scheduler);
+    }
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -1373,9 +1936,581 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     TraceDreamsGraphicsPipeline(true, is_indexed, pipeline, regs, 0, 0, arg_address + offset,
                                 stride, max_count, count_address);
 
+    if (PrewarmDreamsVs370BdaTransforms()) {
+        const auto& vertex_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
+        if (vertex_info.pgm_hash == DreamsSpriteGeometryVertexShaderAlt) {
+            constexpr VAddr GuestAddressLimit = VAddr{1} << 48;
+            constexpr u64 TransformStride = 192;
+            constexpr u64 TransformBlockOffset = 128;
+            constexpr u64 TransformBlockSize = 64;
+
+            const bool has_constants =
+                vertex_info.user_data.size() >= 3 && vertex_info.flattened_ud_buf.size() > 37;
+            VAddr table_base{};
+            u64 transform_index{};
+            u64 transform_offset{};
+            VAddr transform_address{};
+            bool address_in_range{};
+            bool mapped{};
+            bool registered_before{};
+            bool gpu_modified{};
+            VideoCore::BufferId buffer_id{};
+            if (has_constants) {
+                // VS 3706083c obtains the table pointer from SRT dwords 20/21, flattened to
+                // dwords 36/37, then reads four 16-byte columns at index * 192 + 128.
+                table_base = (VAddr{vertex_info.flattened_ud_buf[36]} |
+                              (VAddr{vertex_info.flattened_ud_buf[37]} << 32)) &
+                             (GuestAddressLimit - 1);
+                transform_index = vertex_info.user_data[2];
+                transform_offset = transform_index * TransformStride + TransformBlockOffset;
+                address_in_range =
+                    table_base != 0 && transform_offset <= GuestAddressLimit - table_base &&
+                    TransformBlockSize <= GuestAddressLimit - (table_base + transform_offset);
+                if (address_in_range) {
+                    transform_address = table_base + transform_offset;
+                    mapped = memory->IsValidMapping(transform_address, TransformBlockSize);
+                }
+                if (mapped) {
+                    registered_before =
+                        buffer_cache.IsRegionRegistered(transform_address, TransformBlockSize);
+                    gpu_modified =
+                        buffer_cache.IsRegionGpuModified(transform_address, TransformBlockSize);
+                    // Do this before Rasterizer::BindResources snapshots ordinary descriptors.
+                    // FindBuffer also publishes the guest page in the BDA page table.
+                    buffer_id =
+                        buffer_cache.FindBuffer(transform_address, TransformBlockSize);
+                    buffer_cache.SynchronizeBuffersInRange(transform_address, TransformBlockSize);
+                }
+            }
+
+            static u32 dreams_vs370_bda_prewarm_log_count{};
+            static VAddr dreams_vs370_bda_prewarm_last_address = ~VAddr{};
+            if (dreams_vs370_bda_prewarm_log_count == 0 ||
+                (dreams_vs370_bda_prewarm_log_count < 16 &&
+                 transform_address != dreams_vs370_bda_prewarm_last_address)) {
+                dreams_vs370_bda_prewarm_last_address = transform_address;
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams VS370 BDA prewarm #{} base={:#x} transform={} address={:#x}+{:#x} "
+                    "constants={} in_range={} mapped={} registered_before={} gpu_modified={} "
+                    "buffer_id={}",
+                    ++dreams_vs370_bda_prewarm_log_count, table_base, transform_index,
+                    transform_address, TransformBlockSize, has_constants, address_in_range, mapped,
+                    registered_before, gpu_modified, buffer_id.index);
+            }
+        }
+    }
+
+    if (PrewarmDreamsD25BdaTransforms()) {
+        const auto& vertex_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
+        if (vertex_info.pgm_hash == DreamsSpriteGeometryVertexShader) {
+            constexpr VAddr GuestAddressLimit = VAddr{1} << 48;
+            constexpr u64 TransformStride = 192;
+            constexpr u64 TransformBlockOffset = 128;
+            constexpr u64 TransformBlockSize = 64;
+
+            const bool has_user_data = vertex_info.user_data.size() >= 3;
+            VAddr table_base{};
+            u64 transform_index{};
+            u64 transform_offset{};
+            VAddr transform_address{};
+            bool address_in_range{};
+            bool mapped{};
+            bool gpu_modified{};
+            VideoCore::BufferId buffer_id{};
+            if (has_user_data) {
+                table_base = (VAddr{vertex_info.user_data[0]} |
+                              (VAddr{vertex_info.user_data[1]} << 32)) &
+                             (GuestAddressLimit - 1);
+                transform_index = vertex_info.user_data[2];
+                transform_offset = transform_index * TransformStride + TransformBlockOffset;
+                address_in_range =
+                    table_base != 0 && transform_offset <= GuestAddressLimit - table_base &&
+                    TransformBlockSize <= GuestAddressLimit - (table_base + transform_offset);
+                if (address_in_range) {
+                    transform_address = table_base + transform_offset;
+                    mapped = memory->IsValidMapping(transform_address, TransformBlockSize);
+                }
+                if (mapped) {
+                    gpu_modified =
+                        buffer_cache.IsRegionGpuModified(transform_address, TransformBlockSize);
+                    // Registering the range populates the BDA page table before the draw. A direct
+                    // synchronization is still required: dynamic ReadConst bypasses ordinary
+                    // shader descriptors, so descriptor refresh alone cannot upload this page.
+                    buffer_id =
+                        buffer_cache.FindBuffer(transform_address, TransformBlockSize);
+                    buffer_cache.SynchronizeBuffersInRange(transform_address, TransformBlockSize);
+                }
+            }
+
+            static u32 dreams_d25_bda_prewarm_log_count{};
+            static VAddr dreams_d25_bda_prewarm_last_address = ~VAddr{};
+            if (dreams_d25_bda_prewarm_log_count == 0 ||
+                (dreams_d25_bda_prewarm_log_count < 16 &&
+                 transform_address != dreams_d25_bda_prewarm_last_address)) {
+                dreams_d25_bda_prewarm_last_address = transform_address;
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams d25 BDA prewarm #{} base={:#x} transform={} address={:#x}+{:#x} "
+                    "userdata={} in_range={} mapped={} gpu_modified={} buffer_id={}",
+                    ++dreams_d25_bda_prewarm_log_count, table_base, transform_index,
+                    transform_address, TransformBlockSize, has_user_data, address_in_range, mapped,
+                    gpu_modified, buffer_id.index);
+            }
+        }
+    }
+
     PrepareRenderState(pipeline);
+    ApplyDreamsDccBdaPrewarm(pipeline, memory, buffer_cache);
     if (!BindResources(pipeline)) {
         return;
+    }
+
+    const auto& visibility_list_vertex = pipeline->GetStage(Shader::LogicalStage::Vertex);
+    if (g_dreams_visibility_list_consumer_snapshot.valid &&
+        visibility_list_vertex.pgm_hash == DreamsSpriteGeometryVertexShaderAlt &&
+        visibility_list_vertex.buffers.size() > 4 &&
+        !visibility_list_vertex.buffers[3].IsSpecial() &&
+        !visibility_list_vertex.buffers[4].IsSpecial()) {
+        const auto list = visibility_list_vertex.buffers[3].GetSharp(visibility_list_vertex);
+        const auto lookup = visibility_list_vertex.buffers[4].GetSharp(visibility_list_vertex);
+        if (list.base_address == g_dreams_visibility_list_consumer_snapshot.output_base) {
+            scheduler.Finish();
+            VkDrawIndexedIndirectCommand command{};
+            const VAddr command_address = arg_address + offset;
+            const bool command_mapped =
+                is_indexed && memory->IsValidMapping(command_address, sizeof(command));
+            if (command_mapped) {
+                buffer_cache.ReadMemory(command_address, sizeof(command));
+                std::memcpy(&command, std::bit_cast<const void*>(command_address),
+                            sizeof(command));
+            }
+
+            constexpr u32 MaxSampleRecords = 1024;
+            const u64 first_record = command.firstInstance;
+            const u64 available_records = list.GetSize() / (2 * sizeof(u32));
+            const u32 sampled_records = command_mapped && first_record < available_records
+                                            ? static_cast<u32>(std::min<u64>(
+                                                  {command.instanceCount, MaxSampleRecords,
+                                                   available_records - first_record}))
+                                            : 0;
+            const VAddr list_address =
+                list.base_address + first_record * 2 * sizeof(u32);
+            std::vector<u32> consumed_words;
+            const u64 consumed_size = static_cast<u64>(sampled_records) * 2 * sizeof(u32);
+            const bool list_gpu_modified_before =
+                consumed_size != 0 &&
+                buffer_cache.IsRegionGpuModified(list_address, consumed_size);
+            if (consumed_size != 0 && memory->IsValidMapping(list_address, consumed_size)) {
+                buffer_cache.ReadMemory(list_address, consumed_size);
+                consumed_words.resize(static_cast<u64>(sampled_records) * 2);
+                std::memcpy(consumed_words.data(), std::bit_cast<const void*>(list_address),
+                            consumed_size);
+            }
+
+            u32 invalid_lookup_ids{};
+            u32 max_low24_id{};
+            u32 changed_since_dispatch{};
+            for (u32 record = 0; record < consumed_words.size() / 2; ++record) {
+                const u32 low24_id = consumed_words[record * 2] & 0x00ffffff;
+                max_low24_id = std::max(max_low24_id, low24_id);
+                const u64 lookup_offset = static_cast<u64>(low24_id) * 4 * sizeof(u32);
+                invalid_lookup_ids +=
+                    lookup_offset > lookup.GetSize() ||
+                    2 * sizeof(u32) > lookup.GetSize() - lookup_offset;
+
+                const u64 snapshot_record = first_record + record;
+                if (snapshot_record >=
+                    g_dreams_visibility_list_consumer_snapshot.words.size() / 2) {
+                    ++changed_since_dispatch;
+                    continue;
+                }
+                changed_since_dispatch +=
+                    consumed_words[record * 2] !=
+                        g_dreams_visibility_list_consumer_snapshot.words[snapshot_record * 2] ||
+                    consumed_words[record * 2 + 1] !=
+                        g_dreams_visibility_list_consumer_snapshot.words[snapshot_record * 2 + 1];
+            }
+            const u64 consumed_hash = HashDreamsTraceWords(consumed_words);
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams visibility list consume #{} producer_sequence={} shader={:#x} "
+                "command={:#x} mapped={} instances={} first_instance={} active={} "
+                "sampled={} truncated={} list={:#x}+{:#x} stride={} lookup={:#x}+{:#x} "
+                "stride={} hash={:#x} producer_hash={:#x} changed_since_dispatch={} "
+                "invalid_lookup_ids={} max_low24_id={}",
+                g_dreams_visibility_list_consumer_snapshot.ordinal,
+                g_dreams_visibility_list_consumer_snapshot.dispatch_sequence,
+                g_dreams_visibility_list_consumer_snapshot.shader_hash, command_address,
+                command_mapped, command.instanceCount, command.firstInstance,
+                g_dreams_visibility_list_consumer_snapshot.active_records, sampled_records,
+                command.instanceCount > sampled_records, list.base_address, list.GetSize(),
+                list.stride, lookup.base_address, lookup.GetSize(), lookup.stride, consumed_hash,
+                g_dreams_visibility_list_consumer_snapshot.output_hash,
+                changed_since_dispatch, invalid_lookup_ids, max_low24_id);
+            const u32 records_to_log = std::min<u32>(consumed_words.size() / 2, 8);
+            for (u32 record = 0; record < records_to_log; ++record) {
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams visibility list consumed #{}[{}] values={:#x},{:#x} "
+                            "low24_id={} flags={}",
+                            g_dreams_visibility_list_consumer_snapshot.ordinal,
+                            static_cast<u32>(first_record) + record,
+                            consumed_words[record * 2], consumed_words[record * 2 + 1],
+                            consumed_words[record * 2] & 0x00ffffff,
+                            (consumed_words[record * 2 + 1] >> 16) & 3);
+            }
+
+            if (sampled_records != 0) {
+                struct DreamsVsResourceSample {
+                    std::string_view label;
+                    u32 binding{};
+                    u32 words_per_record{};
+                    VAddr descriptor_base{};
+                    u64 descriptor_size{};
+                    u32 descriptor_stride{};
+                    VAddr sampled_base{};
+                    u64 sampled_span{};
+                    bool gpu_modified_before{};
+                    u32 invalid_records{};
+                    std::vector<u32> keys;
+                    std::vector<u32> words;
+                };
+                struct DreamsVsResourceHistory {
+                    bool valid{};
+                    u32 ordinal{};
+                    u32 words_per_record{};
+                    std::vector<u32> keys;
+                    std::vector<u32> words;
+                };
+                static std::array<DreamsVsResourceHistory, 8> resource_history{};
+
+                std::vector<u32> low24_ids(sampled_records);
+                std::vector<u32> low16_ids(sampled_records);
+                std::vector<u32> list_indices(sampled_records);
+                for (u32 record = 0; record < sampled_records; ++record) {
+                    low24_ids[record] = consumed_words[record * 2] & 0x00ffffff;
+                    low16_ids[record] = consumed_words[record * 2 + 1] & 0xffff;
+                    list_indices[record] = static_cast<u32>(first_record) + record;
+                }
+
+                const auto sample_indexed_binding =
+                    [&](u32 binding, std::string_view label, std::span<const u32> keys,
+                        u32 record_size) {
+                        DreamsVsResourceSample sample{
+                            .label = label,
+                            .binding = binding,
+                            .words_per_record =
+                                static_cast<u32>(record_size / sizeof(u32)),
+                        };
+                        sample.keys.assign(keys.begin(), keys.end());
+                        if (binding >= visibility_list_vertex.buffers.size() ||
+                            visibility_list_vertex.buffers[binding].IsSpecial()) {
+                            sample.invalid_records = static_cast<u32>(keys.size());
+                            return sample;
+                        }
+
+                        const auto sharp =
+                            visibility_list_vertex.buffers[binding].GetSharp(visibility_list_vertex);
+                        sample.descriptor_base = sharp.base_address;
+                        sample.descriptor_size = sharp.GetSize();
+                        sample.descriptor_stride = sharp.stride;
+                        std::vector<u32> valid_keys;
+                        valid_keys.reserve(keys.size());
+                        u64 min_offset = std::numeric_limits<u64>::max();
+                        u64 max_end{};
+                        for (const u32 key : keys) {
+                            const u64 offset = static_cast<u64>(key) * record_size;
+                            const bool valid = sharp.base_address != 0 &&
+                                               offset <= sharp.GetSize() &&
+                                               record_size <= sharp.GetSize() - offset &&
+                                               memory->IsValidMapping(sharp.base_address + offset,
+                                                                      record_size);
+                            if (!valid) {
+                                ++sample.invalid_records;
+                                continue;
+                            }
+                            valid_keys.push_back(key);
+                            min_offset = std::min(min_offset, offset);
+                            max_end = std::max(max_end, offset + record_size);
+                        }
+                        std::ranges::sort(valid_keys);
+                        valid_keys.erase(std::unique(valid_keys.begin(), valid_keys.end()),
+                                         valid_keys.end());
+
+                        if (!valid_keys.empty()) {
+                            sample.sampled_base = sharp.base_address + min_offset;
+                            sample.sampled_span = max_end - min_offset;
+                            constexpr u64 MaxContiguousRead = 512_KB;
+                            if (sample.sampled_span <= MaxContiguousRead &&
+                                memory->IsValidMapping(sample.sampled_base,
+                                                       sample.sampled_span)) {
+                                sample.gpu_modified_before = buffer_cache.IsRegionGpuModified(
+                                    sample.sampled_base, sample.sampled_span);
+                                buffer_cache.ReadMemory(sample.sampled_base, sample.sampled_span);
+                            } else {
+                                for (const u32 key : valid_keys) {
+                                    const VAddr record_address =
+                                        sharp.base_address + static_cast<u64>(key) * record_size;
+                                    sample.gpu_modified_before |=
+                                        buffer_cache.IsRegionGpuModified(record_address,
+                                                                         record_size);
+                                    buffer_cache.ReadMemory(record_address, record_size);
+                                }
+                            }
+                        }
+
+                        sample.words.reserve(static_cast<u64>(keys.size()) *
+                                             sample.words_per_record);
+                        for (const u32 key : keys) {
+                            const u64 offset = static_cast<u64>(key) * record_size;
+                            const bool valid = sharp.base_address != 0 &&
+                                               offset <= sharp.GetSize() &&
+                                               record_size <= sharp.GetSize() - offset &&
+                                               memory->IsValidMapping(sharp.base_address + offset,
+                                                                      record_size);
+                            const size_t old_size = sample.words.size();
+                            sample.words.resize(old_size + sample.words_per_record);
+                            if (valid) {
+                                std::memcpy(sample.words.data() + old_size,
+                                            std::bit_cast<const void*>(sharp.base_address + offset),
+                                            record_size);
+                            }
+                        }
+                        return sample;
+                    };
+
+                std::array<DreamsVsResourceSample, 5> samples{
+                    sample_indexed_binding(0, "object", low16_ids, 432),
+                    sample_indexed_binding(1, "id-data-a", low24_ids, sizeof(u32)),
+                    sample_indexed_binding(2, "id-data-b", low24_ids, sizeof(u32)),
+                    DreamsVsResourceSample{
+                        .label = "visibility-list",
+                        .binding = 3,
+                        .words_per_record = 2,
+                        .descriptor_base = list.base_address,
+                        .descriptor_size = list.GetSize(),
+                        .descriptor_stride = static_cast<u32>(list.stride),
+                        .sampled_base = list_address,
+                        .sampled_span = consumed_size,
+                        .gpu_modified_before = list_gpu_modified_before,
+                        .keys = std::move(list_indices),
+                        .words = consumed_words,
+                    },
+                    sample_indexed_binding(4, "id-record", low24_ids, 4 * sizeof(u32)),
+                };
+
+                const auto log_writer_provenance = [&](const DreamsVsResourceSample& sample) {
+                    if (sample.sampled_base == 0 || sample.sampled_span == 0) {
+                        return;
+                    }
+                    u32 matches{};
+                    for (auto writer = g_dreams_buffer_writers.rbegin();
+                         writer != g_dreams_buffer_writers.rend() && matches < 2; ++writer) {
+                        if (!writer->declared_write ||
+                            !OverlapsDreamsRange(sample.sampled_base, sample.sampled_span,
+                                                writer->base, writer->size)) {
+                            continue;
+                        }
+                        LOG_WARNING(
+                            Render_Vulkan,
+                            "Dreams visibility VS writer #{} resource={} match={} sequence={} "
+                            "dispatch={} shader={:#x} stage={} binding={} range={:#x}+{:#x} "
+                            "stride={}",
+                            g_dreams_visibility_list_consumer_snapshot.ordinal, sample.label,
+                            matches, writer->sequence, writer->dispatch_sequence,
+                            writer->shader_hash, static_cast<u32>(writer->stage),
+                            writer->binding_index, writer->base, writer->size, writer->stride);
+                        ++matches;
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams visibility VS writer summary #{} resource={} "
+                                "matches={} history={}",
+                                g_dreams_visibility_list_consumer_snapshot.ordinal, sample.label,
+                                matches, g_dreams_buffer_writers.size());
+                };
+
+                const auto log_resource = [&](u32 history_index,
+                                              const DreamsVsResourceSample& sample) {
+                    auto& previous = resource_history[history_index];
+                    u32 changed_words{};
+                    u32 first_changed_record = std::numeric_limits<u32>::max();
+                    u32 first_changed_word = std::numeric_limits<u32>::max();
+                    u32 before_value{};
+                    u32 after_value{};
+                    bool keys_changed{};
+                    if (previous.valid) {
+                        const size_t key_count = std::max(previous.keys.size(), sample.keys.size());
+                        for (size_t record = 0; record < key_count; ++record) {
+                            if (record < previous.keys.size() && record < sample.keys.size() &&
+                                previous.keys[record] == sample.keys[record]) {
+                                continue;
+                            }
+                            keys_changed = true;
+                            first_changed_record = static_cast<u32>(record);
+                            break;
+                        }
+                        const size_t word_count =
+                            std::max(previous.words.size(), sample.words.size());
+                        for (size_t word = 0; word < word_count; ++word) {
+                            const u32 before =
+                                word < previous.words.size() ? previous.words[word] : 0;
+                            const u32 after = word < sample.words.size() ? sample.words[word] : 0;
+                            if (before == after) {
+                                continue;
+                            }
+                            ++changed_words;
+                            if (first_changed_word != std::numeric_limits<u32>::max()) {
+                                continue;
+                            }
+                            const u32 words_per_record =
+                                std::max(sample.words_per_record, 1U);
+                            first_changed_record = static_cast<u32>(word / words_per_record);
+                            first_changed_word = static_cast<u32>(word % words_per_record);
+                            before_value = before;
+                            after_value = after;
+                        }
+                    }
+                    const u64 key_hash = HashDreamsTraceWords(sample.keys);
+                    const u64 data_hash = HashDreamsTraceWords(sample.words);
+                    LOG_WARNING(
+                        Render_Vulkan,
+                        "Dreams visibility VS resource #{} name={} binding={} base={:#x}+{:#x} "
+                        "stride={} sampled={:#x}+{:#x} records={} words_per_record={} "
+                        "gpu_before={} invalid={} key_hash={:#x} data_hash={:#x} "
+                        "previous=#{} keys_changed={} changed_words={} "
+                        "first_record={} first_word={} value={:#x}->{:#x}",
+                        g_dreams_visibility_list_consumer_snapshot.ordinal, sample.label,
+                        sample.binding, sample.descriptor_base, sample.descriptor_size,
+                        sample.descriptor_stride, sample.sampled_base, sample.sampled_span,
+                        sample.keys.size(), sample.words_per_record,
+                        sample.gpu_modified_before, sample.invalid_records, key_hash, data_hash,
+                        previous.valid ? previous.ordinal : 0, keys_changed, changed_words,
+                        first_changed_record, first_changed_word, before_value, after_value);
+                    if (!previous.valid || keys_changed || changed_words != 0) {
+                        log_writer_provenance(sample);
+                    }
+                    previous = {
+                        .valid = true,
+                        .ordinal = g_dreams_visibility_list_consumer_snapshot.ordinal,
+                        .words_per_record = sample.words_per_record,
+                        .keys = sample.keys,
+                        .words = sample.words,
+                    };
+                    return data_hash;
+                };
+
+                std::array<u64, 8> resource_hashes{};
+                for (u32 index = 0; index < samples.size(); ++index) {
+                    resource_hashes[index] = log_resource(index, samples[index]);
+                }
+
+                DreamsVsResourceSample constants{
+                    .label = "userdata-flat",
+                    .binding = std::numeric_limits<u32>::max(),
+                    .words_per_record = 7,
+                    .keys = {0},
+                };
+                constants.words.resize(7);
+                for (u32 index = 0; index < 4; ++index) {
+                    constants.words[index] = index < visibility_list_vertex.user_data.size()
+                                                 ? visibility_list_vertex.user_data[index]
+                                                 : 0;
+                }
+                for (u32 index = 0; index < 3; ++index) {
+                    constants.words[4 + index] =
+                        36 + index < visibility_list_vertex.flattened_ud_buf.size()
+                            ? visibility_list_vertex.flattened_ud_buf[36 + index]
+                            : 0;
+                }
+                resource_hashes[5] = log_resource(5, constants);
+
+                constexpr VAddr GuestAddressLimit = VAddr{1} << 48;
+                const VAddr srt_base =
+                    (VAddr{constants.words[0]} | (VAddr{constants.words[1]} << 32)) &
+                    (GuestAddressLimit - 1);
+                DreamsVsResourceSample srt_entries{
+                    .label = "srt-dwords20-22",
+                    .binding = std::numeric_limits<u32>::max(),
+                    .words_per_record = 3,
+                    .descriptor_base = srt_base,
+                    .descriptor_size = 23 * sizeof(u32),
+                    .sampled_base = srt_base + 20 * sizeof(u32),
+                    .sampled_span = 3 * sizeof(u32),
+                    .keys = {20},
+                };
+                if (srt_base != 0 &&
+                    memory->IsValidMapping(srt_entries.sampled_base,
+                                           srt_entries.sampled_span)) {
+                    srt_entries.gpu_modified_before = buffer_cache.IsRegionGpuModified(
+                        srt_entries.sampled_base, srt_entries.sampled_span);
+                    if (srt_entries.gpu_modified_before) {
+                        buffer_cache.ReadMemory(srt_entries.sampled_base,
+                                                srt_entries.sampled_span);
+                    }
+                    srt_entries.words.resize(3);
+                    std::memcpy(srt_entries.words.data(),
+                                std::bit_cast<const void*>(srt_entries.sampled_base),
+                                srt_entries.sampled_span);
+                } else {
+                    srt_entries.invalid_records = 1;
+                }
+                resource_hashes[6] = log_resource(6, srt_entries);
+
+                const VAddr transform_base =
+                    (VAddr{constants.words[4]} | (VAddr{constants.words[5]} << 32)) &
+                    (GuestAddressLimit - 1);
+                const u64 transform_offset =
+                    static_cast<u64>(constants.words[2]) * 192 + 128;
+                DreamsVsResourceSample transform{
+                    .label = "dynamic-transform",
+                    .binding = std::numeric_limits<u32>::max(),
+                    .words_per_record = 16,
+                    .descriptor_base = transform_base,
+                    .descriptor_size = transform_offset + 64,
+                    .sampled_base = transform_base + transform_offset,
+                    .sampled_span = 64,
+                    .keys = {constants.words[2]},
+                };
+                const bool transform_in_range =
+                    transform_base != 0 && transform_offset <= GuestAddressLimit - transform_base &&
+                    64 <= GuestAddressLimit - (transform_base + transform_offset);
+                if (transform_in_range &&
+                    memory->IsValidMapping(transform.sampled_base, transform.sampled_span)) {
+                    transform.gpu_modified_before = buffer_cache.IsRegionGpuModified(
+                        transform.sampled_base, transform.sampled_span);
+                    if (transform.gpu_modified_before) {
+                        buffer_cache.ReadMemory(transform.sampled_base, transform.sampled_span);
+                    }
+                    transform.words.resize(16);
+                    std::memcpy(transform.words.data(),
+                                std::bit_cast<const void*>(transform.sampled_base),
+                                transform.sampled_span);
+                } else {
+                    transform.invalid_records = 1;
+                }
+                resource_hashes[7] = log_resource(7, transform);
+
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams visibility VS frame #{} producer_sequence={} instances={} "
+                    "hashes b0-4={:#x},{:#x},{:#x},{:#x},{:#x} constants={:#x} "
+                    "srt={:#x} bda={:#x} userdata={:#x},{:#x},{:#x},{:#x} "
+                    "flat36-38={:#x},{:#x},{:#x} srt_match={}",
+                    g_dreams_visibility_list_consumer_snapshot.ordinal,
+                    g_dreams_visibility_list_consumer_snapshot.dispatch_sequence,
+                    sampled_records, resource_hashes[0], resource_hashes[1],
+                    resource_hashes[2], resource_hashes[3], resource_hashes[4],
+                    resource_hashes[5], resource_hashes[6], resource_hashes[7],
+                    constants.words[0], constants.words[1], constants.words[2],
+                    constants.words[3], constants.words[4], constants.words[5],
+                    constants.words[6], srt_entries.words.size() == 3 &&
+                                              srt_entries.words[0] == constants.words[4] &&
+                                              srt_entries.words[1] == constants.words[5] &&
+                                              srt_entries.words[2] == constants.words[6]);
+            }
+            g_dreams_visibility_list_consumer_snapshot.valid = false;
+            g_dreams_visibility_list_consumer_snapshot.words.clear();
+        }
     }
     const auto state = BeginRendering(pipeline);
 
@@ -1385,9 +2520,15 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         dreams_graphics_key.hashes[static_cast<u32>(Shader::LogicalStage::Fragment)];
     static std::optional<std::filesystem::path> dreams_visibility_dump_dir;
     static u32 dreams_visibility_dump_draw_count{};
+    static u32 dreams_visibility_dump_frame_index{};
+    static u32 dreams_visibility_dump_frames_remaining{};
     if (dreams_fragment_hash == 0x2b6d3647) {
         if (auto output_dir = ConsumeDreamsVisibilityTargetDumpRequest()) {
             dreams_visibility_dump_dir = std::move(output_dir);
+            dreams_visibility_dump_frame_index = 0;
+            dreams_visibility_dump_frames_remaining = DreamsVisibilityTargetDumpCount();
+        }
+        if (dreams_visibility_dump_dir) {
             dreams_visibility_dump_draw_count = 0;
         }
     }
@@ -1619,6 +2760,29 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
     }
 
+    const bool stabilize_graphics_buffers = StabilizeDreamsGraphicsBuffers();
+    if (stabilize_graphics_buffers) {
+        buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers, true);
+        if (is_indexed) {
+            buffer_cache.BindIndexBuffer(0, buffer_barriers, true);
+        }
+        const u32 indirect_size = stride * max_count;
+        if (indirect_size != 0) {
+            buffer_cache.FindBuffer(arg_address + offset, indirect_size);
+        }
+        if (count_address != 0) {
+            buffer_cache.FindBuffer(count_address, sizeof(u32));
+        }
+        const u32 changed_handles = RefreshBufferResources(pipeline, true);
+        static u32 dreams_graphics_stabilize_indirect_log_count{};
+        if ((changed_handles != 0 || dreams_graphics_stabilize_indirect_log_count == 0) &&
+            dreams_graphics_stabilize_indirect_log_count++ < 64) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams graphics stabilization indirect indexed={} changed_handles={}",
+                        is_indexed, changed_handles);
+        }
+    }
+
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(0, buffer_barriers);
@@ -1645,6 +2809,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    if (stabilize_graphics_buffers) {
+        ApplyDreamsGraphicsBufferBarrier(scheduler);
+    }
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -1711,20 +2878,24 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             const auto& image = texture_cache.GetImage(image_id);
             const auto file =
                 *dreams_visibility_dump_dir /
-                fmt::format("{}-{:#x}-{}x{}-pitch{}-bits{}.bin", role,
-                            image.info.guest_address, image.info.size.width,
-                            image.info.size.height, image.info.pitch, image.info.num_bits);
+                fmt::format("frame{:02}-{}-{:#x}-{}x{}-pitch{}-bits{}.bin",
+                            dreams_visibility_dump_frame_index, role, image.info.guest_address,
+                            image.info.size.width, image.info.size.height, image.info.pitch,
+                            image.info.num_bits);
             texture_cache.DumpImageLinear(image_id, file);
             LOG_WARNING(Render_Vulkan,
-                        "Dreams visibility target dumped role={} id={} guest={:#x} "
+                        "Dreams visibility target dumped frame={} role={} id={} guest={:#x} "
                         "extent={}x{} pitch={} bits={} file={}",
-                        role, image_id.index, image.info.guest_address, image.info.size.width,
-                        image.info.size.height, image.info.pitch, image.info.num_bits,
-                        file.string());
+                        dreams_visibility_dump_frame_index, role, image_id.index,
+                        image.info.guest_address, image.info.size.width, image.info.size.height,
+                        image.info.pitch, image.info.num_bits, file.string());
         };
         dump_target("color", cb_descs[0].first);
         dump_target("depth", db_desc.first);
-        dreams_visibility_dump_dir.reset();
+        ++dreams_visibility_dump_frame_index;
+        if (--dreams_visibility_dump_frames_remaining == 0) {
+            dreams_visibility_dump_dir.reset();
+        }
     }
 
     ResetBindings();
@@ -1776,7 +2947,13 @@ void Rasterizer::DispatchDirect() {
     }
     const u32 gpu_profile_ordinal = ConsumeDreamsGpuProfileEvent();
     if (gpu_profile_ordinal != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams GPU profile #{} kind=dispatch hash={:#x} pre-fence begin",
+                    gpu_profile_ordinal, cs.pgm_hash);
         scheduler.Finish();
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams GPU profile #{} kind=dispatch hash={:#x} pre-fence complete",
+                    gpu_profile_ordinal, cs.pgm_hash);
     }
     const auto gpu_profile_start = std::chrono::steady_clock::now();
 
@@ -2955,24 +4132,1451 @@ void Rasterizer::DispatchDirect() {
                     sizeof(u32));
     }
 
+    if (TraceDreamsModelRecord() && cs.pgm_hash == 0xac97d610) {
+        static u32 collect_bricks_trace_count{};
+        if (collect_bricks_trace_count++ < 8) {
+            scheduler.Finish();
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams collect-bricks input #{} sequence={} dims={}x{}x{} buffers={} "
+                        "flat_size={}",
+                        collect_bricks_trace_count, g_compute_dispatch_sequence,
+                        cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, cs.buffers.size(),
+                        cs.flattened_ud_buf.size());
+            for (u32 index = 0; index < cs.buffers.size(); ++index) {
+                const auto& desc = cs.buffers[index];
+                const auto sharp = desc.GetSharp(cs);
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams collect-bricks buffer #{} index={} special={} write={} "
+                            "type={} base={:#x}+{:#x} stride={} records={}",
+                            collect_bricks_trace_count, index, desc.IsSpecial(), desc.is_written,
+                            static_cast<u32>(desc.buffer_type), sharp.base_address,
+                            sharp.GetSize(), sharp.stride, sharp.num_records);
+                if (index != 1 || desc.IsSpecial() || sharp.base_address == 0) {
+                    continue;
+                }
+                const u64 dispatched_words = u64{cs_program.dim_x} * 64;
+                const u64 read_size =
+                    std::min<u64>(sharp.GetSize(), dispatched_words * sizeof(u32)) & ~u64{3};
+                if (read_size == 0 ||
+                    !memory->IsValidMapping(sharp.base_address, read_size)) {
+                    continue;
+                }
+                const bool gpu_modified =
+                    buffer_cache.IsRegionGpuModified(sharp.base_address, read_size);
+                buffer_cache.ReadMemory(sharp.base_address, read_size);
+                const auto* words = std::bit_cast<const u32*>(sharp.base_address);
+                const u64 word_count = read_size / sizeof(u32);
+                u64 nonzero{};
+                u64 below_sentinel{};
+                u64 direct_candidates{};
+                u32 minimum = std::numeric_limits<u32>::max();
+                u32 maximum{};
+                for (u64 word_index = 0; word_index < word_count; ++word_index) {
+                    const u32 word = words[word_index];
+                    nonzero += word != 0;
+                    below_sentinel += word < 0x0fffffffu;
+                    direct_candidates += word < 0x0fffffffu && (word & 1u) != 0;
+                    minimum = std::min(minimum, word);
+                    maximum = std::max(maximum, word);
+                }
+                std::array<u32, 8> head{};
+                std::memcpy(head.data(), words,
+                            std::min<u64>(sizeof(head), read_size));
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams collect-bricks candidates #{} words={} gpu_modified={} nonzero={} "
+                    "below_sentinel={} direct_bit0={} min={:#x} max={:#x} "
+                    "head={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    collect_bricks_trace_count, word_count, gpu_modified, nonzero,
+                    below_sentinel, direct_candidates, minimum, maximum, head[0], head[1],
+                    head[2], head[3], head[4], head[5], head[6], head[7]);
+            }
+        }
+    }
+
+    static const u32 gather_post_diagnostic_limit = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_GATHER_POST_DIAG");
+        if (value == nullptr) {
+            return 0u;
+        }
+        if (value[0] == '\0') {
+            return 8u;
+        }
+        char* end{};
+        const u64 parsed = std::strtoull(value, &end, 0);
+        return end != value ? static_cast<u32>(std::clamp<u64>(parsed, 1, 64)) : 8u;
+    }();
+    static u32 gather_post_diagnostic_count{};
+    const bool gather_post_diagnostic =
+        Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+        cs.pgm_hash == Shader::DreamsCompat::GatherVoxelsShader &&
+        !TraceDreamsGatherStages() &&
+        gather_post_diagnostic_count < gather_post_diagnostic_limit;
+    const u32 gather_post_diagnostic_ordinal =
+        gather_post_diagnostic ? ++gather_post_diagnostic_count : 0;
+    std::array<bool, 9> gather_post_buffer_ready{};
+    std::array<bool, 9> gather_post_buffer_gpu_modified{};
+
+    if ((TraceDreamsModelRecord() || TraceDreamsGatherStages()) &&
+        cs.pgm_hash == 0x7ba4de5d &&
+        std::getenv("SHADPS4_DREAMS_GATHER_INPUT_READBACK") != nullptr) {
+        static u32 gather_input_trace_count{};
+        if (gather_input_trace_count++ < 8) {
+            scheduler.Finish();
+            for (const u32 index : {7u, 8u, 12u, 13u, 14u}) {
+                if (index >= cs.buffers.size() || cs.buffers[index].IsSpecial()) {
+                    continue;
+                }
+                const auto sharp = cs.buffers[index].GetSharp(cs);
+                const u64 read_size =
+                    std::min<u64>(sharp.GetSize(), 16 * 1024 * 1024) & ~u64{3};
+                if (sharp.base_address == 0 || read_size == 0 ||
+                    !memory->IsValidMapping(sharp.base_address, read_size)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams GatherVoxels input #{} unavailable base={:#x}+{:#x}",
+                                index, sharp.base_address, sharp.GetSize());
+                    continue;
+                }
+                const bool gpu_modified =
+                    buffer_cache.IsRegionGpuModified(sharp.base_address, read_size);
+                const bool head_gpu_modified =
+                    buffer_cache.IsRegionGpuModified(sharp.base_address, sizeof(u32));
+                const char* reupload_value =
+                    std::getenv("SHADPS4_DREAMS_GATHER_INPUT_REUPLOAD");
+                const bool force_reupload = index == 14 && reupload_value != nullptr &&
+                                            std::string_view{reupload_value} == "1";
+                // Opt-in A/B test: after synchronization, mark only candidate buffer 14 as
+                // CPU-modified so ObtainBuffer must upload its CPU backing again.
+                buffer_cache.ReadMemory(sharp.base_address, read_size, force_reupload);
+                const bool cpu_modified_after_read =
+                    buffer_cache.IsRegionCpuModified(sharp.base_address, read_size);
+                const auto* words = std::bit_cast<const u32*>(sharp.base_address);
+                const u64 word_count = read_size / sizeof(u32);
+                u64 nonzero{};
+                u64 over_1024{};
+                u64 over_million{};
+                u32 maximum{};
+                u64 first_nonzero = std::numeric_limits<u64>::max();
+                for (u64 word = 0; word < word_count; ++word) {
+                    const u32 value = words[word];
+                    nonzero += value != 0;
+                    over_1024 += value > 1024;
+                    over_million += value > 1'000'000;
+                    maximum = std::max(maximum, value);
+                    if (value != 0 && first_nonzero == std::numeric_limits<u64>::max()) {
+                        first_nonzero = word;
+                    }
+                }
+                std::array<u32, 8> head{};
+                std::memcpy(head.data(), words, std::min<u64>(sizeof(head), read_size));
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams GatherVoxels input trace={} #{} base={:#x}+{:#x} stride={} "
+                    "records={} gpu_modified={} head_gpu_modified={} force_reupload={} "
+                    "cpu_modified_after_read={} "
+                    "scanned={} nonzero={} "
+                    "gt1024={} gt1m={} "
+                    "max={:#x} head={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    gather_input_trace_count, index, sharp.base_address, sharp.GetSize(),
+                    sharp.stride, sharp.num_records, gpu_modified, head_gpu_modified,
+                    force_reupload, cpu_modified_after_read, word_count, nonzero, over_1024,
+                    over_million, maximum,
+                    head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7]);
+                if (index == 13 && first_nonzero != std::numeric_limits<u64>::max() &&
+                    cs.buffers.size() > 12 && !cs.buffers[12].IsSpecial()) {
+                    const auto pairs = cs.buffers[12].GetSharp(cs);
+                    const u64 pair_stride = pairs.stride != 0 ? pairs.stride : 2 * sizeof(u32);
+                    const u64 pair_offset = first_nonzero * pair_stride;
+                    std::array<u32, 2> pair{};
+                    const bool pair_mapped = pairs.base_address != 0 &&
+                                             pair_offset + sizeof(pair) <= pairs.GetSize() &&
+                                             memory->IsValidMapping(pairs.base_address + pair_offset,
+                                                                    sizeof(pair));
+                    if (pair_mapped) {
+                        std::memcpy(pair.data(),
+                                    std::bit_cast<const void*>(pairs.base_address + pair_offset),
+                                    sizeof(pair));
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams GatherVoxels first hash bucket={} bound={:#x} "
+                                "pair_mapped={} pair_key={:#x} pair_payload={:#x}",
+                                first_nonzero, words[first_nonzero], pair_mapped, pair[0], pair[1]);
+                }
+            }
+        }
+    }
+
+    struct DreamsModelConfigGdsTrace {
+        bool enabled{};
+        u32 ordinal{};
+        u32 inner_counter_before{};
+        u32 inner_required_before{};
+        std::array<u32, 7> prefix_a_before{};
+        std::array<u32, 18> prefix_b_before{};
+        std::array<u32, 25> before{};
+    } dreams_model_config_gds_trace{};
+    if (TraceDreamsModelRecord() &&
+        std::ranges::any_of(cs.buffers, [](const auto& desc) {
+            return desc.buffer_type == Shader::BufferType::GdsBuffer;
+        })) {
+        static u32 model_config_gds_ordinal{};
+        if (model_config_gds_ordinal < 4096) {
+            scheduler.Finish();
+            const auto* gds = buffer_cache.GetGdsBuffer();
+            constexpr u64 ModelConfigGdsOffset = 704 * sizeof(u32);
+            if (gds->mapped_data.size() >=
+                ModelConfigGdsOffset + sizeof(dreams_model_config_gds_trace.before)) {
+                dreams_model_config_gds_trace.enabled = true;
+                dreams_model_config_gds_trace.ordinal = ++model_config_gds_ordinal;
+                std::memcpy(&dreams_model_config_gds_trace.inner_counter_before,
+                            gds->mapped_data.data() + 64 * sizeof(u32), sizeof(u32));
+                std::memcpy(&dreams_model_config_gds_trace.inner_required_before,
+                            gds->mapped_data.data() + 65 * sizeof(u32), sizeof(u32));
+                std::memcpy(dreams_model_config_gds_trace.prefix_a_before.data(),
+                            gds->mapped_data.data() + 196 * sizeof(u32),
+                            sizeof(dreams_model_config_gds_trace.prefix_a_before));
+                std::memcpy(dreams_model_config_gds_trace.prefix_b_before.data(),
+                            gds->mapped_data.data() + 389 * sizeof(u32),
+                            sizeof(dreams_model_config_gds_trace.prefix_b_before));
+                std::memcpy(dreams_model_config_gds_trace.before.data(),
+                            gds->mapped_data.data() + ModelConfigGdsOffset,
+                            sizeof(dreams_model_config_gds_trace.before));
+            }
+        }
+    }
+
+    struct DreamsModelGdsTrace {
+        bool enabled{};
+        u32 ordinal{};
+        std::array<u32, 17> before{};
+    } dreams_model_gds_trace{};
+    if (TraceDreamsModelRecord()) {
+        u32* ordinal_counter = nullptr;
+        static u32 model_accumulate_ordinal{};
+        static u32 model_finalize_ordinal{};
+        static u32 model_transfer_ordinal{};
+        if (cs.pgm_hash == 0x5650b8f7) {
+            ordinal_counter = &model_accumulate_ordinal;
+        } else if (cs.pgm_hash == 0xd049fb84) {
+            ordinal_counter = &model_finalize_ordinal;
+        } else if (cs.pgm_hash == 0xcca80e03) {
+            ordinal_counter = &model_transfer_ordinal;
+        }
+        if (ordinal_counter != nullptr && *ordinal_counter < 256) {
+            scheduler.Finish();
+            const auto* gds = buffer_cache.GetGdsBuffer();
+            constexpr u64 ModelGdsOffset = 768 * sizeof(u32);
+            if (gds->mapped_data.size() <
+                ModelGdsOffset + sizeof(dreams_model_gds_trace.before)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams model GDS trace skipped: mapped GDS is only {:#x} bytes",
+                            gds->mapped_data.size());
+            } else {
+                dreams_model_gds_trace.enabled = true;
+                dreams_model_gds_trace.ordinal = ++*ordinal_counter;
+                std::memcpy(dreams_model_gds_trace.before.data(),
+                            gds->mapped_data.data() + ModelGdsOffset,
+                            sizeof(dreams_model_gds_trace.before));
+                const auto& values = dreams_model_gds_trace.before;
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams model GDS pre shader={:#x} ordinal={} sequence={} dims={}x{}x{} "
+                    "GDS768-784={},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    cs.pgm_hash, dreams_model_gds_trace.ordinal, g_compute_dispatch_sequence,
+                    cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, values[0], values[1],
+                    values[2], values[3], values[4], values[5], values[6], values[7], values[8],
+                    values[9], values[10], values[11], values[12], values[13], values[14],
+                    values[15], values[16]);
+
+                if (cs.pgm_hash == 0x5650b8f7 && dreams_model_gds_trace.ordinal <= 4) {
+                    LOG_WARNING(
+                        Render_Vulkan,
+                        "Dreams model accumulate resources ordinal={} buffers={} flat_size={}",
+                        dreams_model_gds_trace.ordinal, cs.buffers.size(),
+                        cs.flattened_ud_buf.size());
+                    for (u32 index = 0; index < cs.buffers.size(); ++index) {
+                        const auto& desc = cs.buffers[index];
+                        const auto sharp = desc.GetSharp(cs);
+                        const u64 probe_size =
+                            !desc.IsSpecial() && !desc.is_written
+                                ? std::min<u64>(sharp.GetSize(), 8 * sizeof(u32))
+                                : 0;
+                        const bool mapped = sharp.base_address != 0 && probe_size != 0 &&
+                                            memory->IsValidMapping(sharp.base_address, probe_size);
+                        const bool cpu_modified = mapped && buffer_cache.IsRegionCpuModified(
+                                                               sharp.base_address, probe_size);
+                        const bool gpu_modified = mapped && buffer_cache.IsRegionGpuModified(
+                                                               sharp.base_address, probe_size);
+                        std::array<u32, 8> head{};
+                        if (mapped) {
+                            buffer_cache.ReadMemory(sharp.base_address, probe_size);
+                            std::memcpy(head.data(),
+                                        std::bit_cast<const void*>(sharp.base_address), probe_size);
+                        }
+                        LOG_WARNING(
+                            Render_Vulkan,
+                            "Dreams model accumulate buffer ordinal={} index={} special={} "
+                            "write={} type={} base={:#x}+{:#x} stride={} records={} "
+                            "cpu_modified={} gpu_modified={} head={:#x},{:#x},{:#x},{:#x},"
+                            "{:#x},{:#x},{:#x},{:#x}",
+                            dreams_model_gds_trace.ordinal, index, desc.IsSpecial(),
+                            desc.is_written, static_cast<u32>(desc.buffer_type), sharp.base_address,
+                            sharp.GetSize(), sharp.stride, sharp.num_records, cpu_modified,
+                            gpu_modified, head[0], head[1], head[2], head[3], head[4], head[5],
+                            head[6], head[7]);
+                    }
+                }
+                const bool trace_model_finalize_inputs =
+                    cs.pgm_hash == 0xd049fb84 &&
+                    (dreams_model_gds_trace.ordinal == 4 ||
+                     dreams_model_gds_trace.ordinal == 5 ||
+                     dreams_model_gds_trace.ordinal == 90 ||
+                     (dreams_model_gds_trace.ordinal >= 94 &&
+                      dreams_model_gds_trace.ordinal <= 105));
+                if (trace_model_finalize_inputs && cs.buffers.size() > 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams model finalize inputs ordinal={} buffers={} flat_size={}",
+                                dreams_model_gds_trace.ordinal, cs.buffers.size(),
+                                cs.flattened_ud_buf.size());
+                    for (u32 index = 0; index < cs.buffers.size(); ++index) {
+                        const auto& desc = cs.buffers[index];
+                        const auto sharp = desc.GetSharp(cs);
+                        LOG_WARNING(Render_Vulkan,
+                                    "Dreams model finalize buffer ordinal={} index={} special={} "
+                                    "write={} type={} base={:#x}+{:#x} stride={} records={} "
+                                    "cpu_modified={} gpu_modified={}",
+                                    dreams_model_gds_trace.ordinal, index, desc.IsSpecial(),
+                                    desc.is_written, static_cast<u32>(desc.buffer_type),
+                                    sharp.base_address, sharp.GetSize(), sharp.stride,
+                                    sharp.num_records,
+                                    sharp.base_address != 0 && sharp.GetSize() != 0 &&
+                                        buffer_cache.IsRegionCpuModified(sharp.base_address,
+                                                                         sharp.GetSize()),
+                                    sharp.base_address != 0 && sharp.GetSize() != 0 &&
+                                        buffer_cache.IsRegionGpuModified(sharp.base_address,
+                                                                         sharp.GetSize()));
+                    }
+
+                    const auto work = cs.buffers[6].GetSharp(cs);
+                    const auto source = cs.buffers[7].GetSharp(cs);
+                    const u32 work_group_base = cs.user_data.size() > 4 ? cs.user_data[4] : 0;
+                    const u32 allocation_mode = cs.user_data.size() > 5 ? cs.user_data[5] : 0;
+                    const u64 work_offset = u64{work_group_base} * 6 * sizeof(u32);
+                    const u64 work_bytes =
+                        work_offset <= work.GetSize()
+                            ? std::min<u64>(work.GetSize() - work_offset,
+                                            u64{cs_program.dim_x} * 6 * sizeof(u32))
+                            : 0;
+                    const VAddr work_address = work.base_address + work_offset;
+                    std::vector<u32> source_indices;
+                    if (!cs.buffers[6].IsSpecial() && work.base_address != 0 &&
+                        work_bytes >= 6 * sizeof(u32) &&
+                        memory->IsValidMapping(work_address, work_bytes)) {
+                        const bool work_gpu_modified =
+                            buffer_cache.IsRegionGpuModified(work_address, work_bytes);
+                        buffer_cache.ReadMemory(work_address, work_bytes);
+                        const auto* words = std::bit_cast<const u32*>(work_address);
+                        const u32 work_records = static_cast<u32>(work_bytes / (6 * sizeof(u32)));
+                        for (u32 record = 0; record < work_records; ++record) {
+                            const u32* values = words + record * 6;
+                            if (std::ranges::find(source_indices, values[1]) ==
+                                source_indices.end()) {
+                                source_indices.push_back(values[1]);
+                            }
+                            if (record < 8 || (values[1] >= 5200 && values[1] < 5300)) {
+                                LOG_WARNING(
+                                    Render_Vulkan,
+                                    "Dreams model finalize work ordinal={} record={} "
+                                    "values={:#x},{},{:#x},{:#x},{:#x},{:#x}",
+                                    dreams_model_gds_trace.ordinal, work_group_base + record,
+                                    values[0], values[1], values[2], values[3], values[4],
+                                    values[5]);
+                            }
+                        }
+                        LOG_WARNING(Render_Vulkan,
+                                    "Dreams model finalize work summary ordinal={} records={} "
+                                    "group_base={} allocation_mode={} unique_sources={} "
+                                    "gpu_modified_before={}",
+                                    dreams_model_gds_trace.ordinal, work_records,
+                                    work_group_base, allocation_mode, source_indices.size(),
+                                    work_gpu_modified);
+                    }
+
+                    if (!cs.buffers[7].IsSpecial() && source.base_address != 0) {
+                        for (const u32 source_index : source_indices) {
+                            const u64 record_offset = u64{source_index} * sizeof(u32);
+                            const u64 record_size = 24 * sizeof(u32);
+                            if (record_offset > source.GetSize() ||
+                                record_size > source.GetSize() - record_offset) {
+                                LOG_WARNING(Render_Vulkan,
+                                            "Dreams model finalize source ordinal={} index={} "
+                                            "out_of_range offset={:#x} size={:#x}",
+                                            dreams_model_gds_trace.ordinal, source_index,
+                                            record_offset, source.GetSize());
+                                continue;
+                            }
+                            const VAddr record_address = source.base_address + record_offset;
+                            if (!memory->IsValidMapping(record_address, record_size)) {
+                                continue;
+                            }
+                            const bool cpu_modified =
+                                buffer_cache.IsRegionCpuModified(record_address, record_size);
+                            const bool gpu_modified =
+                                buffer_cache.IsRegionGpuModified(record_address, record_size);
+                            buffer_cache.ReadMemory(record_address, record_size);
+                            std::array<u32, 24> record{};
+                            std::memcpy(record.data(), std::bit_cast<const void*>(record_address),
+                                        record_size);
+                            u32 nonzero{};
+                            for (u32 word = 0; word < record_size / sizeof(u32); ++word) {
+                                nonzero += record[word] != 0;
+                            }
+                            LOG_WARNING(
+                                Render_Vulkan,
+                                "Dreams model finalize source ordinal={} index={} address={:#x} "
+                                "cpu_modified={} gpu_modified={} nonzero={} "
+                                "head={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                                dreams_model_gds_trace.ordinal, source_index, record_address,
+                                cpu_modified, gpu_modified, nonzero, record[0], record[1],
+                                record[2], record[3], record[4], record[5], record[6], record[7]);
+
+                            if (record[0] != std::numeric_limits<u32>::max() &&
+                                !cs.buffers[3].IsSpecial()) {
+                                const auto nodes = cs.buffers[3].GetSharp(cs);
+                                const u32 node_index = record[0] & 0x00FFFFFF;
+                                constexpr u64 NodeSize = 24 * sizeof(u32);
+                                const u64 node_offset = u64{node_index} * NodeSize;
+                                if (nodes.base_address != 0 && node_offset <= nodes.GetSize() &&
+                                    NodeSize <= nodes.GetSize() - node_offset) {
+                                    const VAddr node_address = nodes.base_address + node_offset;
+                                    if (memory->IsValidMapping(node_address, NodeSize)) {
+                                        const bool node_cpu_modified =
+                                            buffer_cache.IsRegionCpuModified(node_address,
+                                                                             NodeSize);
+                                        const bool node_gpu_modified =
+                                            buffer_cache.IsRegionGpuModified(node_address,
+                                                                             NodeSize);
+                                        buffer_cache.ReadMemory(node_address, NodeSize);
+                                        std::array<u32, 24> node{};
+                                        std::memcpy(node.data(),
+                                                    std::bit_cast<const void*>(node_address),
+                                                    NodeSize);
+                                        u32 node_nonzero{};
+                                        for (const u32 word : node) {
+                                            node_nonzero += word != 0;
+                                        }
+                                        LOG_WARNING(
+                                            Render_Vulkan,
+                                            "Dreams model finalize node ordinal={} source_index={} "
+                                            "packed={:#x} node={} address={:#x} cpu_modified={} "
+                                            "gpu_modified={} nonzero={} head={:#x},{:#x},{:#x},"
+                                            "{:#x},{:#x},{:#x},{:#x},{:#x}",
+                                            dreams_model_gds_trace.ordinal, source_index,
+                                            record[0], node_index, node_address,
+                                            node_cpu_modified, node_gpu_modified, node_nonzero,
+                                            node[0], node[1], node[2], node[3], node[4], node[5],
+                                            node[6], node[7]);
+
+                                        u32 node_matches{};
+                                        const VAddr node_end = node_address + NodeSize;
+                                        for (auto writer = g_dreams_buffer_writers.rbegin();
+                                             writer != g_dreams_buffer_writers.rend() &&
+                                             node_matches < 24;
+                                             ++writer) {
+                                            const VAddr writer_end = writer->base + writer->size;
+                                            if (!writer->declared_write ||
+                                                writer->base >= node_end ||
+                                                node_address >= writer_end ||
+                                                writer->dispatch_sequence >=
+                                                    g_compute_dispatch_sequence) {
+                                                continue;
+                                            }
+                                            LOG_WARNING(
+                                                Render_Vulkan,
+                                                "Dreams model finalize node writer ordinal={} "
+                                                "node={} match={} writer_seq={} dispatch={} kind={} "
+                                                "shader={:#x} binding={} range={:#x}+{:#x} "
+                                                "stride={} source={:#x}",
+                                                dreams_model_gds_trace.ordinal, node_index,
+                                                node_matches, writer->sequence,
+                                                writer->dispatch_sequence,
+                                                static_cast<u32>(writer->kind), writer->shader_hash,
+                                                writer->binding_index, writer->base, writer->size,
+                                                writer->stride, writer->source);
+                                            ++node_matches;
+                                        }
+                                        LOG_WARNING(
+                                            Render_Vulkan,
+                                            "Dreams model finalize node writers ordinal={} node={} "
+                                            "matches={} history={}",
+                                            dreams_model_gds_trace.ordinal, node_index,
+                                            node_matches, g_dreams_buffer_writers.size());
+                                    }
+                                }
+                            }
+
+                            u32 matches{};
+                            const VAddr record_end = record_address + record_size;
+                            for (auto writer = g_dreams_buffer_writers.rbegin();
+                                 writer != g_dreams_buffer_writers.rend() && matches < 24;
+                                 ++writer) {
+                                const VAddr writer_end = writer->base + writer->size;
+                                if (!writer->declared_write || writer->base >= record_end ||
+                                    record_address >= writer_end ||
+                                    writer->dispatch_sequence >= g_compute_dispatch_sequence) {
+                                    continue;
+                                }
+                                LOG_WARNING(
+                                    Render_Vulkan,
+                                    "Dreams model finalize source writer ordinal={} index={} "
+                                    "match={} writer_seq={} dispatch={} kind={} shader={:#x} "
+                                    "binding={} range={:#x}+{:#x} stride={} source={:#x}",
+                                    dreams_model_gds_trace.ordinal, source_index, matches,
+                                    writer->sequence, writer->dispatch_sequence,
+                                    static_cast<u32>(writer->kind), writer->shader_hash,
+                                    writer->binding_index, writer->base, writer->size,
+                                    writer->stride, writer->source);
+                                ++matches;
+                            }
+                            LOG_WARNING(Render_Vulkan,
+                                        "Dreams model finalize source writers ordinal={} "
+                                        "index={} matches={} history={}",
+                                        dreams_model_gds_trace.ordinal, source_index, matches,
+                                        g_dreams_buffer_writers.size());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static u32 dreams_model_producer_cycle{};
+    static u32 dreams_model_compact_ordinal{};
+    static u32 dreams_model_post_ordinal{};
+    static u64 dreams_model_compact_sequence{};
+    static u64 dreams_model_post_sequence{};
+    struct DreamsModelProducerTrace {
+        bool enabled{};
+        bool compact{};
+        u32 ordinal{};
+        u32 cycle{};
+        VAddr output_base{};
+        u64 output_size{};
+    } dreams_model_producer_trace{};
+    if (TraceDreamsModelRecord() &&
+        (cs.pgm_hash == Shader::DreamsCompat::SceneCompactShader ||
+         cs.pgm_hash == Shader::DreamsCompat::ModelBucketPostShader)) {
+        dreams_model_producer_trace.compact =
+            cs.pgm_hash == Shader::DreamsCompat::SceneCompactShader;
+        if (dreams_model_producer_trace.compact) {
+            dreams_model_producer_trace.ordinal = ++dreams_model_compact_ordinal;
+            dreams_model_producer_trace.cycle = ++dreams_model_producer_cycle;
+            dreams_model_compact_sequence = g_compute_dispatch_sequence;
+        } else {
+            dreams_model_producer_trace.ordinal = ++dreams_model_post_ordinal;
+            dreams_model_producer_trace.cycle = dreams_model_producer_cycle;
+            dreams_model_post_sequence = g_compute_dispatch_sequence;
+        }
+        const u32 output_index = dreams_model_producer_trace.compact ? 0 : 1;
+        if (output_index < cs.buffers.size() && !cs.buffers[output_index].IsSpecial()) {
+            const auto output = cs.buffers[output_index].GetSharp(cs);
+            dreams_model_producer_trace.output_base = output.base_address;
+            dreams_model_producer_trace.output_size = output.GetSize();
+        }
+        if (dreams_model_producer_trace.ordinal <= 256) {
+            scheduler.Finish();
+            auto* gds = buffer_cache.GetGdsBuffer();
+            const u64 counter_offset =
+                static_cast<u64>(Shader::DreamsCompat::ModelProducerTraceBaseDword) * sizeof(u32);
+            const u64 counter_size =
+                Shader::DreamsCompat::ModelProducerTraceCount * sizeof(u32);
+            const u64 numeric_offset =
+                static_cast<u64>(Shader::DreamsCompat::ModelProducerNumericBaseDword) *
+                sizeof(u32);
+            const u64 numeric_size =
+                Shader::DreamsCompat::ModelProducerNumericCount * sizeof(u32);
+            if (counter_offset + counter_size <= gds->SizeBytes() &&
+                numeric_offset + numeric_size <= gds->SizeBytes()) {
+                dreams_model_producer_trace.enabled = true;
+                gds->Fill(counter_offset, counter_size, 0);
+                gds->Fill(numeric_offset, numeric_size, 0);
+                for (const u32 minimum_slot : {9u, 22u, 24u}) {
+                    gds->Fill(counter_offset + minimum_slot * sizeof(u32), sizeof(u32),
+                              0xffffffff);
+                }
+            } else {
+                LOG_ERROR(Render_Vulkan,
+                          "Dreams model producer trace range exceeds GDS size {:#x}",
+                          gds->SizeBytes());
+            }
+        }
+    }
+
+    bool model_finalize_gate_trace =
+        dreams_model_gds_trace.enabled &&
+        cs.pgm_hash == Shader::DreamsCompat::ModelFinalizeShader;
+    const u64 model_finalize_gate_trace_offset =
+        static_cast<u64>(Shader::DreamsCompat::ModelFinalizeGateTraceBaseDword) * sizeof(u32);
+    const u32 model_finalize_gate_trace_size =
+        Shader::DreamsCompat::ModelFinalizeGateTraceCount * sizeof(u32);
+    const u64 model_finalize_gate_numeric_offset =
+        static_cast<u64>(Shader::DreamsCompat::ModelFinalizeGateNumericBaseDword) * sizeof(u32);
+    const u32 model_finalize_gate_numeric_size =
+        Shader::DreamsCompat::ModelFinalizeGateNumericCount * sizeof(u32);
+    if (model_finalize_gate_trace) {
+        // Finish earlier GDS users and clear the host-private ranges on the GPU immediately
+        // before this finalize dispatch. This keeps every logged ordinal independent.
+        scheduler.Finish();
+        auto* gds = buffer_cache.GetGdsBuffer();
+        if (model_finalize_gate_trace_offset + model_finalize_gate_trace_size >
+                gds->SizeBytes() ||
+            model_finalize_gate_numeric_offset + model_finalize_gate_numeric_size >
+                gds->SizeBytes()) {
+            LOG_ERROR(Render_Vulkan,
+                      "Dreams d049 gate trace ranges counters={:#x}+{:#x} "
+                      "numeric={:#x}+{:#x} exceed GDS size {:#x}",
+                      model_finalize_gate_trace_offset, model_finalize_gate_trace_size,
+                      model_finalize_gate_numeric_offset, model_finalize_gate_numeric_size,
+                      gds->SizeBytes());
+            model_finalize_gate_trace = false;
+        } else {
+            gds->Fill(model_finalize_gate_trace_offset, model_finalize_gate_trace_size, 0);
+            gds->Fill(model_finalize_gate_numeric_offset, model_finalize_gate_numeric_size, 0);
+        }
+    }
+
+    bool gather_stage_trace =
+        TraceDreamsGatherStages() &&
+        cs.pgm_hash == Shader::DreamsCompat::GatherVoxelsShader;
+    const u64 gather_stage_trace_offset =
+        static_cast<u64>(Shader::DreamsCompat::GatherStageTraceBaseDword) * sizeof(u32);
+    const u32 gather_stage_trace_size =
+        Shader::DreamsCompat::GatherStageTraceCount * sizeof(u32);
+    const u64 gather_numeric_trace_offset =
+        static_cast<u64>(Shader::DreamsCompat::GatherNumericTraceBaseDword) * sizeof(u32);
+    const u32 gather_numeric_trace_size =
+        Shader::DreamsCompat::GatherNumericTraceCount * sizeof(u32);
+    if (gather_stage_trace) {
+        const auto user_data = [&](u32 index) {
+            return index < cs.user_data.size() ? cs.user_data[index] : 0;
+        };
+        const auto flat_data = [&](u32 index) {
+            return index < cs.flattened_ud_buf.size() ? cs.flattened_ud_buf[index] : 0;
+        };
+        constexpr VAddr GuestAddressMask = 0x0000FFFFFFFFFFFFULL;
+        constexpr std::array<u64, 8> GatherConstantOffsets{
+            0x170, 0x174, 0x180, 0x184, 0x188, 0x18c, 0x190, 0x194};
+        const VAddr gather_constant_base =
+            ((static_cast<VAddr>(user_data(1)) << 32) | user_data(0)) & GuestAddressMask;
+        const VAddr gather_hash_constant_base =
+            ((static_cast<VAddr>(user_data(3)) << 32) | user_data(2)) & GuestAddressMask;
+        std::array<u32, GatherConstantOffsets.size()> gather_constant_cpu{};
+        std::array<bool, GatherConstantOffsets.size()> gather_constant_mapped{};
+        std::array<bool, GatherConstantOffsets.size()> gather_constant_gpu_modified{};
+        for (u32 index = 0; index < GatherConstantOffsets.size(); ++index) {
+            const VAddr address = gather_constant_base + GatherConstantOffsets[index];
+            gather_constant_mapped[index] =
+                gather_constant_base != 0 && memory->IsValidMapping(address, sizeof(u32));
+            if (!gather_constant_mapped[index]) {
+                continue;
+            }
+            std::memcpy(&gather_constant_cpu[index], std::bit_cast<const void*>(address),
+                        sizeof(u32));
+            gather_constant_gpu_modified[index] =
+                buffer_cache.IsRegionGpuModified(address, sizeof(u32));
+        }
+        constexpr std::array<u64, 6> GatherHashConstantOffsets{0, 4, 8, 12, 16, 24};
+        std::array<u32, GatherHashConstantOffsets.size()> gather_hash_constant_cpu{};
+        std::array<bool, GatherHashConstantOffsets.size()> gather_hash_constant_mapped{};
+        std::array<bool, GatherHashConstantOffsets.size()> gather_hash_constant_gpu_modified{};
+        for (u32 index = 0; index < GatherHashConstantOffsets.size(); ++index) {
+            const VAddr address = gather_hash_constant_base + GatherHashConstantOffsets[index];
+            gather_hash_constant_mapped[index] =
+                gather_hash_constant_base != 0 && memory->IsValidMapping(address, sizeof(u32));
+            if (!gather_hash_constant_mapped[index]) {
+                continue;
+            }
+            std::memcpy(&gather_hash_constant_cpu[index], std::bit_cast<const void*>(address),
+                        sizeof(u32));
+            gather_hash_constant_gpu_modified[index] =
+                buffer_cache.IsRegionGpuModified(address, sizeof(u32));
+        }
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams Gather stage trace begin dims={}x{}x{} "
+            "ud0-10={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x} "
+            "flat96-103={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x} cb_base={:#x} "
+            "cb92-101={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x} "
+            "mapped={},{},{},{},{},{},{},{} gpu_modified={},{},{},{},{},{},{},{}",
+            cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, user_data(0), user_data(1),
+            user_data(2), user_data(3), user_data(4), user_data(5), user_data(6), user_data(7),
+            user_data(8), user_data(9), user_data(10), flat_data(96), flat_data(97),
+            flat_data(98), flat_data(99), flat_data(100), flat_data(101), flat_data(102),
+            flat_data(103), gather_constant_base, gather_constant_cpu[0], gather_constant_cpu[1],
+            gather_constant_cpu[2], gather_constant_cpu[3], gather_constant_cpu[4],
+            gather_constant_cpu[5], gather_constant_cpu[6], gather_constant_cpu[7],
+            gather_constant_mapped[0], gather_constant_mapped[1], gather_constant_mapped[2],
+            gather_constant_mapped[3], gather_constant_mapped[4], gather_constant_mapped[5],
+            gather_constant_mapped[6], gather_constant_mapped[7],
+            gather_constant_gpu_modified[0], gather_constant_gpu_modified[1],
+            gather_constant_gpu_modified[2], gather_constant_gpu_modified[3],
+            gather_constant_gpu_modified[4], gather_constant_gpu_modified[5],
+            gather_constant_gpu_modified[6], gather_constant_gpu_modified[7]);
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams Gather hash constants flat104-109={:#x},{:#x},{:#x},{:#x},{:#x},{:#x} "
+            "hash_cb_base={:#x} cb0-4,6={:#x},{:#x},{:#x},{:#x},{:#x},{:#x} "
+            "mapped={},{},{},{},{},{} gpu_modified={},{},{},{},{},{}",
+            flat_data(104), flat_data(105), flat_data(106), flat_data(107), flat_data(108),
+            flat_data(109), gather_hash_constant_base, gather_hash_constant_cpu[0],
+            gather_hash_constant_cpu[1], gather_hash_constant_cpu[2],
+            gather_hash_constant_cpu[3], gather_hash_constant_cpu[4],
+            gather_hash_constant_cpu[5],
+            gather_hash_constant_mapped[0], gather_hash_constant_mapped[1],
+            gather_hash_constant_mapped[2], gather_hash_constant_mapped[3],
+            gather_hash_constant_mapped[4], gather_hash_constant_mapped[5],
+            gather_hash_constant_gpu_modified[0], gather_hash_constant_gpu_modified[1],
+            gather_hash_constant_gpu_modified[2], gather_hash_constant_gpu_modified[3],
+            gather_hash_constant_gpu_modified[4], gather_hash_constant_gpu_modified[5]);
+        // Finish all prior GDS users, then clear on the GPU so this is also correct when the
+        // host-visible GDS allocation is not host coherent.
+        scheduler.Finish();
+        auto* gds = buffer_cache.GetGdsBuffer();
+        if (gather_stage_trace_offset + gather_stage_trace_size > gds->SizeBytes() ||
+            gather_numeric_trace_offset + gather_numeric_trace_size > gds->SizeBytes()) {
+            LOG_ERROR(Render_Vulkan,
+                      "Dreams Gather trace ranges stage={:#x}+{:#x} numeric={:#x}+{:#x} "
+                      "exceed GDS size {:#x}",
+                      gather_stage_trace_offset, gather_stage_trace_size,
+                      gather_numeric_trace_offset, gather_numeric_trace_size, gds->SizeBytes());
+            gather_stage_trace = false;
+        } else {
+            gds->Fill(gather_stage_trace_offset, gather_stage_trace_size, 0);
+            gds->Fill(gather_numeric_trace_offset, gather_numeric_trace_size, 0);
+        }
+    }
+    const auto read_gather_stage_trace = [&] {
+        std::array<u32, Shader::DreamsCompat::GatherStageTraceCount> values{};
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        if (gather_stage_trace_offset + sizeof(values) <= gds->mapped_data.size()) {
+            std::memcpy(values.data(), gds->mapped_data.data() + gather_stage_trace_offset,
+                        sizeof(values));
+        }
+        return values;
+    };
+    const auto read_gather_numeric_trace = [&] {
+        std::array<u32, Shader::DreamsCompat::GatherNumericTraceCount> values{};
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        if (gather_numeric_trace_offset + sizeof(values) <= gds->mapped_data.size()) {
+            std::memcpy(values.data(), gds->mapped_data.data() + gather_numeric_trace_offset,
+                        sizeof(values));
+        }
+        return values;
+    };
+
     if (!BindResources(pipeline)) {
         return;
+    }
+
+    struct DreamsTemporalContentDispatchCapture {
+        bool enabled{};
+        u32 ordinal{};
+        u32 chain{};
+        u32 chain_dispatch{};
+        std::array<DreamsTemporalContentImage, 4> images{};
+        std::array<u32, 5> constants{};
+        std::array<std::filesystem::path, 4> pre_files{};
+        std::filesystem::path post_file;
+    } temporal_content_capture{};
+    constexpr std::array<std::string_view, 4> TemporalContentRoles{
+        "output", "history", "current", "depth"};
+    const auto collect_temporal_content_images = [&] {
+        std::array<DreamsTemporalContentImage, 4> images{};
+        u32 flattened_index{};
+        for (u32 binding = 0; binding < images.size(); ++binding) {
+            auto& entry = images[binding];
+            entry.binding = binding;
+            entry.flattened_index = flattened_index;
+            if (binding >= cs.images.size()) {
+                continue;
+            }
+
+            const auto& image_desc = cs.images[binding];
+            const auto tsharp = image_desc.GetSharp(cs);
+            const bool null_descriptor =
+                tsharp.Address() == 0 ||
+                tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid;
+            entry.written = image_desc.is_written;
+            entry.array_size = null_descriptor ? 1 : image_desc.NumBindings(cs);
+            entry.descriptor_base = tsharp.Address();
+            entry.descriptor_width = static_cast<u32>(tsharp.width) + 1;
+            entry.descriptor_height = static_cast<u32>(tsharp.height) + 1;
+            entry.descriptor_depth = static_cast<u32>(tsharp.depth) + 1;
+            entry.descriptor_pitch = tsharp.Pitch();
+
+            if (flattened_index < image_bindings.size()) {
+                const auto& [image_id, desc] = image_bindings[flattened_index];
+                entry.image_id = image_id;
+                entry.view_format = static_cast<u32>(desc.view_info.format);
+                entry.base_level = desc.view_info.range.base.level;
+                entry.levels = desc.view_info.range.extent.levels;
+                entry.base_layer = desc.view_info.range.base.layer;
+                entry.layers = desc.view_info.range.extent.layers;
+                if (image_id) {
+                    const auto& image = texture_cache.GetImage(image_id);
+                    entry.valid = true;
+                    entry.image_uid = image.image_uid;
+                    entry.guest_base = image.info.guest_address;
+                    entry.guest_size = image.info.guest_size;
+                    entry.cached_width = image.info.size.width;
+                    entry.cached_height = image.info.size.height;
+                    entry.cached_depth = image.info.size.depth;
+                    entry.cached_pitch = image.info.pitch;
+                    entry.bits = image.info.num_bits;
+                    entry.image_format = static_cast<u32>(image.info.pixel_format);
+                    entry.tile_mode = static_cast<u32>(image.info.tile_mode);
+                    entry.linear_size =
+                        static_cast<u64>(image.info.pitch) * image.info.size.height *
+                        image.info.size.depth * image.info.resources.layers *
+                        (image.info.num_bits / 8);
+                }
+            }
+            flattened_index += entry.array_size;
+        }
+        return images;
+    };
+    const auto restore_temporal_content_images = [&](std::span<const DreamsTemporalContentImage>
+                                                         images) {
+        std::array<VideoCore::ImageId, 4> restored{};
+        u32 restored_count{};
+        for (const auto& entry : images) {
+            if (!entry.valid || entry.flattened_index >= image_bindings.size() ||
+                entry.flattened_index >= image_infos.size() ||
+                std::find(restored.begin(), restored.begin() + restored_count, entry.image_id) !=
+                    restored.begin() + restored_count) {
+                continue;
+            }
+            const auto& [image_id, desc] = image_bindings[entry.flattened_index];
+            if (image_id != entry.image_id) {
+                continue;
+            }
+            auto access = vk::AccessFlags2{vk::AccessFlagBits2::eShaderRead};
+            if (desc.type == VideoCore::TextureCache::BindingType::Storage) {
+                access |= vk::AccessFlagBits2::eShaderWrite;
+            }
+            texture_cache.GetImage(image_id).Transit(
+                image_infos[entry.flattened_index].imageLayout, access, desc.view_info.range);
+            restored[restored_count++] = image_id;
+        }
+    };
+
+    if (cs.pgm_hash == Shader::DreamsCompat::TemporalResolveShader &&
+        BeginDreamsTemporalContentCaptureDispatch()) {
+        auto& state = g_dreams_temporal_content_capture;
+        temporal_content_capture.enabled = true;
+        temporal_content_capture.ordinal = ++state.ordinal;
+        temporal_content_capture.images = collect_temporal_content_images();
+        for (u32 index = 0; index < temporal_content_capture.constants.size(); ++index) {
+            // The shader's SRT dwords 28-32 are remapped after the 16-word user-data prefix.
+            const u32 flat_index = 44 + index;
+            temporal_content_capture.constants[index] =
+                flat_index < cs.flattened_ud_buf.size() ? cs.flattened_ud_buf[flat_index] : 0;
+        }
+        std::tie(temporal_content_capture.chain, temporal_content_capture.chain_dispatch) =
+            AssignDreamsTemporalContentChain(temporal_content_capture.images);
+
+        const auto image_address = [](const DreamsTemporalContentImage& image) {
+            return image.valid ? image.guest_base : image.descriptor_base;
+        };
+        const VAddr output_address = image_address(temporal_content_capture.images[0]);
+        const VAddr history_address = image_address(temporal_content_capture.images[1]);
+        {
+            std::ofstream dispatches{state.output_dir / "dispatches.tsv", std::ios::app};
+            dispatches << temporal_content_capture.ordinal << '\t' << g_compute_dispatch_sequence
+                       << '\t' << temporal_content_capture.chain << '\t'
+                       << temporal_content_capture.chain_dispatch << '\t'
+                       << std::min(output_address, history_address) << '\t'
+                       << std::max(output_address, history_address) << '\t' << cs_program.dim_x
+                       << '\t' << cs_program.dim_y << '\t' << cs_program.dim_z;
+            for (const u32 value : temporal_content_capture.constants) {
+                dispatches << '\t' << value;
+            }
+            dispatches << '\n';
+        }
+
+        boost::container::small_vector<VideoCore::TextureCache::LinearImageDump, 4> dumps;
+        for (u32 binding = 0; binding < temporal_content_capture.images.size(); ++binding) {
+            const auto& image = temporal_content_capture.images[binding];
+            if (image.valid) {
+                temporal_content_capture.pre_files[binding] =
+                    state.output_dir /
+                    fmt::format("dispatch-{:02}-chain-{:02}-chain-dispatch-{:02}-pre-b{}-{}.bin",
+                                temporal_content_capture.ordinal, temporal_content_capture.chain,
+                                temporal_content_capture.chain_dispatch, binding,
+                                TemporalContentRoles[binding]);
+                dumps.push_back({image.image_id, temporal_content_capture.pre_files[binding]});
+            }
+        }
+        texture_cache.DumpImagesLinear(dumps);
+        restore_temporal_content_images(temporal_content_capture.images);
+        for (u32 binding = 0; binding < temporal_content_capture.images.size(); ++binding) {
+            WriteDreamsTemporalContentImageMetadata(
+                temporal_content_capture.ordinal, g_compute_dispatch_sequence,
+                temporal_content_capture.chain, "pre", TemporalContentRoles[binding],
+                temporal_content_capture.images[binding],
+                temporal_content_capture.pre_files[binding]);
+        }
+        temporal_content_capture.post_file =
+            state.output_dir /
+            fmt::format("dispatch-{:02}-chain-{:02}-chain-dispatch-{:02}-post-b0-output.bin",
+                        temporal_content_capture.ordinal, temporal_content_capture.chain,
+                        temporal_content_capture.chain_dispatch);
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams temporal content pre ordinal={} sequence={} chain={} chain_dispatch={} "
+                    "output={:#x} history={:#x} bindings={} srt28-32/flat44-48={:#010x},{:#010x},"
+                    "{:#010x},{:#010x},{:#010x}",
+                    temporal_content_capture.ordinal, g_compute_dispatch_sequence,
+                    temporal_content_capture.chain, temporal_content_capture.chain_dispatch,
+                    output_address, history_address, image_bindings.size(),
+                    temporal_content_capture.constants[0], temporal_content_capture.constants[1],
+                    temporal_content_capture.constants[2], temporal_content_capture.constants[3],
+                    temporal_content_capture.constants[4]);
+    }
+
+    struct DreamsGatherDeviceReadback {
+        bool enabled{};
+        u32 ordinal{};
+        VAddr guest_address{};
+        vk::Buffer source_buffer{};
+        u64 source_offset{};
+        u64 source_range{};
+        u64 download_offset{};
+        u8* download_data{};
+        bool download_coherent{};
+        std::array<u32, 8> guest_before{};
+    } gather_device_readback{};
+    const char* gather_device_readback_value =
+        std::getenv("SHADPS4_DREAMS_GATHER_DEVICE_READBACK");
+    if (cs.pgm_hash == Shader::DreamsCompat::GatherVoxelsShader &&
+        gather_device_readback_value != nullptr &&
+        std::string_view{gather_device_readback_value} == "1" && cs.buffers.size() > 14 &&
+        !cs.buffers[14].IsSpecial() && buffer_infos.size() > 14) {
+        static u32 gather_device_readback_count{};
+        if (gather_device_readback_count < 8) {
+            const auto sharp = cs.buffers[14].GetSharp(cs);
+            constexpr u32 ProbeSize = 8 * sizeof(u32);
+            if (sharp.base_address != 0 && sharp.GetSize() >= ProbeSize &&
+                memory->IsValidMapping(sharp.base_address, ProbeSize)) {
+                const auto& source = buffer_infos[14];
+                auto& download =
+                    buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download);
+                const auto [download_data, download_offset] = download.Map(ProbeSize, 64);
+                if (download_data != nullptr) {
+                    download.Commit();
+                    gather_device_readback.enabled = true;
+                    gather_device_readback.ordinal = ++gather_device_readback_count;
+                    gather_device_readback.guest_address = sharp.base_address;
+                    gather_device_readback.source_buffer = source.buffer;
+                    gather_device_readback.source_offset = source.offset;
+                    gather_device_readback.source_range = source.range;
+                    gather_device_readback.download_offset = download_offset;
+                    gather_device_readback.download_data = download_data;
+                    gather_device_readback.download_coherent = download.is_coherent;
+                    std::memcpy(gather_device_readback.guest_before.data(),
+                                std::bit_cast<const void*>(sharp.base_address), ProbeSize);
+
+                    // Copy from the exact VkBuffer and offset already stored in descriptor 14.
+                    // Do not refind the guest address: BindTextures may have replaced the cache
+                    // buffer after BindBuffers built this descriptor.
+                    scheduler.EndRendering();
+                    const auto probe_cmdbuf = scheduler.CommandBuffer();
+                    const vk::BufferMemoryBarrier2 source_pre = {
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                        .buffer = source.buffer,
+                        .offset = source.offset,
+                        .size = ProbeSize,
+                    };
+                    probe_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                        .bufferMemoryBarrierCount = 1,
+                        .pBufferMemoryBarriers = &source_pre,
+                    });
+                    const vk::BufferCopy probe_copy = {
+                        .srcOffset = source.offset,
+                        .dstOffset = download_offset,
+                        .size = ProbeSize,
+                    };
+                    probe_cmdbuf.copyBuffer(source.buffer, download.Handle(), probe_copy);
+                    const std::array<vk::BufferMemoryBarrier2, 2> probe_post{{
+                        {
+                            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                            .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                            .buffer = source.buffer,
+                            .offset = source.offset,
+                            .size = ProbeSize,
+                        },
+                        {
+                            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                            .buffer = download.Handle(),
+                            .offset = download_offset,
+                            .size = ProbeSize,
+                        },
+                    }};
+                    probe_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                        .bufferMemoryBarrierCount = static_cast<u32>(probe_post.size()),
+                        .pBufferMemoryBarriers = probe_post.data(),
+                    });
+                }
+            }
+        }
     }
 
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     const bool profile = ShouldProfileCompute();
     const auto profile_start = std::chrono::steady_clock::now();
-    if (cs.pgm_hash == DreamsTraversalShader) {
+    u32 dispatch_x = cs_program.dim_x;
+    u32 dispatch_base_x{};
+    if (Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+        cs.pgm_hash == 0x7ba4de5d) {
+        static const bool diagnostic_skip =
+            std::getenv("SHADPS4_DREAMS_GATHER_VOXELS_SKIP") != nullptr;
+        static const u32 diagnostic_cap = [] {
+            const char* value = std::getenv("SHADPS4_DREAMS_GATHER_VOXELS_CAP");
+            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+        }();
+        static const u32 diagnostic_base = [] {
+            const char* value = std::getenv("SHADPS4_DREAMS_GATHER_VOXELS_BASE");
+            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+        }();
+        dispatch_base_x = std::min(diagnostic_base, dispatch_x);
+        dispatch_x -= dispatch_base_x;
+        if (diagnostic_skip) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams diagnostic: skipping GatherVoxelsChunk dispatch of {} groups",
+                        dispatch_x);
+            dispatch_x = 0;
+        } else if (diagnostic_cap != 0 && dispatch_x > diagnostic_cap) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams diagnostic: limiting GatherVoxelsChunk dispatch base={} "
+                        "remaining={} -> {} groups",
+                        dispatch_base_x, dispatch_x, diagnostic_cap);
+            dispatch_x = diagnostic_cap;
+        }
+    }
+    static const u32 gather_batch_size = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_GATHER_VOXELS_BATCH");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    static const u32 gather_submit_batch_size = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_GATHER_VOXELS_SUBMIT_BATCH");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    const auto download_gather_diagnostic_output = [&] {
+        if (!gather_post_diagnostic || gather_post_buffer_ready[2] || dispatch_x == 0 ||
+            cs.buffers.size() <= 2 || cs.buffers[2].IsSpecial()) {
+            return;
+        }
+        // ReadMemory appends the transfer to the current command buffer and fences it. Calling
+        // this while the command buffer still contains the final Gather dispatch keeps the
+        // diagnostic download in that same submit.
+        const auto output = cs.buffers[2].GetSharp(cs);
+        const u64 read_size = std::min<u64>(output.GetSize(), 16_MB) & ~u64{3};
+        if (output.base_address == 0 || read_size < sizeof(u32) ||
+            !memory->IsValidMapping(output.base_address, read_size)) {
+            return;
+        }
+        gather_post_buffer_gpu_modified[2] =
+            buffer_cache.IsRegionGpuModified(output.base_address, read_size);
+        buffer_cache.ReadMemory(output.base_address, read_size);
+        gather_post_buffer_ready[2] = true;
+    };
+    if (cs.pgm_hash == DreamsTraversalShader ||
+        (cs.pgm_hash == Shader::DreamsCompat::SceneCompactShader &&
+         OrderDreamsSceneCompact())) {
         DispatchDreamsTraversalOrdered(cmdbuf, cs_program.dim_x, cs_program.dim_y,
                                        cs_program.dim_z);
+    } else if (cs.pgm_hash == 0x7ba4de5d && gather_submit_batch_size != 0 &&
+               dispatch_x != 0) {
+        for (const u32 index : {5u, 6u}) {
+            if (index >= cs.buffers.size() || cs.buffers[index].IsSpecial()) {
+                continue;
+            }
+            const auto sharp = cs.buffers[index].GetSharp(cs);
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams diagnostic: GatherVoxelsChunk buffer #{} base={:#x}+{:#x} "
+                        "stride={} records={} write={}",
+                        index, sharp.base_address, sharp.GetSize(), sharp.stride,
+                        sharp.num_records, cs.buffers[index].is_written);
+        }
+        const vk::MemoryBarrier2 gather_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                             vk::AccessFlagBits2::eShaderWrite,
+        };
+        const vk::DependencyInfo gather_dependency = {
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &gather_barrier,
+        };
+        for (u32 offset = 0; offset < dispatch_x; offset += gather_submit_batch_size) {
+            const u32 count = std::min(gather_submit_batch_size, dispatch_x - offset);
+            cmdbuf.dispatchBase(dispatch_base_x + offset, 0, 0, count, cs_program.dim_y,
+                                cs_program.dim_z);
+            const bool has_more = offset + count < dispatch_x;
+            if (has_more) {
+                cmdbuf.pipelineBarrier2(gather_dependency);
+            } else {
+                download_gather_diagnostic_output();
+            }
+            scheduler.Finish();
+            std::array<u32, 3> gather_gds{};
+            constexpr std::array<u32, 3> GatherGdsIndices{64, 65, 122};
+            const auto* gds = buffer_cache.GetGdsBuffer();
+            for (u32 index = 0; index < GatherGdsIndices.size(); ++index) {
+                const u64 byte_offset =
+                    static_cast<u64>(GatherGdsIndices[index]) * sizeof(u32);
+                if (byte_offset + sizeof(u32) <= gds->mapped_data.size()) {
+                    std::memcpy(&gather_gds[index], gds->mapped_data.data() + byte_offset,
+                                sizeof(u32));
+                }
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams diagnostic: GatherVoxelsChunk submit batch base={} groups={} "
+                        "complete GDS64={} GDS65={} GDS122={}",
+                        dispatch_base_x + offset, count, gather_gds[0], gather_gds[1],
+                        gather_gds[2]);
+            if (gather_stage_trace) {
+                const auto stages = read_gather_stage_trace();
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams Gather stage trace cumulative base={} groups_done={} "
+                    "entry={} active={} class_any={} hash_attempt={} hash_found={} "
+                    "take_output={} reached_gds64={} sentinel={} local_lt8={} class_empty={} "
+                    "cb93_positive={} local_and_cb={} final_pre_save={} class_reduce_reach={} "
+                    "v47_nonzero={} v47_bit6={} v47_bit7={} v47_both={} v35_nonzero={} "
+                    "input_reach={} input_any_nan={} input_all_exact_1={} input_any_ne_1={} "
+                    "input_any_lt_0875={} input_any_eq_0875={} input_any_gt_1={} "
+                    "producer_reach={} producer_any_nan={} producer_all_exact_1={} "
+                    "producer_any_ne_1={} producer_any_lt_0875={} explicit_hit={} "
+                    "explicit_fallback={} explicit_value_negative={} fallback_negative={} "
+                    "fallback_positive={} low16_negative={} special_abs8={} direct={} "
+                    "direct11_path={} sparse10_path={} sparse_l1_hit={} sparse_l1_miss={} "
+                    "sparse_l2_hit={} sparse_l2_miss={} sparse_leaf_hit={} sparse_leaf_miss={} "
+                    "pre67c_explicit_nonzero={} pre67c_fallback_nonzero={} "
+                    "post67c_explicit_nonzero={} post67c_fallback_nonzero={} "
+                    "root_in_range={} root_oob={} root_negative={} root_nonnegative={} "
+                    "root_minus2={} root_other_negative={} sparse_l1_reach={} "
+                    "probe_reach={} probe_within_limit={} probe_exhausted={} "
+                    "key_equal={} key_mismatch={} x_underflow={} y_underflow={} "
+                    "z_underflow={} v4_ge_2048={} v11_ge_2048={} v5_ge_2048={} "
+                    "max_high_bit={} max_ffffffff={}",
+                    dispatch_base_x, offset + count, stages[0], stages[1], stages[2], stages[3],
+                    stages[4], stages[5], stages[6], stages[7], stages[8], stages[9], stages[10],
+                    stages[11], stages[12], stages[13], stages[14], stages[15], stages[16],
+                    stages[17], stages[18], stages[19], stages[20], stages[21], stages[22],
+                    stages[23], stages[24], stages[25], stages[26], stages[27], stages[28],
+                    stages[29], stages[30], stages[31], stages[32], stages[33], stages[34],
+                    stages[35], stages[36], stages[37], stages[38], stages[39], stages[40],
+                    stages[41], stages[42], stages[43], stages[44], stages[45], stages[46],
+                    stages[47], stages[48], stages[49], stages[50], stages[51], stages[52],
+                    stages[53], stages[54], stages[55], stages[56], stages[57], stages[58],
+                    stages[59], stages[60], stages[61], stages[62], stages[63], stages[64],
+                    stages[65], stages[66], stages[67], stages[68], stages[69], stages[70]);
+            }
+            if (has_more) {
+                pipeline->BindResources(set_writes, buffer_barriers, push_data);
+                cmdbuf = scheduler.CommandBuffer();
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+            }
+        }
+    } else if (cs.pgm_hash == 0x7ba4de5d && gather_batch_size != 0 && dispatch_x != 0) {
+        const vk::MemoryBarrier2 gather_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                             vk::AccessFlagBits2::eShaderWrite,
+        };
+        const vk::DependencyInfo gather_dependency = {
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &gather_barrier,
+        };
+        for (u32 offset = 0; offset < dispatch_x; offset += gather_batch_size) {
+            const u32 count = std::min(gather_batch_size, dispatch_x - offset);
+            cmdbuf.dispatchBase(dispatch_base_x + offset, 0, 0, count, cs_program.dim_y,
+                                cs_program.dim_z);
+            if (offset + count < dispatch_x) {
+                cmdbuf.pipelineBarrier2(gather_dependency);
+            }
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams diagnostic: batched GatherVoxelsChunk base={} groups={} batch={}",
+                    dispatch_base_x, dispatch_x, gather_batch_size);
+    } else if (dispatch_base_x != 0) {
+        cmdbuf.dispatchBase(dispatch_base_x, 0, 0, dispatch_x, cs_program.dim_y,
+                            cs_program.dim_z);
     } else {
-        cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+        cmdbuf.dispatch(dispatch_x, cs_program.dim_y, cs_program.dim_z);
+    }
+    if (temporal_content_capture.enabled) {
+        const auto& output = temporal_content_capture.images[0];
+        if (output.valid) {
+            const std::array dumps{VideoCore::TextureCache::LinearImageDump{
+                output.image_id, temporal_content_capture.post_file}};
+            texture_cache.DumpImagesLinear(dumps);
+            restore_temporal_content_images(
+                std::span<const DreamsTemporalContentImage>{&output, 1});
+        }
+        WriteDreamsTemporalContentImageMetadata(
+            temporal_content_capture.ordinal, g_compute_dispatch_sequence,
+            temporal_content_capture.chain, "post", TemporalContentRoles[0], output,
+            temporal_content_capture.post_file);
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams temporal content post ordinal={} sequence={} chain={} output_id={} "
+                    "file={}",
+                    temporal_content_capture.ordinal, g_compute_dispatch_sequence,
+                    temporal_content_capture.chain, output.image_id.index,
+                    temporal_content_capture.post_file.string());
+        FinishDreamsTemporalContentCaptureDispatch();
+    }
+    download_gather_diagnostic_output();
+    if (Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+        cs.pgm_hash == 0x7ba4de5d &&
+        (std::getenv("SHADPS4_DREAMS_GATHER_VOXELS_SYNC") != nullptr ||
+         ProfileDreamsGpuAfterGather() || gather_post_diagnostic || gather_stage_trace ||
+         gather_device_readback.enabled)) {
+        const auto gather_start = std::chrono::steady_clock::now();
+        scheduler.Finish();
+        const auto gather_elapsed = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - gather_start)
+                                        .count();
+        std::array<u32, 3> gather_gds{};
+        constexpr std::array<u32, 3> GatherGdsIndices{64, 65, 122};
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        for (u32 index = 0; index < GatherGdsIndices.size(); ++index) {
+            const u64 byte_offset =
+                static_cast<u64>(GatherGdsIndices[index]) * sizeof(u32);
+            if (byte_offset + sizeof(u32) <= gds->mapped_data.size()) {
+                std::memcpy(&gather_gds[index], gds->mapped_data.data() + byte_offset,
+                            sizeof(u32));
+            }
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams diagnostic: GatherVoxelsChunk completed {} groups in {:.3f}ms "
+                    "GDS64={} GDS65={} GDS122={}",
+                    dispatch_x, gather_elapsed, gather_gds[0], gather_gds[1], gather_gds[2]);
+        if (gather_device_readback.enabled) {
+            std::array<u32, 8> descriptor_head{};
+            std::memcpy(descriptor_head.data(), gather_device_readback.download_data,
+                        sizeof(descriptor_head));
+            const auto& guest_before = gather_device_readback.guest_before;
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams Gather descriptor readback trace={} guest={:#x}+{:#x} "
+                "descriptor_vk={:#x} descriptor_offset={:#x} descriptor_range={:#x} "
+                "download_offset={:#x} coherent={} "
+                "before={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x} "
+                "descriptor={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                gather_device_readback.ordinal, gather_device_readback.guest_address,
+                sizeof(descriptor_head),
+                reinterpret_cast<uintptr_t>(
+                    static_cast<VkBuffer>(gather_device_readback.source_buffer)),
+                gather_device_readback.source_offset, gather_device_readback.source_range,
+                gather_device_readback.download_offset,
+                gather_device_readback.download_coherent, guest_before[0], guest_before[1],
+                guest_before[2], guest_before[3], guest_before[4], guest_before[5],
+                guest_before[6], guest_before[7], descriptor_head[0], descriptor_head[1],
+                descriptor_head[2], descriptor_head[3], descriptor_head[4], descriptor_head[5],
+                descriptor_head[6], descriptor_head[7]);
+        }
+        if (gather_stage_trace) {
+            const auto stages = read_gather_stage_trace();
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams Gather stage trace final base={} groups={} entry={} active={} "
+                        "class_any={} hash_attempt={} hash_found={} take_output={} "
+                        "reached_gds64={} sentinel={} local_lt8={} class_empty={} "
+                        "cb93_positive={} local_and_cb={} final_pre_save={} "
+                        "class_reduce_reach={} v47_nonzero={} v47_bit6={} v47_bit7={} "
+                        "v47_both={} v35_nonzero={} input_reach={} input_any_nan={} "
+                        "input_all_exact_1={} input_any_ne_1={} input_any_lt_0875={} "
+                        "input_any_eq_0875={} input_any_gt_1={} producer_reach={} "
+                        "producer_any_nan={} producer_all_exact_1={} producer_any_ne_1={} "
+                        "producer_any_lt_0875={} explicit_hit={} explicit_fallback={} "
+                        "explicit_value_negative={} fallback_negative={} fallback_positive={} "
+                        "low16_negative={} special_abs8={} direct={} direct11_path={} "
+                        "sparse10_path={} sparse_l1_hit={} sparse_l1_miss={} sparse_l2_hit={} "
+                        "sparse_l2_miss={} sparse_leaf_hit={} sparse_leaf_miss={} "
+                        "pre67c_explicit_nonzero={} pre67c_fallback_nonzero={} "
+                        "post67c_explicit_nonzero={} post67c_fallback_nonzero={} "
+                        "root_in_range={} root_oob={} root_negative={} root_nonnegative={} "
+                        "root_minus2={} root_other_negative={} sparse_l1_reach={} "
+                        "probe_reach={} probe_within_limit={} probe_exhausted={} "
+                        "key_equal={} key_mismatch={} x_underflow={} y_underflow={} "
+                        "z_underflow={} v4_ge_2048={} v11_ge_2048={} v5_ge_2048={} "
+                        "max_high_bit={} max_ffffffff={}",
+                        dispatch_base_x, dispatch_x, stages[0], stages[1], stages[2], stages[3],
+                        stages[4], stages[5], stages[6], stages[7], stages[8], stages[9],
+                        stages[10], stages[11], stages[12], stages[13], stages[14], stages[15],
+                        stages[16], stages[17], stages[18], stages[19], stages[20], stages[21],
+                        stages[22], stages[23], stages[24], stages[25], stages[26], stages[27],
+                        stages[28], stages[29], stages[30], stages[31], stages[32], stages[33],
+                        stages[34], stages[35], stages[36], stages[37], stages[38], stages[39],
+                        stages[40], stages[41], stages[42], stages[43], stages[44], stages[45],
+                        stages[46], stages[47], stages[48], stages[49], stages[50], stages[51],
+                        stages[52], stages[53], stages[54], stages[55], stages[56], stages[57],
+                        stages[58], stages[59], stages[60], stages[61], stages[62], stages[63],
+                        stages[64], stages[65], stages[66], stages[67], stages[68], stages[69],
+                        stages[70]);
+            const auto numeric = read_gather_numeric_trace();
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams Gather numeric trace final base={} groups={} "
+                "post28(valid,lane,v9)={:#x},{:#x},{:#x} "
+                "pre180(valid,lane,v8,v11,v15)={:#x},{:#x},{:#x},{:#x},{:#x} "
+                "post180_end184(valid,lane,v8,v11,v15)={:#x},{:#x},{:#x},{:#x},{:#x} "
+                "post194_exec(valid,lane,v8,v11,v15)={:#x},{:#x},{:#x},{:#x},{:#x} "
+                "post270(valid,lane,target_v5)={:#x},{:#x},{:#x} "
+                "post2d0(valid,lane,bucket_v1)={:#x},{:#x},{:#x} "
+                "pre2f4(valid,lane,bound_v18)={:#x},{:#x},{:#x} "
+                "pre410(valid,lane,v1,v2,v3)={:#x},{:#x},{:#x},{:#x},{:#x} "
+                "post418(valid,lane,v4,v11,v5)={:#x},{:#x},{:#x},{:#x},{:#x} "
+                "gpu_head_valid={:#x} gpu_head0-7={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                dispatch_base_x, dispatch_x, numeric[0], numeric[1], numeric[2], numeric[3],
+                numeric[4], numeric[5], numeric[6], numeric[7], numeric[8], numeric[9],
+                numeric[10], numeric[11], numeric[12], numeric[13], numeric[14], numeric[15],
+                numeric[16], numeric[17], numeric[28], numeric[29], numeric[30], numeric[31],
+                numeric[32], numeric[33], numeric[34], numeric[35], numeric[36], numeric[18],
+                numeric[19], numeric[20], numeric[21], numeric[22], numeric[23], numeric[24],
+                numeric[25], numeric[26], numeric[27], numeric[45], numeric[37], numeric[38],
+                numeric[39], numeric[40], numeric[41], numeric[42], numeric[43], numeric[44]);
+        }
+        if (gather_post_diagnostic) {
+            const auto flat = [&](u32 index) {
+                return index < cs.flattened_ud_buf.size() ? cs.flattened_ud_buf[index] : 0;
+            };
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams Gather post #{} sequence={} base={} groups={} flat_size={} "
+                        "CB92(flat96)={:#x} CB93(flat97)={:#x}",
+                        gather_post_diagnostic_ordinal, g_compute_dispatch_sequence,
+                        dispatch_base_x, dispatch_x, cs.flattened_ud_buf.size(), flat(96), flat(97));
+
+            for (const u32 buffer_index : {2u}) {
+                if (buffer_index >= cs.buffers.size() || cs.buffers[buffer_index].IsSpecial()) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams Gather post #{} buffer #{} unavailable buffers={} "
+                                "special={}",
+                                gather_post_diagnostic_ordinal, buffer_index, cs.buffers.size(),
+                                buffer_index < cs.buffers.size() &&
+                                    cs.buffers[buffer_index].IsSpecial());
+                    continue;
+                }
+
+                const auto& desc = cs.buffers[buffer_index];
+                const auto sharp = desc.GetSharp(cs);
+                constexpr u64 GatherDiagnosticReadLimit = 16_MB;
+                const u64 read_size =
+                    std::min<u64>(sharp.GetSize(), GatherDiagnosticReadLimit) & ~u64{3};
+                if (sharp.base_address == 0 || read_size < sizeof(u32) ||
+                    !memory->IsValidMapping(sharp.base_address, read_size)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams Gather post #{} buffer #{} invalid base={:#x}+{:#x} "
+                                "stride={} records={} read={:#x}",
+                                gather_post_diagnostic_ordinal, buffer_index, sharp.base_address,
+                                sharp.GetSize(), sharp.stride, sharp.num_records, read_size);
+                    continue;
+                }
+                if (!gather_post_buffer_ready[buffer_index]) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams Gather post #{} buffer #{} was not synchronized in the "
+                                "safe submission window",
+                                gather_post_diagnostic_ordinal, buffer_index);
+                    continue;
+                }
+                const auto* bytes = std::bit_cast<const u8*>(sharp.base_address);
+                const u64 stride = sharp.stride != 0 ? sharp.stride : sizeof(u32);
+                const u64 available_records = 1 + (read_size - sizeof(u32)) / stride;
+                const u64 record_count =
+                    sharp.num_records != 0
+                        ? std::min<u64>(sharp.num_records, available_records)
+                        : available_records;
+
+                u64 zero{};
+                u64 all_ones{};
+                u64 key_sentinel{};
+                u64 first_nonzero = std::numeric_limits<u64>::max();
+                u64 first_all_ones = std::numeric_limits<u64>::max();
+                u32 first_nonzero_value{};
+                u32 minimum = std::numeric_limits<u32>::max();
+                u32 maximum{};
+                u64 hash = 1469598103934665603ULL;
+                std::array<u32, 8> head{};
+                for (u64 record = 0; record < record_count; ++record) {
+                    u32 value{};
+                    std::memcpy(&value, bytes + record * stride, sizeof(value));
+                    if (record < head.size()) {
+                        head[record] = value;
+                    }
+                    zero += value == 0;
+                    all_ones += value == std::numeric_limits<u32>::max();
+                    key_sentinel += value == 0x0fffffffu;
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                    hash ^= value;
+                    hash *= 1099511628211ULL;
+                    if (value != 0 && first_nonzero == std::numeric_limits<u64>::max()) {
+                        first_nonzero = record;
+                        first_nonzero_value = value;
+                    }
+                    if (value == std::numeric_limits<u32>::max() &&
+                        first_all_ones == std::numeric_limits<u64>::max()) {
+                        first_all_ones = record;
+                    }
+                }
+                if (record_count == 0) {
+                    minimum = 0;
+                }
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams Gather post #{} buffer #{} base={:#x}+{:#x} stride={} "
+                    "records={} scanned={} bytes={:#x} truncated={} write={} gpu_modified={} "
+                    "zero={} ffffffff={} 0fffffff={} nonzero={} min={:#x} max={:#x} "
+                    "first_nonzero={} value={:#x} first_ffffffff={} hash={:#x} "
+                    "head={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}",
+                    gather_post_diagnostic_ordinal, buffer_index, sharp.base_address,
+                    sharp.GetSize(), sharp.stride, sharp.num_records, record_count, read_size,
+                    read_size < sharp.GetSize(), desc.is_written,
+                    gather_post_buffer_gpu_modified[buffer_index], zero, all_ones, key_sentinel,
+                    record_count - zero, minimum, maximum, first_nonzero, first_nonzero_value,
+                    first_all_ones, hash, head[0], head[1], head[2], head[3], head[4], head[5],
+                    head[6], head[7]);
+            }
+        }
+        if (ProfileDreamsGpuAfterGather()) {
+            ArmDreamsGpuProfile();
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams one-shot GPU profile auto-armed after GatherVoxelsChunk "
+                        "sequence={}",
+                        g_compute_dispatch_sequence);
+        }
     }
     if (gpu_profile_ordinal != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams GPU profile #{} kind=dispatch hash={:#x} post-fence begin",
+                    gpu_profile_ordinal, cs.pgm_hash);
         scheduler.Finish();
         const auto elapsed = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - gpu_profile_start)
@@ -2991,6 +5595,286 @@ void Rasterizer::DispatchDirect() {
         const auto result = cs.buffers[0].GetSharp(cs);
         if (result.base_address != 0 && result.GetSize() != 0) {
             buffer_cache.ReadMemory(result.base_address, result.GetSize());
+        }
+    }
+    if (dreams_model_config_gds_trace.enabled) {
+        scheduler.Finish();
+        std::array<u32, 25> after{};
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        std::memcpy(after.data(), gds->mapped_data.data() + 704 * sizeof(u32), sizeof(after));
+        u32 changed{};
+        for (u32 index = 0; index < after.size(); ++index) {
+            changed += after[index] != dreams_model_config_gds_trace.before[index];
+        }
+        const u32 source_base =
+            cs.flattened_ud_buf.size() > 21 ? cs.flattened_ud_buf[21] : 0;
+        u32 inner_counter_after{};
+        std::memcpy(&inner_counter_after, gds->mapped_data.data() + 64 * sizeof(u32),
+                    sizeof(u32));
+        u32 inner_required_after{};
+        std::memcpy(&inner_required_after, gds->mapped_data.data() + 65 * sizeof(u32),
+                    sizeof(u32));
+        if (cs.pgm_hash == 0xac97d610) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams collect-bricks GDS sequence={} dims={}x{}x{} "
+                        "dword64={}->{} dword65={}->{}",
+                        g_compute_dispatch_sequence, cs_program.dim_x, cs_program.dim_y,
+                        cs_program.dim_z, dreams_model_config_gds_trace.inner_counter_before,
+                        inner_counter_after, dreams_model_config_gds_trace.inner_required_before,
+                        inner_required_after);
+        }
+        if (inner_counter_after != dreams_model_config_gds_trace.inner_counter_before) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams inner-model GDS64 shader={:#x} ordinal={} sequence={} "
+                        "dims={}x{}x{} value={:#x}->{:#x} source_base={:#x}",
+                        cs.pgm_hash, dreams_model_config_gds_trace.ordinal,
+                        g_compute_dispatch_sequence, cs_program.dim_x, cs_program.dim_y,
+                        cs_program.dim_z, dreams_model_config_gds_trace.inner_counter_before,
+                        inner_counter_after, source_base);
+        }
+        std::array<u32, 7> prefix_a_after{};
+        std::array<u32, 18> prefix_b_after{};
+        std::memcpy(prefix_a_after.data(), gds->mapped_data.data() + 196 * sizeof(u32),
+                    sizeof(prefix_a_after));
+        std::memcpy(prefix_b_after.data(), gds->mapped_data.data() + 389 * sizeof(u32),
+                    sizeof(prefix_b_after));
+        const bool prefix_shader =
+            cs.pgm_hash == 0xe275eba8 || cs.pgm_hash == 0xd2d439f3 ||
+            cs.pgm_hash == 0xe165304b || cs.pgm_hash == 0x9f3303a7 ||
+            cs.pgm_hash == 0xe9d99694;
+        if (prefix_shader) {
+            static u32 prefix_shader_direct_count{};
+            if (prefix_shader_direct_count++ < 128) {
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams model prefix direct shader={:#x} sequence={} dims={}x{}x{} "
+                    "GDS64={}->{} A196-202={},{},{},{},{},{},{} -> "
+                    "{},{},{},{},{},{},{} B389,391,406={},{},{} -> {},{},{}",
+                    cs.pgm_hash, g_compute_dispatch_sequence, cs_program.dim_x, cs_program.dim_y,
+                    cs_program.dim_z, dreams_model_config_gds_trace.inner_counter_before,
+                    inner_counter_after, dreams_model_config_gds_trace.prefix_a_before[0],
+                    dreams_model_config_gds_trace.prefix_a_before[1],
+                    dreams_model_config_gds_trace.prefix_a_before[2],
+                    dreams_model_config_gds_trace.prefix_a_before[3],
+                    dreams_model_config_gds_trace.prefix_a_before[4],
+                    dreams_model_config_gds_trace.prefix_a_before[5],
+                    dreams_model_config_gds_trace.prefix_a_before[6], prefix_a_after[0],
+                    prefix_a_after[1], prefix_a_after[2], prefix_a_after[3], prefix_a_after[4],
+                    prefix_a_after[5], prefix_a_after[6],
+                    dreams_model_config_gds_trace.prefix_b_before[0],
+                    dreams_model_config_gds_trace.prefix_b_before[2],
+                    dreams_model_config_gds_trace.prefix_b_before[17], prefix_b_after[0],
+                    prefix_b_after[2], prefix_b_after[17]);
+            }
+        }
+        if (cs.pgm_hash == 0xcca80e03 && source_base != 0) {
+            static std::array<u32, 16> seen_transfer_sources{};
+            static u32 seen_transfer_source_count{};
+            const bool seen = std::find(seen_transfer_sources.begin(),
+                                        seen_transfer_sources.begin() + seen_transfer_source_count,
+                                        source_base) !=
+                              seen_transfer_sources.begin() + seen_transfer_source_count;
+            if (!seen && seen_transfer_source_count < seen_transfer_sources.size()) {
+                seen_transfer_sources[seen_transfer_source_count++] = source_base;
+                VAddr output_base{};
+                u64 output_size{};
+                if (!cs.buffers.empty() && !cs.buffers[0].IsSpecial()) {
+                    const auto result = cs.buffers[0].GetSharp(cs);
+                    output_base = result.base_address;
+                    output_size = result.GetSize();
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams model transfer source discovered source_base={:#x} "
+                            "sequence={} output={:#x}+{:#x}",
+                            source_base, g_compute_dispatch_sequence, output_base, output_size);
+                for (u32 back = 0; back < g_recent_compute_dispatches.size(); ++back) {
+                    const u32 slot = (g_recent_compute_dispatch_index - 1 - back) &
+                                     (g_recent_compute_dispatches.size() - 1);
+                    const auto& recent = g_recent_compute_dispatches[slot];
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams model transfer history source={:#x} back={} hash={:#x} "
+                                "dims={}x{}x{}",
+                                source_base, back, recent.hash, recent.dim_x, recent.dim_y,
+                                recent.dim_z);
+                }
+            }
+        }
+        const bool config_transfer = cs.pgm_hash == 0xcca80e03 && source_base == 0xb00;
+        if (changed != 0 || config_transfer) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams model-config GDS shader={:#x} ordinal={} sequence={} "
+                        "dims={}x{}x{} changed={} source_base={:#x}",
+                        cs.pgm_hash, dreams_model_config_gds_trace.ordinal,
+                        g_compute_dispatch_sequence, cs_program.dim_x, cs_program.dim_y,
+                        cs_program.dim_z, changed, source_base);
+            if (config_transfer) {
+                static u32 model_config_history_count{};
+                if (model_config_history_count++ < 3) {
+                    for (u32 back = 0; back < g_recent_compute_dispatches.size(); ++back) {
+                        const u32 slot =
+                            (g_recent_compute_dispatch_index - 1 - back) &
+                            (g_recent_compute_dispatches.size() - 1);
+                        const auto& recent = g_recent_compute_dispatches[slot];
+                        LOG_WARNING(Render_Vulkan,
+                                    "Dreams model-config history back={} sequence={} hash={:#x} "
+                                    "dims={}x{}x{}",
+                                    back, g_compute_dispatch_sequence - back, recent.hash,
+                                    recent.dim_x, recent.dim_y, recent.dim_z);
+                    }
+                }
+            }
+            for (u32 index = 0; index < after.size(); ++index) {
+                if (!config_transfer &&
+                    dreams_model_config_gds_trace.before[index] == after[index]) {
+                    continue;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams model-config GDS index={} value={:#x}->{:#x}", 704 + index,
+                            dreams_model_config_gds_trace.before[index], after[index]);
+            }
+        }
+    }
+    if (dreams_model_producer_trace.enabled) {
+        scheduler.Finish();
+        std::array<u32, Shader::DreamsCompat::ModelProducerTraceCount> counters{};
+        std::array<u32, Shader::DreamsCompat::ModelProducerNumericCount> numeric{};
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        const u64 counter_offset =
+            static_cast<u64>(Shader::DreamsCompat::ModelProducerTraceBaseDword) * sizeof(u32);
+        const u64 numeric_offset =
+            static_cast<u64>(Shader::DreamsCompat::ModelProducerNumericBaseDword) * sizeof(u32);
+        std::memcpy(counters.data(), gds->mapped_data.data() + counter_offset, sizeof(counters));
+        std::memcpy(numeric.data(), gds->mapped_data.data() + numeric_offset, sizeof(numeric));
+        if (dreams_model_producer_trace.compact) {
+            const u32 capacity_fail = counters[5] >= counters[6] ? counters[5] - counters[6] : 0;
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams model producer compact cycle={} ordinal={} sequence={} "
+                "output={:#x}+{:#x} eligible={} class0={} class1={} class2={} class3={} "
+                "final_class1={} stores={} capacity_fail={} index_min={} index_max={}",
+                dreams_model_producer_trace.cycle, dreams_model_producer_trace.ordinal,
+                g_compute_dispatch_sequence, dreams_model_producer_trace.output_base,
+                dreams_model_producer_trace.output_size, counters[0], counters[1], counters[2],
+                counters[3], counters[4], counters[5], counters[6], capacity_fail, counters[9],
+                counters[10]);
+            const u32 sample_count = std::min(counters[6], 16u);
+            for (u32 sample = 0; sample < sample_count; ++sample) {
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams model producer compact store cycle={} sample={} "
+                            "index={} handle={:#x}",
+                            dreams_model_producer_trace.cycle, sample, numeric[sample * 2],
+                            numeric[sample * 2 + 1]);
+            }
+            for (u32 wave = 0; wave < 8; ++wave) {
+                const u32 base = 32 + wave * 8;
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams model producer compact wave cycle={} wave={} s33={} "
+                            "flat21={} flat42={} flat43={} binary={} class={} index={} capacity={}",
+                            dreams_model_producer_trace.cycle, wave, numeric[base],
+                            numeric[base + 1], numeric[base + 2], numeric[base + 3],
+                            numeric[base + 4], numeric[base + 5], numeric[base + 6],
+                            numeric[base + 7]);
+            }
+        } else {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams model producer post cycle={} ordinal={} sequence={} "
+                "output={:#x}+{:#x} active={} zero_range={} nonzero_range={} underflow={} "
+                "range_sum={} invalidates={} base_min={} base_max={} end_min={} end_max={}",
+                dreams_model_producer_trace.cycle, dreams_model_producer_trace.ordinal,
+                g_compute_dispatch_sequence, dreams_model_producer_trace.output_base,
+                dreams_model_producer_trace.output_size, counters[16], counters[17], counters[18],
+                counters[19], counters[20], counters[21], counters[22], counters[23], counters[24],
+                counters[25]);
+            const u32 sample_count = std::min(counters[16], 16u);
+            for (u32 sample = 0; sample < sample_count; ++sample) {
+                const u32 base = 96 + sample * 4;
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams model producer post range cycle={} entry={} base={} end={} "
+                            "length={} capacity={}",
+                            dreams_model_producer_trace.cycle, sample, numeric[base],
+                            numeric[base + 1], numeric[base + 2], numeric[base + 3]);
+            }
+        }
+    }
+    if (dreams_model_gds_trace.enabled) {
+        scheduler.Finish();
+        std::array<u32, 17> after{};
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        std::memcpy(after.data(), gds->mapped_data.data() + 768 * sizeof(u32), sizeof(after));
+        u32 changed{};
+        for (u32 index = 0; index < after.size(); ++index) {
+            changed += after[index] != dreams_model_gds_trace.before[index];
+        }
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams model GDS post shader={:#x} ordinal={} sequence={} changed={} "
+            "GDS768-784={},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            cs.pgm_hash, dreams_model_gds_trace.ordinal, g_compute_dispatch_sequence, changed,
+            after[0], after[1], after[2], after[3], after[4], after[5], after[6], after[7],
+            after[8], after[9], after[10], after[11], after[12], after[13], after[14], after[15],
+            after[16]);
+        if (cs.pgm_hash == 0xcca80e03 && !cs.buffers.empty() &&
+            !cs.buffers[0].IsSpecial()) {
+            const auto result = cs.buffers[0].GetSharp(cs);
+            std::array<u32, 17> output{};
+            const u64 read_size = std::min<u64>(result.GetSize(), sizeof(output)) & ~u64{3};
+            if (result.base_address != 0 && read_size != 0 &&
+                memory->IsValidMapping(result.base_address, read_size)) {
+                buffer_cache.ReadMemory(result.base_address, read_size);
+                std::memcpy(output.data(), std::bit_cast<const void*>(result.base_address),
+                            read_size);
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams model transfer result ordinal={} base={:#x}+{:#x} "
+                        "count={} min={},{},{} max={},{},{} progress={} flat21={:#x}",
+                        dreams_model_gds_trace.ordinal, result.base_address, result.GetSize(),
+                        output[10], output[11], output[12], output[13], output[14], output[15],
+                        output[16], output[7],
+                        cs.flattened_ud_buf.size() > 21 ? cs.flattened_ud_buf[21] : 0);
+        }
+    }
+    if (model_finalize_gate_trace) {
+        std::array<u32, Shader::DreamsCompat::ModelFinalizeGateTraceCount> counters{};
+        std::array<u32, Shader::DreamsCompat::ModelFinalizeGateNumericCount> numeric{};
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        if (model_finalize_gate_trace_offset + sizeof(counters) <= gds->mapped_data.size()) {
+            std::memcpy(counters.data(),
+                        gds->mapped_data.data() + model_finalize_gate_trace_offset,
+                        sizeof(counters));
+        }
+        if (model_finalize_gate_numeric_offset + sizeof(numeric) <= gds->mapped_data.size()) {
+            std::memcpy(numeric.data(),
+                        gds->mapped_data.data() + model_finalize_gate_numeric_offset,
+                        sizeof(numeric));
+        }
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams d049 gate ordinal={} sequence={} producer_cycle={} "
+            "compact_sequence={} post_sequence={} reach={} zero_flags={} "
+            "ticket_mismatch={} float_le={} iteration_zero={} or_gate={} final_and={} "
+            "float_fail={} ticket_equal={} flags_nonzero={} or_fail={} final_fail={} "
+            "value_nan={} threshold_nan={} threshold_negative={} value_negative={}",
+            dreams_model_gds_trace.ordinal, g_compute_dispatch_sequence,
+            dreams_model_producer_cycle, dreams_model_compact_sequence,
+            dreams_model_post_sequence, counters[0], counters[1], counters[2], counters[3],
+            counters[4], counters[5], counters[6],
+            counters[7], counters[8], counters[9], counters[10], counters[11], counters[12],
+            counters[13], counters[14], counters[15]);
+        for (u32 workgroup = 0;
+             workgroup < Shader::DreamsCompat::ModelFinalizeGateNumericWorkgroups;
+             ++workgroup) {
+            const u32 base = workgroup * Shader::DreamsCompat::ModelFinalizeGateNumericStride;
+            if (numeric[base + 7] == 0) {
+                continue;
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams d049 gate sample ordinal={} workgroup={} "
+                        "v7={:#x} v16={:#x} state={:#x} ticket={:#x} "
+                        "value={:#x} threshold={:#x} iteration={:#x}",
+                        dreams_model_gds_trace.ordinal, workgroup, numeric[base],
+                        numeric[base + 1], numeric[base + 2], numeric[base + 3],
+                        numeric[base + 4], numeric[base + 5], numeric[base + 6]);
         }
     }
     if (TraceDreamsReplayResult() && cs.pgm_hash == 0xcca80e03 &&
@@ -3682,6 +6566,216 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
             }
         }
     }
+
+    struct DreamsVisibilityListDispatchTrace {
+        bool enabled{};
+        bool indexed_input{};
+        u32 ordinal{};
+        u32 count_index{};
+        u32 counter_a_index{};
+        u32 counter_b_index{};
+        u32 active_records{};
+        u32 sampled_records{};
+        VAddr output_base{};
+        u64 output_size{};
+        u32 output_stride{};
+        std::array<u32, 3> dims{};
+        std::array<u32, 3> gds_before{};
+        std::vector<u32> input_words;
+        std::vector<u32> output_before;
+    } visibility_list_trace{};
+    constexpr u64 DreamsVisibilityListShader = 0x7aa925e9;
+    constexpr u64 DreamsVisibilityListShaderAlt = 0x016b9f6a;
+    const bool is_dreams_visibility_list =
+        cs.pgm_hash == DreamsVisibilityListShader ||
+        cs.pgm_hash == DreamsVisibilityListShaderAlt;
+    if (is_dreams_visibility_list && ConsumeDreamsVisibilityListTraceRequest()) {
+        visibility_list_trace.enabled = true;
+        visibility_list_trace.indexed_input = cs.pgm_hash == DreamsVisibilityListShader;
+        visibility_list_trace.ordinal = ++g_dreams_visibility_list_trace_ordinal;
+        visibility_list_trace.count_index = visibility_list_trace.indexed_input ? 324 : 325;
+        visibility_list_trace.counter_a_index = visibility_list_trace.indexed_input ? 351 : 353;
+        visibility_list_trace.counter_b_index = visibility_list_trace.indexed_input ? 352 : 354;
+
+        scheduler.Finish();
+        buffer_cache.ReadMemory(args_address, sizeof(visibility_list_trace.dims));
+        if (memory->IsValidMapping(args_address, sizeof(visibility_list_trace.dims))) {
+            std::memcpy(visibility_list_trace.dims.data(),
+                        std::bit_cast<const void*>(args_address),
+                        sizeof(visibility_list_trace.dims));
+        }
+
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        const auto read_gds = [&](u32 index) {
+            u32 value{};
+            const u64 offset = static_cast<u64>(index) * sizeof(u32);
+            if (offset + sizeof(value) <= gds->mapped_data.size()) {
+                std::memcpy(&value, gds->mapped_data.data() + offset, sizeof(value));
+            }
+            return value;
+        };
+        visibility_list_trace.gds_before = {
+            read_gds(visibility_list_trace.count_index),
+            read_gds(visibility_list_trace.counter_a_index),
+            read_gds(visibility_list_trace.counter_b_index),
+        };
+        visibility_list_trace.active_records =
+            std::min(visibility_list_trace.gds_before[0], 1U << 20);
+        constexpr u32 MaxSampleRecords = 1024;
+        visibility_list_trace.sampled_records =
+            std::min(visibility_list_trace.active_records, MaxSampleRecords);
+
+        const auto read_buffer_words = [&](const auto& sharp, u64 wanted_words,
+                                           std::vector<u32>& words) {
+            const u64 word_count = std::min<u64>(wanted_words, sharp.GetSize() / sizeof(u32));
+            const u64 read_size = word_count * sizeof(u32);
+            if (sharp.base_address == 0 || read_size == 0 ||
+                !memory->IsValidMapping(sharp.base_address, read_size)) {
+                return;
+            }
+            buffer_cache.ReadMemory(sharp.base_address, read_size);
+            words.resize(word_count);
+            std::memcpy(words.data(), std::bit_cast<const void*>(sharp.base_address), read_size);
+        };
+
+        const auto log_recent_writers = [&](std::string_view role, VAddr base, u64 size) {
+            if (!visibility_list_trace.indexed_input || visibility_list_trace.ordinal > 8) {
+                return;
+            }
+            constexpr u32 MaxWriters = 8;
+            u32 logged{};
+            bool truncated{};
+            for (auto writer = g_dreams_buffer_writers.rbegin();
+                 writer != g_dreams_buffer_writers.rend(); ++writer) {
+                if (!writer->declared_write ||
+                    !OverlapsDreamsRange(base, size, writer->base, writer->size)) {
+                    continue;
+                }
+                if (logged == MaxWriters) {
+                    truncated = true;
+                    break;
+                }
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams visibility list writer #{} role={} match={} seq={} dispatch={} "
+                    "kind={} shader={:#x} stage={} binding={} range={:#x}+{:#x} stride={} "
+                    "source={:#x}",
+                    visibility_list_trace.ordinal, role, logged, writer->sequence,
+                    writer->dispatch_sequence, static_cast<u32>(writer->kind), writer->shader_hash,
+                    static_cast<u32>(writer->stage), writer->binding_index, writer->base,
+                    writer->size, writer->stride, writer->source);
+                ++logged;
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams visibility list writer summary #{} role={} target={:#x}+{:#x} "
+                        "logged={} truncated={} history={}",
+                        visibility_list_trace.ordinal, role, base, size, logged, truncated,
+                        g_dreams_buffer_writers.size());
+        };
+
+        if (!cs.buffers.empty() && !cs.buffers[0].IsSpecial()) {
+            const auto output = cs.buffers[0].GetSharp(cs);
+            visibility_list_trace.output_base = output.base_address;
+            visibility_list_trace.output_size = output.GetSize();
+            visibility_list_trace.output_stride = output.stride;
+            read_buffer_words(output, static_cast<u64>(visibility_list_trace.sampled_records) * 2,
+                              visibility_list_trace.output_before);
+        }
+        if (cs.buffers.size() > 1 && !cs.buffers[1].IsSpecial()) {
+            const auto input = cs.buffers[1].GetSharp(cs);
+            const u64 input_words =
+                static_cast<u64>(visibility_list_trace.sampled_records) *
+                (visibility_list_trace.indexed_input ? 1 : 2);
+            read_buffer_words(input, input_words, visibility_list_trace.input_words);
+            const u64 active_input_size =
+                std::min<u64>(input.GetSize(),
+                              static_cast<u64>(visibility_list_trace.active_records) *
+                                  (visibility_list_trace.indexed_input ? sizeof(u32)
+                                                                       : 2 * sizeof(u32)));
+            log_recent_writers("candidate", input.base_address, active_input_size);
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams visibility list input #{} binding=1 base={:#x}+{:#x} stride={} "
+                "records={} sampled={} hash={:#x}",
+                visibility_list_trace.ordinal, input.base_address, input.GetSize(), input.stride,
+                input.num_records, visibility_list_trace.sampled_records,
+                HashDreamsTraceWords(visibility_list_trace.input_words));
+        }
+
+        u32 invalid_source_refs{};
+        std::vector<u32> source_sample_words;
+        if (visibility_list_trace.indexed_input && cs.buffers.size() > 2 &&
+            !cs.buffers[2].IsSpecial()) {
+            const auto source = cs.buffers[2].GetSharp(cs);
+            log_recent_writers("source", source.base_address, source.GetSize());
+            const u64 source_records = source.GetSize() / (2 * sizeof(u32));
+            for (u32 record = 0; record < visibility_list_trace.input_words.size(); ++record) {
+                const u32 selector = visibility_list_trace.input_words[record];
+                invalid_source_refs += (selector >> 10) >= source_records;
+            }
+            const u32 records_to_log =
+                std::min<u32>(visibility_list_trace.input_words.size(), 8);
+            for (u32 record = 0; record < records_to_log; ++record) {
+                const u32 selector = visibility_list_trace.input_words[record];
+                const u32 source_index = selector >> 10;
+                std::array<u32, 2> values{};
+                bool valid = source_index < source_records;
+                const VAddr source_address =
+                    source.base_address + static_cast<u64>(source_index) * 2 * sizeof(u32);
+                valid = valid && memory->IsValidMapping(source_address, sizeof(values));
+                if (valid) {
+                    buffer_cache.ReadMemory(source_address, sizeof(values));
+                    std::memcpy(values.data(), std::bit_cast<const void*>(source_address),
+                                sizeof(values));
+                    source_sample_words.insert(source_sample_words.end(), values.begin(),
+                                               values.end());
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams visibility list candidate #{}[{}] selector={:#x} "
+                            "source_index={} valid={} values={:#x},{:#x} flags={}",
+                            visibility_list_trace.ordinal, record, selector, source_index, valid,
+                            values[0], values[1], (values[1] >> 16) & 3);
+            }
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams visibility list source #{} binding=2 base={:#x}+{:#x} stride={} "
+                "records={} checked={} invalid={} sampled_hash={:#x}",
+                visibility_list_trace.ordinal, source.base_address, source.GetSize(),
+                source.stride, source.num_records, visibility_list_trace.input_words.size(),
+                invalid_source_refs, HashDreamsTraceWords(source_sample_words));
+        } else {
+            const u32 records_to_log = std::min<u32>(
+                static_cast<u32>(visibility_list_trace.input_words.size() / 2), 8);
+            for (u32 record = 0; record < records_to_log; ++record) {
+                const u32 value0 = visibility_list_trace.input_words[record * 2];
+                const u32 value1 = visibility_list_trace.input_words[record * 2 + 1];
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams visibility list candidate #{}[{}] values={:#x},{:#x} "
+                            "flags={}",
+                            visibility_list_trace.ordinal, record, value0, value1,
+                            (value1 >> 16) & 3);
+            }
+        }
+
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams visibility list pre #{} sequence={} shader={:#x} args={:#x} "
+            "dims={}x{}x{} active={} sampled={} truncated={} gds_count[{}]={} "
+            "gds_a[{}]={} gds_b[{}]={} output={:#x}+{:#x} stride={} "
+            "output_pre_hash={:#x} remaining={}",
+            visibility_list_trace.ordinal, g_compute_dispatch_sequence, cs.pgm_hash,
+            args_address, visibility_list_trace.dims[0], visibility_list_trace.dims[1],
+            visibility_list_trace.dims[2], visibility_list_trace.active_records,
+            visibility_list_trace.sampled_records,
+            visibility_list_trace.active_records > visibility_list_trace.sampled_records,
+            visibility_list_trace.count_index, visibility_list_trace.gds_before[0],
+            visibility_list_trace.counter_a_index, visibility_list_trace.gds_before[1],
+            visibility_list_trace.counter_b_index, visibility_list_trace.gds_before[2],
+            visibility_list_trace.output_base, visibility_list_trace.output_size,
+            visibility_list_trace.output_stride,
+            HashDreamsTraceWords(visibility_list_trace.output_before),
+            g_dreams_visibility_list_trace_remaining);
+    }
     struct DreamsSceneStreamIndirectTrace {
         bool enabled{};
         u32 ordinal{};
@@ -3936,6 +7030,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
                     state[9], state[10]);
     }
     const bool ordered_dreams_traversal = cs.pgm_hash == DreamsTraversalShader;
+    const bool ordered_dreams_visibility_list = OrderDreamsVisibilityList(cs.pgm_hash);
     const bool trace_dreams_progress =
         ordered_dreams_traversal && TraceDreamsTraversalProgress();
     std::array<u32, 3> ordered_dims{};
@@ -3975,11 +7070,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     // Exact indirect ordering requires a GPU readback and thousands of tiny submissions. Keep it
     // available for diagnosis without imposing that cost on normal gameplay.
     const bool inspect_ordered_dims =
-        ordered_dreams_traversal && OrderDreamsIndirectTraversal();
+        (ordered_dreams_traversal && OrderDreamsIndirectTraversal()) ||
+        ordered_dreams_visibility_list;
     if (inspect_ordered_dims) {
         scheduler.Finish();
     }
-    if (ordered_dreams_traversal && inspect_ordered_dims) {
+    if (inspect_ordered_dims) {
         buffer_cache.ReadMemory(args_address, sizeof(ordered_dims));
         if (memory->IsValidMapping(args_address, sizeof(ordered_dims))) {
             std::memcpy(ordered_dims.data(), std::bit_cast<const void*>(args_address),
@@ -3988,6 +7084,17 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         }
         if (trace_dreams_progress) {
             progress_pre_gds = read_dreams_gds();
+        }
+    }
+    if (ordered_dreams_visibility_list) {
+        static u32 activation_log_count{};
+        if (activation_log_count < 32) {
+            ++activation_log_count;
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams ordered visibility-list activation #{} hash={:#x} args={:#x} "
+                        "mapped={} dims={}x{}x{} batch=1",
+                        activation_log_count, cs.pgm_hash, args_address, have_ordered_dims,
+                        ordered_dims[0], ordered_dims[1], ordered_dims[2]);
         }
     }
     if (profile_dreams) {
@@ -4195,6 +7302,103 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         }
     }
 
+    struct DreamsModelConfigIndirectGdsTrace {
+        bool enabled{};
+        u32 ordinal{};
+        u32 inner_counter_before{};
+        std::array<u32, 7> prefix_a_before{};
+        std::array<u32, 18> prefix_b_before{};
+        std::array<u32, 3> dims{};
+        std::array<u32, 25> before{};
+    } dreams_model_config_gds_trace{};
+    if (TraceDreamsModelRecord() &&
+        std::ranges::any_of(cs.buffers, [](const auto& desc) {
+            return desc.buffer_type == Shader::BufferType::GdsBuffer;
+        })) {
+        static u32 model_config_indirect_gds_ordinal{};
+        if (model_config_indirect_gds_ordinal < 8192) {
+            scheduler.Finish();
+            const auto* gds = buffer_cache.GetGdsBuffer();
+            constexpr u64 ModelConfigGdsOffset = 704 * sizeof(u32);
+            if (gds->mapped_data.size() >=
+                ModelConfigGdsOffset + sizeof(dreams_model_config_gds_trace.before)) {
+                dreams_model_config_gds_trace.enabled = true;
+                dreams_model_config_gds_trace.ordinal = ++model_config_indirect_gds_ordinal;
+                std::memcpy(&dreams_model_config_gds_trace.inner_counter_before,
+                            gds->mapped_data.data() + 64 * sizeof(u32), sizeof(u32));
+                std::memcpy(dreams_model_config_gds_trace.prefix_a_before.data(),
+                            gds->mapped_data.data() + 196 * sizeof(u32),
+                            sizeof(dreams_model_config_gds_trace.prefix_a_before));
+                std::memcpy(dreams_model_config_gds_trace.prefix_b_before.data(),
+                            gds->mapped_data.data() + 389 * sizeof(u32),
+                            sizeof(dreams_model_config_gds_trace.prefix_b_before));
+                std::memcpy(dreams_model_config_gds_trace.before.data(),
+                            gds->mapped_data.data() + ModelConfigGdsOffset,
+                            sizeof(dreams_model_config_gds_trace.before));
+            }
+        }
+    }
+
+    const bool dreams_model_prefix_indirect =
+        cs.pgm_hash == 0xe165304b || cs.pgm_hash == 0x9f3303a7 ||
+        cs.pgm_hash == 0xe9d99694 || cs.pgm_hash == 0xd2d439f3;
+    if (dreams_model_config_gds_trace.enabled && dreams_model_prefix_indirect) {
+        buffer_cache.ReadMemory(args_address, sizeof(dreams_model_config_gds_trace.dims));
+        if (memory->IsValidMapping(args_address, sizeof(dreams_model_config_gds_trace.dims))) {
+            std::memcpy(dreams_model_config_gds_trace.dims.data(),
+                        std::bit_cast<const void*>(args_address),
+                        sizeof(dreams_model_config_gds_trace.dims));
+        }
+
+        static std::vector<std::pair<u64, VAddr>> logged_model_args_writers;
+        const std::pair writer_key{cs.pgm_hash, args_address};
+        if (std::ranges::find(logged_model_args_writers, writer_key) ==
+            logged_model_args_writers.end()) {
+            logged_model_args_writers.push_back(writer_key);
+            const u64 args_end = args_address + sizeof(dreams_model_config_gds_trace.dims);
+            u32 matches{};
+            for (auto writer = g_dreams_buffer_writers.rbegin();
+                 writer != g_dreams_buffer_writers.rend() && matches < 32; ++writer) {
+                const u64 writer_end = writer->base + writer->size;
+                if (!writer->declared_write || writer->dispatch_sequence >= g_compute_dispatch_sequence ||
+                    writer->base >= args_end || args_address >= writer_end) {
+                    continue;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams model args writer consumer={:#x} args={:#x} match={} "
+                            "writer_seq={} dispatch={} kind={} shader={:#x} binding={} "
+                            "range={:#x}+{:#x} stride={} source={:#x}",
+                            cs.pgm_hash, args_address, matches++, writer->sequence,
+                            writer->dispatch_sequence, static_cast<u32>(writer->kind),
+                            writer->shader_hash, writer->binding_index, writer->base, writer->size,
+                            writer->stride, writer->source);
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams model args writer summary consumer={:#x} args={:#x} "
+                        "matches={} history={}",
+                        cs.pgm_hash, args_address, matches, g_dreams_buffer_writers.size());
+        }
+    }
+
+    const bool stabilize_compute_indirect_buffers = StabilizeDreamsComputeIndirectBuffers();
+    if (stabilize_compute_indirect_buffers) {
+        // The indirect-argument lookup can grow a cached buffer and retire shader-buffer handles
+        // selected by BindResources. Preflight that range, refresh shader descriptors and their
+        // barriers against the settled union, then obtain the final indirect handle below.
+        if (size != 0) {
+            buffer_cache.FindBuffer(args_address, size);
+        }
+        const u32 changed_handles =
+            RefreshBufferResources(pipeline, true, "compute indirect");
+        static u32 dreams_compute_indirect_stabilize_log_count{};
+        if ((changed_handles != 0 || dreams_compute_indirect_stabilize_log_count == 0) &&
+            dreams_compute_indirect_stabilize_log_count++ < 64) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams compute indirect stabilization hash={:#x} changed_handles={}",
+                        cs.pgm_hash, changed_handles);
+        }
+    }
+
     const auto [buffer, base] = buffer_cache.ObtainBuffer(args_address, size, false);
     if (profile_dreams) {
         buffer_cache.ReadMemory(args_address, sizeof(std::array<u32, 3>));
@@ -4213,14 +7417,186 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    if (stabilize_compute_indirect_buffers) {
+        ApplyDreamsComputeIndirectBufferBarrier(scheduler);
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     const auto profile_start = std::chrono::steady_clock::now();
     if (have_ordered_dims) {
-        DispatchDreamsTraversalOrdered(cmdbuf, ordered_dims[0], ordered_dims[1], ordered_dims[2]);
+        DispatchDreamsTraversalOrdered(cmdbuf, ordered_dims[0], ordered_dims[1], ordered_dims[2],
+                                       ordered_dreams_visibility_list ? 1U : 0U);
     } else {
         cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    }
+    if (visibility_list_trace.enabled) {
+        scheduler.Finish();
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        const auto read_gds = [&](u32 index) {
+            u32 value{};
+            const u64 byte_offset = static_cast<u64>(index) * sizeof(u32);
+            if (byte_offset + sizeof(value) <= gds->mapped_data.size()) {
+                std::memcpy(&value, gds->mapped_data.data() + byte_offset, sizeof(value));
+            }
+            return value;
+        };
+        const std::array<u32, 3> gds_after{
+            read_gds(visibility_list_trace.count_index),
+            read_gds(visibility_list_trace.counter_a_index),
+            read_gds(visibility_list_trace.counter_b_index),
+        };
+
+        std::vector<u32> output_after;
+        const u64 wanted_words = static_cast<u64>(visibility_list_trace.sampled_records) * 2;
+        const u64 available_words = visibility_list_trace.output_size / sizeof(u32);
+        const u64 word_count = std::min(wanted_words, available_words);
+        const u64 read_size = word_count * sizeof(u32);
+        if (visibility_list_trace.output_base != 0 && read_size != 0 &&
+            memory->IsValidMapping(visibility_list_trace.output_base, read_size)) {
+            buffer_cache.ReadMemory(visibility_list_trace.output_base, read_size);
+            output_after.resize(word_count);
+            std::memcpy(output_after.data(),
+                        std::bit_cast<const void*>(visibility_list_trace.output_base), read_size);
+        }
+
+        const u32 comparable_records = std::min<u32>(
+            visibility_list_trace.output_before.size() / 2, output_after.size() / 2);
+        u32 changed_records{};
+        u32 first_changed = std::numeric_limits<u32>::max();
+        std::array<u32, 4> flag_counts{};
+        u32 max_low24_id{};
+        for (u32 record = 0; record < output_after.size() / 2; ++record) {
+            const u32 value0 = output_after[record * 2];
+            const u32 value1 = output_after[record * 2 + 1];
+            ++flag_counts[(value1 >> 16) & 3];
+            max_low24_id = std::max(max_low24_id, value0 & 0x00ffffff);
+            if (record >= comparable_records ||
+                visibility_list_trace.output_before[record * 2] != value0 ||
+                visibility_list_trace.output_before[record * 2 + 1] != value1) {
+                ++changed_records;
+                first_changed = std::min(first_changed, record);
+            }
+        }
+        const u32 delta_a =
+            gds_after[1] >= visibility_list_trace.gds_before[1]
+                ? gds_after[1] - visibility_list_trace.gds_before[1]
+                : 0;
+        const u32 delta_b =
+            gds_after[2] >= visibility_list_trace.gds_before[2]
+                ? gds_after[2] - visibility_list_trace.gds_before[2]
+                : 0;
+        const u64 output_hash = HashDreamsTraceWords(output_after);
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams visibility list post #{} sequence={} shader={:#x} active={} sampled={} "
+            "gds_count[{}]={}->{} gds_a[{}]={}->{} delta={} reset={} "
+            "gds_b[{}]={}->{} delta={} reset={} changed={} first_changed={} "
+            "hash={:#x} flags0-3={},{},{},{} max_low24_id={}",
+            visibility_list_trace.ordinal, g_compute_dispatch_sequence, cs.pgm_hash,
+            visibility_list_trace.active_records, visibility_list_trace.sampled_records,
+            visibility_list_trace.count_index, visibility_list_trace.gds_before[0], gds_after[0],
+            visibility_list_trace.counter_a_index, visibility_list_trace.gds_before[1],
+            gds_after[1], delta_a, gds_after[1] < visibility_list_trace.gds_before[1],
+            visibility_list_trace.counter_b_index, visibility_list_trace.gds_before[2],
+            gds_after[2], delta_b, gds_after[2] < visibility_list_trace.gds_before[2],
+            changed_records, first_changed, output_hash, flag_counts[0], flag_counts[1],
+            flag_counts[2], flag_counts[3], max_low24_id);
+        const u32 records_to_log = std::min<u32>(output_after.size() / 2, 8);
+        for (u32 record = 0; record < records_to_log; ++record) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams visibility list output #{}[{}] values={:#x},{:#x} "
+                        "low24_id={} flags={}",
+                        visibility_list_trace.ordinal, record, output_after[record * 2],
+                        output_after[record * 2 + 1], output_after[record * 2] & 0x00ffffff,
+                        (output_after[record * 2 + 1] >> 16) & 3);
+        }
+
+        if (g_dreams_visibility_list_consumer_snapshot.valid) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams visibility list consumer snapshot overwritten old=#{} sequence={} "
+                "shader={:#x} output={:#x}",
+                g_dreams_visibility_list_consumer_snapshot.ordinal,
+                g_dreams_visibility_list_consumer_snapshot.dispatch_sequence,
+                g_dreams_visibility_list_consumer_snapshot.shader_hash,
+                g_dreams_visibility_list_consumer_snapshot.output_base);
+        }
+        g_dreams_visibility_list_consumer_snapshot = {
+            .valid = true,
+            .ordinal = visibility_list_trace.ordinal,
+            .shader_hash = cs.pgm_hash,
+            .dispatch_sequence = g_compute_dispatch_sequence,
+            .output_base = visibility_list_trace.output_base,
+            .active_records = visibility_list_trace.active_records,
+            .sampled_records = static_cast<u32>(output_after.size() / 2),
+            .output_hash = output_hash,
+            .words = std::move(output_after),
+        };
+    }
+    if (dreams_model_config_gds_trace.enabled) {
+        scheduler.Finish();
+        std::array<u32, 25> after{};
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        std::memcpy(after.data(), gds->mapped_data.data() + 704 * sizeof(u32), sizeof(after));
+        u32 changed{};
+        for (u32 index = 0; index < after.size(); ++index) {
+            changed += after[index] != dreams_model_config_gds_trace.before[index];
+        }
+        if (changed != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dreams model-config indirect GDS shader={:#x} ordinal={} sequence={} "
+                        "args={:#x} changed={}",
+                        cs.pgm_hash, dreams_model_config_gds_trace.ordinal,
+                        g_compute_dispatch_sequence, args_address, changed);
+            for (u32 index = 0; index < after.size(); ++index) {
+                if (dreams_model_config_gds_trace.before[index] == after[index]) {
+                    continue;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams model-config indirect GDS index={} value={:#x}->{:#x}",
+                            704 + index, dreams_model_config_gds_trace.before[index], after[index]);
+            }
+        }
+        if (dreams_model_prefix_indirect) {
+            static u32 prefix_shader_indirect_count{};
+            if (prefix_shader_indirect_count++ < 256) {
+                u32 inner_counter_after{};
+                std::array<u32, 7> prefix_a_after{};
+                std::array<u32, 18> prefix_b_after{};
+                std::memcpy(&inner_counter_after,
+                            gds->mapped_data.data() + 64 * sizeof(u32), sizeof(u32));
+                std::memcpy(prefix_a_after.data(),
+                            gds->mapped_data.data() + 196 * sizeof(u32),
+                            sizeof(prefix_a_after));
+                std::memcpy(prefix_b_after.data(),
+                            gds->mapped_data.data() + 389 * sizeof(u32),
+                            sizeof(prefix_b_after));
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams model prefix indirect shader={:#x} sequence={} args={:#x} "
+                    "dims={}x{}x{} GDS64={}->{} A196-202={},{},{},{},{},{},{} -> "
+                    "{},{},{},{},{},{},{} B389,391,406={},{},{} -> {},{},{}",
+                    cs.pgm_hash, g_compute_dispatch_sequence, args_address,
+                    dreams_model_config_gds_trace.dims[0],
+                    dreams_model_config_gds_trace.dims[1],
+                    dreams_model_config_gds_trace.dims[2],
+                    dreams_model_config_gds_trace.inner_counter_before, inner_counter_after,
+                    dreams_model_config_gds_trace.prefix_a_before[0],
+                    dreams_model_config_gds_trace.prefix_a_before[1],
+                    dreams_model_config_gds_trace.prefix_a_before[2],
+                    dreams_model_config_gds_trace.prefix_a_before[3],
+                    dreams_model_config_gds_trace.prefix_a_before[4],
+                    dreams_model_config_gds_trace.prefix_a_before[5],
+                    dreams_model_config_gds_trace.prefix_a_before[6], prefix_a_after[0],
+                    prefix_a_after[1], prefix_a_after[2], prefix_a_after[3], prefix_a_after[4],
+                    prefix_a_after[5], prefix_a_after[6],
+                    dreams_model_config_gds_trace.prefix_b_before[0],
+                    dreams_model_config_gds_trace.prefix_b_before[2],
+                    dreams_model_config_gds_trace.prefix_b_before[17], prefix_b_after[0],
+                    prefix_b_after[2], prefix_b_after[17]);
+            }
+        }
     }
     if (gpu_profile_ordinal != 0) {
         scheduler.Finish();
@@ -4564,7 +7940,158 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         fault_process_pending = true;
     }
 
+    RefreshBufferResources(pipeline);
     return true;
+}
+
+u32 Rasterizer::RefreshBufferResources(const Pipeline* pipeline, bool trace_handle_changes,
+                                       std::string_view trace_role) {
+    // Finding or refreshing another resource can grow a cached buffer and retire every
+    // buffer it overlaps. Resolve the complete shader-buffer union again, then update the existing
+    // descriptor infos in place. Descriptor write order and binding numbers remain unchanged.
+    struct BufferRefreshBinding {
+        const Shader::Info* stage;
+        u32 descriptor_index;
+        u32 buffer_info_index;
+        u32 push_offset_index;
+        VideoCore::BufferId buffer_id;
+        AmdGpu::Buffer sharp;
+        u64 size;
+    };
+    boost::container::static_vector<BufferRefreshBinding, Shader::NUM_BUFFERS> refresh_bindings;
+    boost::container::static_vector<vk::Buffer, Shader::NUM_BUFFERS> retired_buffer_handles;
+    const size_t old_barrier_count = buffer_barriers.size();
+    u32 changed_handle_count{};
+    u32 logged_handle_count{};
+    u32 buffer_info_index{};
+    u32 push_offset_index{};
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (u32 descriptor_index = 0; descriptor_index < stage->buffers.size();
+             ++descriptor_index, ++buffer_info_index, ++push_offset_index) {
+            const auto& desc = stage->buffers[descriptor_index];
+            const auto sharp = desc.GetSharp(*stage);
+            if (desc.IsSpecial() || sharp.base_address == 0 || sharp.GetSize() == 0) {
+                continue;
+            }
+            u64 size = memory->ClampRangeSize(sharp.base_address, sharp.GetSize());
+            if (sharp.stride == 0 &&
+                sharp.num_records == std::numeric_limits<u32>::max() &&
+                size > MaxUnboundedGuestBufferWindow) {
+                size = MaxUnboundedGuestBufferWindow;
+            }
+            refresh_bindings.push_back({
+                .stage = stage,
+                .descriptor_index = descriptor_index,
+                .buffer_info_index = buffer_info_index,
+                .push_offset_index = push_offset_index,
+                .buffer_id = {},
+                .sharp = sharp,
+                .size = size,
+            });
+        }
+    }
+
+    // Pre-find every range before obtaining any of them. A later FindBuffer may join and retire
+    // an earlier result; ObtainBuffer detects that, matching BindBuffers' existing two-pass rule.
+    for (auto& refresh : refresh_bindings) {
+        refresh.buffer_id = buffer_cache.FindBuffer(refresh.sharp.base_address, refresh.size);
+    }
+    for (const auto& refresh : refresh_bindings) {
+        const auto& desc = refresh.stage->buffers[refresh.descriptor_index];
+        const bool is_storage = desc.IsStorage(refresh.sharp);
+        const u32 alignment =
+            is_storage ? instance.StorageMinAlignment() : instance.UniformMinAlignment();
+        const auto old_info = buffer_infos[refresh.buffer_info_index];
+        const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
+            refresh.sharp.base_address, refresh.size, desc.is_written, desc.is_formatted,
+            refresh.buffer_id);
+        const u32 offset_aligned = Common::AlignDown(offset, alignment);
+        const u32 adjust = offset - offset_aligned;
+        ASSERT(adjust % 4 == 0);
+        push_data.AddOffset(refresh.push_offset_index, adjust);
+        auto& buffer_info = buffer_infos[refresh.buffer_info_index];
+        buffer_info = vk::DescriptorBufferInfo{
+            vk_buffer->Handle(), offset_aligned, refresh.size + adjust};
+        const bool descriptor_changed = old_info.buffer != buffer_info.buffer ||
+                                        old_info.offset != buffer_info.offset ||
+                                        old_info.range != buffer_info.range;
+        const bool handle_changed = old_info.buffer != buffer_info.buffer;
+        changed_handle_count += handle_changed;
+        static u32 dreams_graphics_changed_handle_log_count{};
+        static u32 dreams_compute_indirect_changed_handle_log_count{};
+        u32& dreams_changed_handle_log_count =
+            trace_role == "compute indirect" ? dreams_compute_indirect_changed_handle_log_count
+                                             : dreams_graphics_changed_handle_log_count;
+        if (trace_handle_changes && handle_changed && logged_handle_count < 4 &&
+            dreams_changed_handle_log_count++ < 64) {
+            ++logged_handle_count;
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams {} stabilization shader={:#x} descriptor={} old_vk={:#x} "
+                "new_vk={:#x} guest={:#x}+{:#x}",
+                trace_role, refresh.stage->pgm_hash, refresh.descriptor_index,
+                reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(old_info.buffer)),
+                reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(buffer_info.buffer)),
+                refresh.sharp.base_address, refresh.size);
+        }
+        if (old_info.buffer && old_info.buffer != buffer_info.buffer &&
+            std::ranges::find(retired_buffer_handles, old_info.buffer) ==
+                retired_buffer_handles.end()) {
+            retired_buffer_handles.push_back(old_info.buffer);
+        }
+
+        const vk::AccessFlags2 access_mask =
+            desc.is_written
+                ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
+                : vk::AccessFlagBits2::eShaderRead;
+        const bool force_dependency = desc.is_written && ForceDreamsStorageDependencies();
+        if (auto barrier = vk_buffer->GetBarrier(
+                access_mask, vk::PipelineStageFlagBits2::eAllCommands, 0, force_dependency)) {
+            buffer_barriers.emplace_back(*barrier);
+        }
+
+        const char* gather_binding_value =
+            std::getenv("SHADPS4_DREAMS_GATHER_BINDING_TRACE");
+        static u32 gather_final_binding_trace_count{};
+        if (refresh.stage->pgm_hash == Shader::DreamsCompat::GatherVoxelsShader &&
+            (refresh.descriptor_index == 2 || refresh.descriptor_index == 14) &&
+            gather_binding_value != nullptr &&
+            std::string_view{gather_binding_value} == "1" &&
+            gather_final_binding_trace_count++ < 16) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams Gather final binding trace={} desc_index={} input_id={} "
+                "guest={:#x}+{:#x} cache_guest={:#x}+{:#x} old_vk={:#x} "
+                "old_offset={:#x} old_range={:#x} final_vk={:#x} final_offset={:#x} "
+                "final_range={:#x} adjust={:#x} push_offset={} changed={}",
+                gather_final_binding_trace_count, refresh.descriptor_index,
+                refresh.buffer_id.index, refresh.sharp.base_address, refresh.size,
+                vk_buffer->CpuAddr(), vk_buffer->SizeBytes(),
+                reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(old_info.buffer)),
+                static_cast<u64>(old_info.offset), static_cast<u64>(old_info.range),
+                reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(buffer_info.buffer)),
+                static_cast<u64>(buffer_info.offset), static_cast<u64>(buffer_info.range), adjust,
+                push_data.buf_offsets[refresh.push_offset_index], descriptor_changed);
+        }
+    }
+
+    // A cache join can retire a buffer after its initial barrier was collected. Remove barriers
+    // for replaced handles from the original prefix; the final barriers appended above must stay.
+    for (size_t barrier_index = old_barrier_count; barrier_index != 0; --barrier_index) {
+        const auto buffer = buffer_barriers[barrier_index - 1].buffer;
+        const bool was_replaced =
+            std::ranges::find(retired_buffer_handles, buffer) != retired_buffer_handles.end();
+        const bool is_still_bound = std::ranges::any_of(
+            buffer_infos, [buffer](const auto& info) { return info.buffer == buffer; });
+        if (was_replaced && !is_still_bound) {
+            buffer_barriers.erase(buffer_barriers.begin() + (barrier_index - 1));
+        }
+    }
+
+    return changed_handle_count;
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -5040,6 +8567,43 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             ASSERT(adjust % 4 == 0);
             push_data.AddOffset(binding.buffer, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
+            const char* gather_binding_value =
+                std::getenv("SHADPS4_DREAMS_GATHER_BINDING_TRACE");
+            static u32 gather_binding_trace_count{};
+            if (stage.pgm_hash == Shader::DreamsCompat::GatherVoxelsShader &&
+                (i == 2 || i == 14) &&
+                gather_binding_value != nullptr &&
+                std::string_view{gather_binding_value} == "1" &&
+                gather_binding_trace_count++ < 16) {
+                u32 guest_head{};
+                const bool guest_head_mapped =
+                    memory->IsValidMapping(vsharp.base_address, sizeof(guest_head));
+                if (guest_head_mapped) {
+                    std::memcpy(&guest_head, std::bit_cast<const void*>(vsharp.base_address),
+                                sizeof(guest_head));
+                }
+                const auto& buffer_info = buffer_infos.back();
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams Gather binding trace={} desc_index={} sharp_index={} "
+                    "buffer_binding={} unified_binding={} input_id={} guest={:#x}+{:#x} "
+                    "stride={} records={} write={} formatted={} cpu_modified={} "
+                    "gpu_modified={} guest_head_mapped={} guest_head={:#x} "
+                    "cache_guest={:#x}+{:#x} vk={:#x} obtain_offset={:#x} alignment={} "
+                    "aligned={:#x} adjust={:#x} descriptor_vk={:#x} "
+                    "descriptor_offset={:#x} descriptor_range={:#x} push_offset={}",
+                    gather_binding_trace_count, i, desc.sharp_idx, binding.buffer,
+                    binding.unified, buffer_id.index, vsharp.base_address, size, vsharp.stride,
+                    vsharp.num_records, desc.is_written, desc.is_formatted,
+                    buffer_cache.IsRegionCpuModified(vsharp.base_address, size),
+                    buffer_cache.IsRegionGpuModified(vsharp.base_address, size),
+                    guest_head_mapped, guest_head, vk_buffer->CpuAddr(), vk_buffer->SizeBytes(),
+                    reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(vk_buffer->Handle())),
+                    offset, alignment, offset_aligned, adjust,
+                    reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(buffer_info.buffer)),
+                    static_cast<u64>(buffer_info.offset), static_cast<u64>(buffer_info.range),
+                    push_data.buf_offsets[binding.buffer]);
+            }
             const vk::AccessFlags2 access_mask =
                 desc.is_written
                     ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
@@ -5167,6 +8731,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
+    const u64 dreams_image_writer_sequence_before = g_dreams_image_writer_sequence;
     // For loading/storing to explicit mip levels, when no native instruction support, bind an array
     // of descriptors consecutively, 1 for each mip level. The shader can index this with LOD
     // operand.
@@ -5464,6 +9029,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                         : vk::ImageLayout::eGeneral;
                 image.Transit(descriptor_layout,
                               vk::AccessFlagBits2::eShaderRead |
+                                  (image.binding.has_storage
+                                       ? vk::AccessFlags2{vk::AccessFlagBits2::eShaderWrite}
+                                       : vk::AccessFlags2{}) |
                                   (image.info.props.is_depth
                                        ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
                                        : vk::AccessFlagBits2::eColorAttachmentWrite |
@@ -5488,6 +9056,233 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.texture |= !is_storage;
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view, descriptor_layout);
+        }
+    }
+
+    if (stage.pgm_hash == Shader::DreamsCompat::TemporalResolveShader &&
+        ConsumeDreamsTemporalImageTraceRequest()) {
+        struct TemporalImageEntry {
+            bool valid{};
+            bool written{};
+            u32 binding{};
+            u32 array_element{};
+            u32 image_id{};
+            u64 image_uid{};
+            VAddr descriptor_base{};
+            VAddr guest_base{};
+            u64 guest_size{};
+            u32 descriptor_width{};
+            u32 descriptor_height{};
+            u32 descriptor_pitch{};
+            u32 cached_width{};
+            u32 cached_height{};
+            u32 cached_pitch{};
+            u32 view_format{};
+            u32 base_level{};
+            u32 levels{};
+            u32 base_layer{};
+            u32 layers{};
+        };
+        struct TemporalDispatch {
+            u32 ordinal{};
+            u64 sequence{};
+            std::vector<TemporalImageEntry> images;
+        };
+        static std::deque<TemporalDispatch> history;
+
+        const u32 ordinal = ++g_dreams_temporal_image_trace_ordinal;
+        std::vector<TemporalImageEntry> current;
+        current.reserve(image_bindings.size());
+        u32 flattened_index{};
+        for (u32 stage_binding = 0; stage_binding < stage.images.size(); ++stage_binding) {
+            const auto& image_desc = stage.images[stage_binding];
+            const auto tsharp = image_desc.GetSharp(stage);
+            const u32 array_size = image_descriptor_array_sizes[stage_binding];
+            for (u32 array_element = 0; array_element < array_size;
+                 ++array_element, ++flattened_index) {
+                TemporalImageEntry entry{
+                    .written = image_desc.is_written,
+                    .binding = stage_binding,
+                    .array_element = array_element,
+                    .descriptor_base = tsharp.Address(),
+                    .descriptor_width = static_cast<u32>(tsharp.width) + 1,
+                    .descriptor_height = static_cast<u32>(tsharp.height) + 1,
+                    .descriptor_pitch = tsharp.Pitch(),
+                };
+                if (flattened_index < image_bindings.size()) {
+                    const auto& [image_id, desc] = image_bindings[flattened_index];
+                    entry.view_format = static_cast<u32>(desc.view_info.format);
+                    entry.base_level = desc.view_info.range.base.level;
+                    entry.levels = desc.view_info.range.extent.levels;
+                    entry.base_layer = desc.view_info.range.base.layer;
+                    entry.layers = desc.view_info.range.extent.layers;
+                    if (image_id) {
+                        const auto& image = texture_cache.GetImage(image_id);
+                        entry.valid = true;
+                        entry.image_id = image_id.index;
+                        entry.image_uid = image.image_uid;
+                        entry.guest_base = image.info.guest_address;
+                        entry.guest_size = image.info.guest_size;
+                        entry.cached_width = image.info.size.width;
+                        entry.cached_height = image.info.size.height;
+                        entry.cached_pitch = image.info.pitch;
+                    }
+                }
+                current.push_back(entry);
+            }
+        }
+
+        const auto same_descriptor = [](const TemporalImageEntry& lhs,
+                                        const TemporalImageEntry& rhs) {
+            return lhs.valid && rhs.valid && lhs.descriptor_base == rhs.descriptor_base &&
+                   lhs.descriptor_width == rhs.descriptor_width &&
+                   lhs.descriptor_height == rhs.descriptor_height &&
+                   lhs.descriptor_pitch == rhs.descriptor_pitch &&
+                   lhs.view_format == rhs.view_format && lhs.base_level == rhs.base_level &&
+                   lhs.levels == rhs.levels && lhs.base_layer == rhs.base_layer &&
+                   lhs.layers == rhs.layers;
+        };
+        const auto same_cached_view = [](const TemporalImageEntry& lhs,
+                                         const TemporalImageEntry& rhs) {
+            return lhs.valid && rhs.valid && lhs.image_uid == rhs.image_uid &&
+                   lhs.view_format == rhs.view_format && lhs.base_level == rhs.base_level &&
+                   lhs.levels == rhs.levels && lhs.base_layer == rhs.base_layer &&
+                   lhs.layers == rhs.layers;
+        };
+
+        const auto& cs_program = liverpool->GetCsRegs();
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams temporal images #{} dispatch={} dims={}x{}x{} bindings={} "
+                    "history={}",
+                    ordinal, g_compute_dispatch_sequence, cs_program.dim_x, cs_program.dim_y,
+                    cs_program.dim_z, current.size(), history.size());
+
+        for (const auto& entry : current) {
+            u32 descriptor_source_ordinal{};
+            u64 descriptor_source_sequence{};
+            u32 uid_source_ordinal{};
+            u64 uid_source_sequence{};
+            u32 overlap_source_ordinal{};
+            u64 overlap_source_sequence{};
+            if (!entry.written) {
+                for (auto dispatch = history.rbegin(); dispatch != history.rend(); ++dispatch) {
+                    for (const auto& prior : dispatch->images) {
+                        if (!prior.written) {
+                            continue;
+                        }
+                        if (descriptor_source_ordinal == 0 && same_descriptor(prior, entry)) {
+                            descriptor_source_ordinal = dispatch->ordinal;
+                            descriptor_source_sequence = dispatch->sequence;
+                        }
+                        if (uid_source_ordinal == 0 && same_cached_view(prior, entry)) {
+                            uid_source_ordinal = dispatch->ordinal;
+                            uid_source_sequence = dispatch->sequence;
+                        }
+                        if (overlap_source_ordinal == 0 &&
+                            OverlapsDreamsRange(prior.guest_base, prior.guest_size,
+                                               entry.guest_base, entry.guest_size)) {
+                            overlap_source_ordinal = dispatch->ordinal;
+                            overlap_source_sequence = dispatch->sequence;
+                        }
+                    }
+                }
+            }
+
+            const DreamsImageWriter* latest_writer{};
+            if (!entry.written) {
+                for (auto writer = g_dreams_image_writers.rbegin();
+                     writer != g_dreams_image_writers.rend(); ++writer) {
+                    if (writer->sequence > dreams_image_writer_sequence_before ||
+                        !OverlapsDreamsRange(writer->base, writer->size, entry.guest_base,
+                                            entry.guest_size)) {
+                        continue;
+                    }
+                    latest_writer = &*writer;
+                    break;
+                }
+            }
+
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams temporal binding #{} binding={} element={} write={} valid={} id={} uid={} "
+                "descriptor={:#x} {}x{} pitch={} cached={:#x}+{:#x} {}x{} pitch={} "
+                "view={} level={}+{} layer={}+{} temporal_descriptor_source={}@{} "
+                "temporal_uid_source={}@{} temporal_overlap_source={}@{} "
+                "writer={} dispatch={} shader={:#x} kind={} target={} id={}",
+                ordinal, entry.binding, entry.array_element, entry.written, entry.valid,
+                entry.image_id, entry.image_uid, entry.descriptor_base, entry.descriptor_width,
+                entry.descriptor_height, entry.descriptor_pitch, entry.guest_base,
+                entry.guest_size, entry.cached_width, entry.cached_height, entry.cached_pitch,
+                entry.view_format, entry.base_level, entry.levels, entry.base_layer, entry.layers,
+                descriptor_source_ordinal, descriptor_source_sequence, uid_source_ordinal,
+                uid_source_sequence, overlap_source_ordinal, overlap_source_sequence,
+                latest_writer != nullptr ? latest_writer->sequence : 0,
+                latest_writer != nullptr ? latest_writer->dispatch_sequence : 0,
+                latest_writer != nullptr ? latest_writer->shader_hash : 0,
+                latest_writer != nullptr ? static_cast<u32>(latest_writer->kind) : 0,
+                latest_writer != nullptr ? latest_writer->binding_index : 0,
+                latest_writer != nullptr ? latest_writer->image_id : 0);
+        }
+
+        u64 immediate_descriptor_mask{};
+        u64 immediate_uid_mask{};
+        u64 immediate_overlap_mask{};
+        u64 current_descriptor_alias_mask{};
+        u64 current_uid_alias_mask{};
+        if (!history.empty()) {
+            for (const auto& prior : history.back().images) {
+                if (!prior.written) {
+                    continue;
+                }
+                for (const auto& entry : current) {
+                    if (entry.written || entry.binding >= 64) {
+                        continue;
+                    }
+                    immediate_descriptor_mask |=
+                        static_cast<u64>(same_descriptor(prior, entry)) << entry.binding;
+                    immediate_uid_mask |=
+                        static_cast<u64>(same_cached_view(prior, entry)) << entry.binding;
+                    immediate_overlap_mask |=
+                        static_cast<u64>(OverlapsDreamsRange(
+                            prior.guest_base, prior.guest_size, entry.guest_base,
+                            entry.guest_size))
+                        << entry.binding;
+                }
+            }
+        }
+        for (const auto& output : current) {
+            if (!output.written) {
+                continue;
+            }
+            for (const auto& input : current) {
+                if (input.written || input.binding >= 64) {
+                    continue;
+                }
+                current_descriptor_alias_mask |=
+                    static_cast<u64>(same_descriptor(output, input)) << input.binding;
+                current_uid_alias_mask |=
+                    static_cast<u64>(same_cached_view(output, input)) << input.binding;
+            }
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams temporal chain #{} previous={}@{} immediate_descriptor_mask={:#x} "
+                    "immediate_uid_mask={:#x} immediate_overlap_mask={:#x} "
+                    "current_descriptor_alias_mask={:#x} current_uid_alias_mask={:#x}",
+                    ordinal, history.empty() ? 0 : history.back().ordinal,
+                    history.empty() ? 0 : history.back().sequence, immediate_descriptor_mask,
+                    immediate_uid_mask, immediate_overlap_mask, current_descriptor_alias_mask,
+                    current_uid_alias_mask);
+
+        history.push_back({
+            .ordinal = ordinal,
+            .sequence = g_compute_dispatch_sequence,
+            .images = std::move(current),
+        });
+        while (history.size() > 32) {
+            history.pop_front();
+        }
+        if (g_dreams_temporal_image_trace_remaining == 0) {
+            LOG_WARNING(Render_Vulkan, "Dreams temporal image trace complete");
         }
     }
 
@@ -5811,6 +9606,13 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    if (is_gds && TraceDreamsModelRecord() &&
+        OverlapsDreamsModelConfigGds(address, num_bytes)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams model-config GDS fill sequence={} offset={:#x} bytes={:#x} "
+                    "value={:#x}",
+                    g_compute_dispatch_sequence, address, num_bytes, value);
+    }
     if (is_gds && TraceDreamsDiagnostics()) {
         static u32 dreams_gds_fill_count{};
         if (dreams_gds_fill_count < 256) {
@@ -5838,6 +9640,14 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (TraceDreamsModelRecord() &&
+        ((dst_gds && OverlapsDreamsModelConfigGds(dst, num_bytes)) ||
+         (src_gds && OverlapsDreamsModelConfigGds(src, num_bytes)))) {
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams model-config GDS copy sequence={} dst={:#x} src={:#x} bytes={:#x} "
+                    "dst_gds={} src_gds={}",
+                    g_compute_dispatch_sequence, dst, src, num_bytes, dst_gds, src_gds);
+    }
     const bool trace_gds_copy = dst_gds || src_gds;
     u32 dreams_scene_source_slot = std::numeric_limits<u32>::max();
     if (g_dreams_scene_graphics_probe_budget != 0 && !dst_gds && !src_gds) {

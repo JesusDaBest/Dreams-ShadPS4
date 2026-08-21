@@ -452,13 +452,6 @@ void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
 }
 
 void EmitStoreBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
-    if (ctx.info.pgm_hash == 0xb535c6c8 && inst->Arg(1).IsImmediate()) {
-        const u32 index = inst->Arg(1).U32();
-        if ((handle == 1 && (index == 0 || index == 8)) || (handle == 0 && index == 1)) {
-            // A GPU-wide completion step emits these values after all unordered Vulkan waves end.
-            return;
-        }
-    }
     EmitStoreBufferB32xN<1, PointerType::U32>(ctx, inst, handle, address, value);
 }
 
@@ -475,11 +468,6 @@ void EmitStoreBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 }
 
 void EmitStoreBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
-    if (ctx.info.pgm_hash == 0xb535c6c8 && handle == 11 && inst->Arg(1).IsImmediate() &&
-        inst->Arg(1).U32() == 160) {
-        // The same completion step updates GDS queue base/count once every invocation is done.
-        return;
-    }
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);

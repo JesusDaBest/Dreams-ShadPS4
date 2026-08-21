@@ -196,6 +196,7 @@ Id EmitCompositeShuffleF32x4(EmitContext& ctx, Id composite1, Id composite2, u32
 Id EmitSelectU1(EmitContext& ctx, Id cond, Id true_value, Id false_value);
 Id EmitSelectU32(EmitContext& ctx, Id cond, Id true_value, Id false_value);
 Id EmitSelectF32(EmitContext& ctx, Id cond, Id true_value, Id false_value);
+Id EmitSelectF64(EmitContext& ctx, Id cond, Id true_value, Id false_value);
 Id EmitBitCastU16F16(EmitContext& ctx, Id value);
 Id EmitBitCastU32F32(EmitContext& ctx, Id value);
 Id EmitBitCastF16U16(EmitContext& ctx, Id value);
@@ -466,6 +467,7 @@ Id EmitCubeFaceIndex(EmitContext& ctx, IR::Inst* inst, Id cube_coords);
 Id EmitLaneId(EmitContext& ctx);
 Id EmitWarpId(EmitContext& ctx);
 Id EmitQuadShuffle(EmitContext& ctx, Id value, Id index);
+Id EmitShuffleXor(EmitContext& ctx, Id value, Id mask);
 Id EmitReadFirstLane(EmitContext& ctx, Id value);
 Id EmitReadLane(EmitContext& ctx, Id value, Id lane);
 Id EmitWriteLane(EmitContext& ctx, Id value, Id write_value, u32 lane);

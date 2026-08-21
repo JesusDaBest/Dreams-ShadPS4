@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <cstdlib>
 #include <span>
 
 #include "shader_recompiler/frontend/control_flow_graph.h"
@@ -764,88 +765,40 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
 
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
 
-    // For data append/consume/order-count operations attempt to deduce the GDS address.
-    if (inst.GetOpcode() == IR::Opcode::DataAppend || inst.GetOpcode() == IR::Opcode::DataConsume ||
-        inst.GetOpcode() == IR::Opcode::DataOrderedCount) {
-        const auto pred = [](const IR::Inst* inst) -> std::optional<const IR::Inst*> {
-            if (inst->GetOpcode() == IR::Opcode::GetUserData) {
-                return inst;
-            }
-            return std::nullopt;
-        };
-
-        u32 gds_addr = 0;
-        u32 gds_index = 0;
-        const bool is_ordered_count = inst.GetOpcode() == IR::Opcode::DataOrderedCount;
-        const IR::Value& gds_offset = inst.Arg(0);
-        if (is_ordered_count) {
-            const u32 control = inst.Arg(2).U32();
-            const u32 offset_bytes = (control >> 8) & 0xff;
-            IR::U32 m0 = IR::U32{gds_offset};
-
-            // M0[31:16] is the dword base, aligned to four counters. OFFSET0[5:2]
-            // selects one of the sixteen ordered-count registers from that base.
-            const IR::U32 base = ir.BitwiseAnd(
-                ir.ShiftRightLogical(m0, ir.Imm32(16)), ir.Imm32(0xfffc));
-            const IR::U32 index = ir.IAdd(base, ir.Imm32(offset_bytes >> 2));
-            inst.SetArg(0, index);
-            inst.SetArg(2, ir.Imm32(control | (binding << 16)));
-            return;
-        }
-        if (gds_offset.IsImmediate()) {
-            // Nothing to do, offset is known.
-            if (is_ordered_count) {
-                const u32 offset_bytes = (inst.Arg(2).U32() >> 8) & 0xff;
-                gds_index = ((gds_offset.U32() >> 16) & 0xfffc) + (offset_bytes >> 2);
-            } else {
-                gds_addr = gds_offset.U32() & 0xFFFF;
-            }
-        } else {
-            const auto result = IR::BreadthFirstSearch(&inst, pred);
-            const IR::Inst* prod = gds_offset.InstRecursive();
-            if (!result) {
-                ASSERT_MSG(is_ordered_count, "Unable to track M0 source");
-                if (prod->GetOpcode() == IR::Opcode::IAdd32) {
-                    gds_index = (prod->Arg(1).U32() >> 2) & 0xFFFF;
-                }
-            } else {
-                // M0 must be set by some user data register.
-                const u32 ud_reg = u32(result.value()->Arg(0).ScalarReg());
-                u32 m0_val = info.user_data[ud_reg] >> 16;
-                if (is_ordered_count) {
-                    // Ordered count uses M0[31:16] as a dword base and offset0[5:2] as an index.
-                    const u32 offset_bytes = (inst.Arg(2).U32() >> 8) & 0xff;
-                    gds_index = (m0_val & 0xfffc) + (offset_bytes >> 2);
-                } else {
-                    if (prod->GetOpcode() == IR::Opcode::IAdd32) {
-                        m0_val += prod->Arg(1).U32();
-                    }
-                    gds_addr = m0_val & 0xFFFF;
-                }
-            }
-        }
-
-        // Patch instruction to GDS buffer atomics.
+    // Append/consume use M0[31:16] as a byte address. Keep the address dynamic because the same
+    // shader can be dispatched with different counter bases.
+    if (inst.GetOpcode() == IR::Opcode::DataAppend || inst.GetOpcode() == IR::Opcode::DataConsume) {
         const IR::U32 handle = ir.Imm32(binding);
-        const IR::U32 index = ir.Imm32(is_ordered_count ? gds_index : (gds_addr >> 2));
-        const IR::Value prev = [&] -> IR::Value {
-            if (is_ordered_count) {
-                const u32 op = inst.Arg(2).U32() & 0x3;
-                switch (op) {
-                case 1:
-                    return ir.BufferAtomicSwap(handle, index, inst.Arg(1), {});
-                case 3:
-                    return ir.BufferAtomicInc(handle, index, {});
-                case 0:
-                default:
-                    return ir.BufferAtomicIAdd(handle, index, inst.Arg(1), {});
-                }
-            }
-            const bool is_append = inst.GetOpcode() == IR::Opcode::DataAppend;
-            return is_append ? ir.BufferAtomicInc(handle, index, {})
-                             : ir.BufferAtomicDec(handle, index, {});
-        }();
+        const IR::U32 index =
+            ir.ShiftRightLogical(IR::U32{inst.Arg(0)}, ir.Imm32(2));
+        const bool is_append = inst.GetOpcode() == IR::Opcode::DataAppend;
+        IR::BufferInstInfo buffer_info{};
+        buffer_info.is_gds_append.Assign(is_append);
+        const IR::Value prev = is_append ? ir.BufferAtomicInc(handle, index, buffer_info)
+                                         : ir.BufferAtomicDec(handle, index, buffer_info);
         inst.ReplaceUsesWithAndRemove(prev);
+    } else if (inst.GetOpcode() == IR::Opcode::DataOrderedCount) {
+        const u32 control = inst.Arg(2).U32();
+        const u32 offset_bytes = (control >> 8) & 0xff;
+        const IR::U32 m0{inst.Arg(0)};
+
+        // For DS_ORDERED_COUNT, M0[31:16] is already the ordered-counter base in
+        // dwords (unlike normal GDS addressing, where it is a byte address). The
+        // low two bits are ignored by the guest hardware. OFFSET0 remains a byte
+        // encoded counter selector, so only that field is divided by four.
+        const IR::U32 base_dwords = ir.BitwiseAnd(
+            ir.ShiftRightLogical(m0, ir.Imm32(16)), ir.Imm32(0xfffc));
+        const bool reproduce_corrupted_base =
+            std::getenv("SHADPS4_DREAMS_REPRO_CORRUPTED_ORDERED_BASE") != nullptr;
+        // This opt-in path intentionally reproduces the earlier broken lowering that treated the
+        // already-dword M0 base as a byte address. It is kept only as an A/B comparison for the
+        // dark, fragmented, flickering sculpt cubes; never enable it for the corrected path.
+        const IR::U32 index = reproduce_corrupted_base
+                                  ? ir.ShiftRightLogical(
+                                        ir.IAdd(base_dwords, ir.Imm32(offset_bytes)), ir.Imm32(2))
+                                  : ir.IAdd(base_dwords, ir.Imm32(offset_bytes >> 2));
+        inst.SetArg(0, index);
+        inst.SetArg(2, ir.Imm32(control | (binding << 16)));
     } else {
         // Convert shared memory opcode to storage buffer atomic to GDS buffer.
         auto& buffer = info.buffers[binding];

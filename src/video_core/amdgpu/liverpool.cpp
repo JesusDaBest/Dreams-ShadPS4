@@ -31,6 +31,12 @@ static bool DreamsDiagnosticsEnabled() {
     return enabled;
 }
 
+static bool DreamsSyncComputeReleaseMem() {
+    static const bool enabled =
+        std::getenv("SHADPS4_DREAMS_SYNC_COMPUTE_RELEASE_MEM") != nullptr;
+    return enabled;
+}
+
 static void TraceDreamsGdsDma(const PM4DmaData& packet, const char* queue_name) {
     static std::atomic<u32> trace_count{};
     if (!DreamsDiagnosticsEnabled() ||
@@ -1193,6 +1199,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             TraceDreamsGdsRelease(*release_mem, "compute");
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
+                // RELEASE_MEM is ordered after all earlier work on the guest compute queue. The
+                // ordinary emulation path writes its CPU-visible fence immediately after recording
+                // that work, which can let Dreams validate a still-stale GDS/readback result. Keep
+                // this expensive synchronization opt-in while the generic deferred-fence path is
+                // developed.
+                if (DreamsSyncComputeReleaseMem() &&
+                    release_mem->data_sel != DataSelect::GdsMemStore) {
+                    rasterizer->Finish();
+                }
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
@@ -1200,6 +1215,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 },
                 [this](VAddr dst, u16 gds_index, u16 num_dwords) {
                     rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+                    if (DreamsSyncComputeReleaseMem()) {
+                        rasterizer->Finish();
+                    }
                 });
             break;
         }

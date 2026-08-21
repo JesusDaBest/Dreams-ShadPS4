@@ -100,24 +100,13 @@ Id BufferAtomicIAddSubgroupLeader(EmitContext& ctx, IR::Inst* inst, u32 handle, 
     const Id lane_id = ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id);
     const Id is_leader = ctx.OpIEqual(ctx.U1[1], lane_id, first_active);
 
-    const Id leader_label = ctx.OpLabel();
-    const Id follower_label = ctx.OpLabel();
-    const Id merge_label = ctx.OpLabel();
-    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-    ctx.OpBranchConditional(is_leader, leader_label, follower_label);
-
-    ctx.AddLabel(leader_label);
+    // Keep every active invocation on the same control-flow path through the atomic and
+    // broadcast. Core Vulkan does not guarantee subgroup reconvergence at a selection merge
+    // reached from divergent control flow, which is where GDS append is commonly emitted.
+    const Id delta = ctx.OpSelect(ctx.U32[1], is_leader, value, ctx.u32_zero_value);
     const Id previous =
-        BufferAtomicU32(ctx, inst, handle, address, value, &Sirit::Module::OpAtomicIAdd);
-    ctx.OpBranch(merge_label);
-
-    ctx.AddLabel(follower_label);
-    ctx.OpBranch(merge_label);
-
-    ctx.AddLabel(merge_label);
-    const Id leader_result =
-        ctx.OpPhi(ctx.U32[1], previous, leader_label, ctx.u32_zero_value, follower_label);
-    return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], subgroup_scope, leader_result);
+        BufferAtomicU32(ctx, inst, handle, address, delta, &Sirit::Module::OpAtomicIAdd);
+    return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], subgroup_scope, previous);
 }
 
 Id BufferAtomicIncSubgroupCompact(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -411,7 +400,9 @@ Id EmitBufferAtomicFMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addre
 
 Id EmitBufferAtomicInc32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const bool is_dreams_sprite_cull = DreamsCompat::IsSpriteCullShader(ctx.info.pgm_hash);
-    if (is_dreams_sprite_cull && ctx.buffers[handle].buffer_type == BufferType::GdsBuffer) {
+    const bool is_gds_append = inst->Flags<IR::BufferInstInfo>().is_gds_append;
+    if ((is_gds_append || is_dreams_sprite_cull) &&
+        ctx.buffers[handle].buffer_type == BufferType::GdsBuffer) {
         // These shaders add a lane prefix to the returned counter base. Reserve the active
         // subgroup once; incrementing from every host lane double-counts and leaves holes.
         return BufferAtomicIncSubgroupCompact(ctx, inst, handle, address);
@@ -587,6 +578,20 @@ Id EmitDataOrderedCount(EmitContext& ctx, Id gds_index, Id value, u32 packed_con
         ctx.OpGroupNonUniformBallotFindLSB(ctx.U32[1], subgroup_scope, active_mask);
     const Id lane_id = ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id);
     const Id is_leader = ctx.OpIEqual(ctx.U1[1], lane_id, first_active);
+
+    const u32 operation = control & 0x3;
+    const bool is_add = operation == 0 || operation == 2;
+    if (DreamsCompat::NeedsBranchlessOrderedCountAdd(ctx.info.pgm_hash) && is_add) {
+        // These Dreams shaders use add-form DS_ORDERED_COUNT bases to index indirect commands or
+        // compact visibility records. Keep every active invocation on the same control-flow path
+        // through the atomic and broadcast: Vulkan does not require subgroup reconvergence at the
+        // merge of the leader-only selection below. Followers add zero, so the first active
+        // invocation (the elected leader) still returns the guest base.
+        const Id delta = ctx.OpSelect(ctx.U32[1], is_leader, value, ctx.u32_zero_value);
+        const Id previous = ctx.OpAtomicIAdd(ctx.U32[1], counter_ptr, device_scope,
+                                             acquire_release_semantics, delta);
+        return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], subgroup_scope, previous);
+    }
 
     const Id leader_label = ctx.OpLabel();
     const Id follower_label = ctx.OpLabel();

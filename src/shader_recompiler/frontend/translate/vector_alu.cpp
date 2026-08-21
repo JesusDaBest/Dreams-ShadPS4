@@ -118,6 +118,8 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_READFIRSTLANE_B32(inst);
     case Opcode::V_CVT_I32_F64:
         return V_CVT_I32_F64(inst);
+    case Opcode::V_CVT_U32_F64:
+        return V_CVT_U32_F64(inst);
     case Opcode::V_CVT_F64_I32:
         return V_CVT_F64_I32(inst);
     case Opcode::V_CVT_F64_U32:
@@ -948,6 +950,17 @@ void Translator::V_CVT_I32_F64(const GcnInst& inst) {
     SetDst(inst.dst[0], ir.ConvertFToS(32, src0));
 }
 
+void Translator::V_CVT_U32_F64(const GcnInst& inst) {
+    const IR::F64 src0{GetSrc64<IR::F64>(inst.src[0])};
+    // GCN conversion is truncating and saturating. SPIR-V OpConvertFToU is undefined for NaN
+    // and out-of-range values, which can turn shader hash/table indices into arbitrary values.
+    const IR::F64 zero{ir.Imm64(0.0)};
+    const IR::F64 max_u32{ir.Imm64(4294967295.0)};
+    const IR::F64 clamped{ir.FPClamp(src0, zero, max_u32)};
+    const IR::F64 safe{ir.Select(ir.FPIsNan(src0), zero, clamped)};
+    SetDst(inst.dst[0], ir.ConvertFToU(32, safe));
+}
+
 void Translator::V_CVT_F64_I32(const GcnInst& inst) {
     const IR::U32 src0{GetSrc(inst.src[0])};
     SetDst64(inst.dst[0], ir.ConvertSToF(64, 32, src0));
@@ -1389,15 +1402,19 @@ void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const 
             UNREACHABLE_MSG("src0 = {}", u32(inst.src[0].field));
         }
     }();
+    // This is a scalar 64-bit comparison. Reconstructing one mask bit per host lane is only an
+    // implementation detail; the comparison result must be uniform and reflect the whole mask.
+    const IR::U1 any_bit = ir.GroupAny(src0);
+    const IR::U1 all_bits = ir.LogicalNot(ir.GroupAny(ir.LogicalNot(src0)));
     const IR::U1 result = [&] {
         switch (op) {
         case ConditionOp::EQ:
-            return is_zero ? ir.LogicalNot(src0) : src0;
+            return is_zero ? ir.LogicalNot(any_bit) : all_bits;
         case ConditionOp::LG: // NE
-            return is_zero ? src0 : ir.LogicalNot(src0);
+            return is_zero ? any_bit : ir.LogicalNot(all_bits);
         case ConditionOp::GT:
             ASSERT(is_zero);
-            return ir.GroupAny(GetThreadBitScalarReg(IR::ScalarReg(inst.src[0].code)));
+            return any_bit;
         default:
             UNREACHABLE_MSG("Unsupported V_CMP_U64 condition operation: {}", u32(op));
         }
@@ -1416,7 +1433,12 @@ void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
         } else if ((class_mask & IR::FloatClassFunc::Infinity) == IR::FloatClassFunc::Infinity) {
             value = ir.FPIsInf(src0);
         } else if ((class_mask & IR::FloatClassFunc::Negative) == IR::FloatClassFunc::Negative) {
-            value = ir.FPLessThanEqual(src0, ir.Imm32(-0.f));
+            // The negative class includes -0 but excludes +0 and NaNs. A floating-point
+            // comparison cannot distinguish the two signed zero encodings, so test the sign bit.
+            const IR::U32 bits{ir.BitCast<IR::U32>(src0)};
+            const IR::U1 sign = ir.INotEqual(ir.BitwiseAnd(bits, ir.Imm32(0x80000000u)),
+                                             ir.Imm32(0));
+            value = ir.LogicalAnd(sign, ir.LogicalNot(ir.FPIsNan(src0)));
         } else {
             UNREACHABLE_MSG("Unsupported float class mask: {:#x}", static_cast<u32>(class_mask));
         }
@@ -1644,21 +1666,29 @@ void Translator::V_CVT_PK_U8_F32(const GcnInst& inst) {
     const IR::U32 src1{GetSrc(inst.src[1])};
     const IR::U32 src2{GetSrc(inst.src[2])};
 
-    const IR::U32 value_uint = ir.ConvertFToU(32, src0);
+    // GCN's float-to-u8 conversion saturates before packing. Converting to u32 and merely
+    // inserting the low byte wraps values above 255 (for example, 638 becomes 126), which is
+    // observably different from the guest instruction. SPIR-V conversion is also undefined for
+    // NaN and out-of-range inputs, so make every case explicit before converting.
+    const IR::F32 zero{ir.Imm32(0.f)};
+    const IR::F32 max_u8{ir.Imm32(255.f)};
+    const IR::F32 clamped{ir.FPClamp(src0, zero, max_u8)};
+    const IR::F32 safe{ir.Select(ir.FPIsNan(src0), zero, clamped)};
+    const IR::U32 value_uint = ir.ConvertFToU(32, safe);
     const IR::U32 offset = ir.ShiftLeftLogical(src1, ir.Imm32(3));
     SetDst(inst.dst[0], ir.BitFieldInsert(src2, value_uint, offset, ir.Imm32(8)));
 }
 
 void Translator::V_LSHL_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    const IR::U64 src1{GetSrc64(inst.src[1])};
-    SetDst64(inst.dst[0], ir.ShiftLeftLogical(src0, ir.BitwiseAnd(src1, ir.Imm64(u64(0x3F)))));
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    SetDst64(inst.dst[0], ir.ShiftLeftLogical(src0, ir.BitwiseAnd(src1, ir.Imm32(0x3F))));
 }
 
 void Translator::V_LSHR_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    const IR::U64 src1{GetSrc64(inst.src[1])};
-    SetDst64(inst.dst[0], ir.ShiftRightLogical(src0, ir.BitwiseAnd(src1, ir.Imm64(u64(0x3F)))));
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    SetDst64(inst.dst[0], ir.ShiftRightLogical(src0, ir.BitwiseAnd(src1, ir.Imm32(0x3F))));
 }
 
 void Translator::V_ALIGNBIT_B32(const GcnInst& inst) {

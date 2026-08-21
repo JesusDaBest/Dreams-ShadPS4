@@ -17,6 +17,17 @@ IR::U1 ThreadBitFromMask(IR::IREmitter& ir, const IR::U64& mask) {
     return ir.INotEqual(bit, ir.Imm64(u64(0)));
 }
 
+IR::U64 ExpandWholeQuadMask(IR::IREmitter& ir, const IR::U64& src) {
+    IR::U64 quad_bits{ir.BitwiseOr(src, ir.ShiftRightLogical(src, ir.Imm32(1)))};
+    quad_bits = ir.BitwiseOr(quad_bits, ir.ShiftRightLogical(src, ir.Imm32(2)));
+    quad_bits = ir.BitwiseOr(quad_bits, ir.ShiftRightLogical(src, ir.Imm32(3)));
+    quad_bits = ir.BitwiseAnd(quad_bits, ir.Imm64(u64(0x1111111111111111)));
+
+    IR::U64 result{ir.BitwiseOr(quad_bits, ir.ShiftLeftLogical(quad_bits, ir.Imm32(1)))};
+    result = ir.BitwiseOr(result, ir.ShiftLeftLogical(quad_bits, ir.Imm32(2)));
+    return ir.BitwiseOr(result, ir.ShiftLeftLogical(quad_bits, ir.Imm32(3)));
+}
+
 } // namespace
 
 void Translator::EmitScalarAlu(const GcnInst& inst) {
@@ -113,7 +124,7 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
         case Opcode::S_NOT_B64:
             return S_NOT_B64(inst);
         case Opcode::S_WQM_B64:
-            break;
+            return S_WQM_B64(inst);
         case Opcode::S_BREV_B32:
             return S_BREV_B32(inst);
         case Opcode::S_BCNT1_I32_B32:
@@ -357,7 +368,22 @@ void Translator::S_AND_B64(NegateMode negate, const GcnInst& inst) {
     if (negate == NegateMode::Result) {
         result = ir.LogicalNot(result);
     }
-    ir.SetScc(result);
+    if (info.pgm_hash == DreamsCompat::TemporalResolveShader) {
+        const IR::U64 mask_src0{GetSrc64<IR::U64>(inst.src[0])};
+        IR::U64 mask_src1{GetSrc64<IR::U64>(inst.src[1])};
+        if (negate == NegateMode::Src1) {
+            mask_src1 = ir.ISub(ir.Imm64(~u64(0)), mask_src1);
+        }
+        IR::U64 mask_result{ir.BitwiseAnd(mask_src0, mask_src1)};
+        if (negate == NegateMode::Result) {
+            mask_result = ir.ISub(ir.Imm64(~u64(0)), mask_result);
+        }
+        // This shader gates its LDS reconstruction with SCC. Read the complete guest mask
+        // directly so the branch is wave-uniform without adding a subgroup vote.
+        ir.SetScc(ir.INotEqual(mask_result, ir.Imm64(u64(0))));
+    } else {
+        ir.SetScc(result);
+    }
     SetDst1(inst.dst[0], result);
 }
 
@@ -408,8 +434,8 @@ void Translator::S_LSHL_B32(const GcnInst& inst) {
 
 void Translator::S_LSHL_B64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    const IR::U64 src1{GetSrc64(inst.src[1])};
-    const IR::U64 result = ir.ShiftLeftLogical(src0, ir.BitwiseAnd(src1, ir.Imm64(u64(0x3F))));
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    const IR::U64 result = ir.ShiftLeftLogical(src0, ir.BitwiseAnd(src1, ir.Imm32(0x3F)));
     SetDst64(inst.dst[0], result);
     ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
 }
@@ -433,8 +459,8 @@ void Translator::S_ASHR_I32(const GcnInst& inst) {
 
 void Translator::S_ASHR_I64(const GcnInst& inst) {
     const IR::U64 src0{GetSrc64(inst.src[0])};
-    const IR::U64 src1{GetSrc64(inst.src[1])};
-    const IR::U64 result{ir.ShiftRightArithmetic(src0, ir.BitwiseAnd(src1, ir.Imm64(u64(0x3F))))};
+    const IR::U32 src1{GetSrc(inst.src[1])};
+    const IR::U64 result{ir.ShiftRightArithmetic(src0, ir.BitwiseAnd(src1, ir.Imm32(0x3F)))};
     SetDst64(inst.dst[0], result);
     ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
 }
@@ -522,20 +548,14 @@ void Translator::S_MULK_I32(const GcnInst& inst) {
 void Translator::S_MOV(const GcnInst& inst) {
     if (inst.dst[0].field == OperandField::ScalarGPR) {
         if (inst.src[0].field == OperandField::ExecLo) {
-            if (info.pgm_hash == DreamsCompat::IndirectArgsShader) {
-                const IR::Value ballot{ir.Ballot(ir.GetExec())};
-                ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code),
-                                IR::U32{ir.CompositeExtract(ballot, 0)});
-            } else {
-                ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), ir.GetExec());
-            }
+            const IR::Value ballot{ir.Ballot(ir.GetExec())};
+            ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code),
+                            IR::U32{ir.CompositeExtract(ballot, 0)});
             return;
         } else if (inst.src[0].field == OperandField::ExecHi) {
-            if (info.pgm_hash == DreamsCompat::IndirectArgsShader) {
-                const IR::Value ballot{ir.Ballot(ir.GetExec())};
-                ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code),
-                                IR::U32{ir.CompositeExtract(ballot, 1)});
-            }
+            const IR::Value ballot{ir.Ballot(ir.GetExec())};
+            ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code),
+                            IR::U32{ir.CompositeExtract(ballot, 1)});
             return;
         }
     }
@@ -560,6 +580,34 @@ void Translator::S_NOT_B64(const GcnInst& inst) {
     const IR::U1 result = ir.LogicalNot(src0);
     ir.SetScc(result);
     SetDst1(inst.dst[0], result);
+}
+
+void Translator::S_WQM_B64(const GcnInst& inst) {
+    // Whole-quad mode expands every non-zero four-bit group in the source mask to 0xf.
+    // Keep the operation in scalar-mask form so it can re-enable lanes in EXEC, including
+    // fragment helper lanes that were disabled by an earlier exact-mask operation.
+    const IR::U64 src{GetSrc64(inst.src[0])};
+    const IR::U64 result{ExpandWholeQuadMask(ir, src)};
+    const IR::U1 result_bit = ThreadBitFromMask(ir, result);
+
+    switch (inst.dst[0].field) {
+    case OperandField::ScalarGPR:
+        SetDst64(inst.dst[0], result);
+        ir.SetThreadBitScalarReg(IR::ScalarReg(inst.dst[0].code), result_bit);
+        break;
+    case OperandField::VccLo:
+        // Preserve the exact expanded mask as well as VCC's per-lane shadow. Re-balloting
+        // result_bit through SetDst1 would drop bits for invocations inactive at this point.
+        SetDst64(inst.dst[0], result);
+        ir.SetVcc(result_bit);
+        break;
+    case OperandField::ExecLo:
+        ir.SetExec(result_bit);
+        break;
+    default:
+        UNREACHABLE_MSG("Invalid S_WQM_B64 destination {}", u32(inst.dst[0].field));
+    }
+    ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
 }
 
 void Translator::S_BREV_B32(const GcnInst& inst) {

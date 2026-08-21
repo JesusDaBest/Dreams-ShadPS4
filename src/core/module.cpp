@@ -423,6 +423,89 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 
 #ifdef _WIN32
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE")) {
+                constexpr std::array<std::pair<u64, u8>, 11> DreamsModelRecordTracePoints{{
+                    {0x7200b0, 0x55},   // Reset allocated model records.
+                    {0x720950, 0x55},   // Begin constructing one model record.
+                    {0x721111, 0x0f},   // Branch on the inner model builder's return status.
+                    {0x723870, 0x49},   // Return from model-record construction.
+                    {0x12676e0, 0x55},  // Publish the finished 0x120-byte record.
+                    {0x1281f5e, 0x48},  // Inspect one completed CSG replay result.
+                    {0x1282390, 0x0f},  // Reject an empty aggregate model result.
+                    {0x12823ae, 0x0f},  // Reject invalid aggregate model bounds.
+                    {0x1282443, 0x42},  // Publish a valid per-context model result.
+                    {0x129217f, 0x0f},  // Gate global model setup on that valid result.
+                    {0x1271397, 0x44},  // Inspect the inner builder's final output-progress gate.
+                }};
+                bool trace_points_match = true;
+                for (const auto [offset, expected] : DreamsModelRecordTracePoints) {
+                    if (offset >= base_size ||
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) != expected) {
+                        trace_points_match = false;
+                        break;
+                    }
+                }
+                if (trace_points_match) {
+                    for (const auto [offset, expected] : DreamsModelRecordTracePoints) {
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) = 0xcc;
+                    }
+                    LOG_WARNING(Core_Linker, "Applied focused Dreams model-record trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams model-record trace did not match this executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SCENE_READY_HANDOFF")) {
+                constexpr u64 DreamsSceneReadyHandoffOffset = 0x9ab22e;
+                constexpr u64 DreamsSceneCacheBootstrapOffset = 0x8b74c0;
+                constexpr u8 BreakpointByte = 0xcc;
+                auto* scene_ready_handoff =
+                    reinterpret_cast<u8*>(base_virtual_addr + DreamsSceneReadyHandoffOffset);
+                auto* scene_cache_bootstrap =
+                    reinterpret_cast<u8*>(base_virtual_addr + DreamsSceneCacheBootstrapOffset);
+                if (DreamsSceneReadyHandoffOffset < base_size &&
+                    DreamsSceneCacheBootstrapOffset < base_size &&
+                    *scene_ready_handoff == 0xe8 && *scene_cache_bootstrap == 0x0f) {
+                    *scene_ready_handoff = BreakpointByte;
+                    *scene_cache_bootstrap = BreakpointByte;
+                    LOG_WARNING(Core_Linker,
+                                "Applied focused Dreams scene-ready/cache-bootstrap repair");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams scene-ready/cache-bootstrap repair did not match this "
+                                "executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_PAIR_QUEUE_TRACE")) {
+                constexpr std::array<std::pair<u64, u8>, 3> DreamsPairQueueTracePoints{{
+                    {0x1008bc0, 0x55}, // Enter the type-1 sculpt renderer.
+                    {0x130b8a0, 0x55}, // Append one paired render record.
+                    {0xc20bc5, 0x89},  // Publish this frame's paired-record count.
+                }};
+                bool trace_points_match = true;
+                for (const auto [offset, expected] : DreamsPairQueueTracePoints) {
+                    if (offset >= base_size ||
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) != expected) {
+                        trace_points_match = false;
+                        break;
+                    }
+                }
+                if (trace_points_match) {
+                    for (const auto [offset, expected] : DreamsPairQueueTracePoints) {
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) = 0xcc;
+                    }
+                    LOG_WARNING(Core_Linker, "Applied focused Dreams paired-record trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams paired-record trace did not match this executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
                 IsEnvironmentFlagEnabled("SHADPS4_DREAMS_PENDING_RETIREMENT_HANDOFF")) {
                 constexpr u64 DreamsRetirementWatermarkWriteOffset = 0x9aaf51;
                 constexpr std::array<u8, 6> ExpectedBytes = {0x89, 0x05, 0xf1,
@@ -512,7 +595,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
                 IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CPU_ROOT_TRACE") &&
-                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_STAMP_TRACE")) {
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_STAMP_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_APPEND_TRACE")) {
                 constexpr u64 DreamsRecordBuilderOffset = 0x8b7380;
                 constexpr u64 DreamsActiveMapOffset = 0x8b81c4;
                 constexpr std::array<std::pair<u64, u8>, 10> DreamsBuilderPhases{{
@@ -552,7 +636,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 constexpr u64 DreamsResourceAssignOffset = 0x71cd98;
                 constexpr u64 DreamsResourceCreateOffset = 0x72aa3e;
                 constexpr u64 DreamsResourceRetireOffset = 0x729da5;
-                constexpr std::array<std::pair<u64, u8>, 28> DreamsReadyWrites{{
+                constexpr std::array<std::pair<u64, u8>, 33> DreamsReadyWrites{{
+                    {0x948b60, 0x41}, {0x948c6c, 0x41}, {0x999ab5, 0x41},
+                    {0x99afec, 0x41}, {0xd8bffe, 0x88},
                     {0x972397, 0xc6}, {0x9be805, 0x41}, {0x9beb05, 0x41},
                     {0x9bf0b0, 0x41}, {0x9bfec7, 0x41}, {0xa14334, 0x41},
                     {0xa143fa, 0x41}, {0xa1637d, 0x41}, {0xaad456, 0xc6},
@@ -563,6 +649,12 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                     {0x8ceb05, 0xc6}, {0x9fd521, 0xc6}, {0xa00559, 0xc6},
                     {0xa3f896, 0xc6}, {0xa4120e, 0x41}, {0xa44b41, 0xc6},
                     {0xa44cec, 0xc6},
+                }};
+                constexpr u64 DreamsParentStageImportOffset = 0x8b6d05;
+                constexpr u64 DreamsParentRebuildCompleteOffset = 0x99de43;
+                constexpr std::array<std::pair<u64, u8>, 5> DreamsReadyLifecycle{{
+                    {0xa36485, 0xe8}, {0xa36bbf, 0xe8}, {0xa370c2, 0x48},
+                    {0xa370ef, 0xe8}, {0xa3f7a0, 0xe8},
                 }};
                 constexpr u8 ExpectedByte = 0x55;
                 constexpr u8 ExpectedActiveMapByte = 0x48;
@@ -620,11 +712,23 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                     reinterpret_cast<u8*>(base_virtual_addr + DreamsResourceCreateOffset);
                 auto* resource_retire =
                     reinterpret_cast<u8*>(base_virtual_addr + DreamsResourceRetireOffset);
+                auto* parent_stage_import =
+                    reinterpret_cast<u8*>(base_virtual_addr + DreamsParentStageImportOffset);
+                auto* parent_rebuild_complete = reinterpret_cast<u8*>(
+                    base_virtual_addr + DreamsParentRebuildCompleteOffset);
                 bool ready_writes_match = true;
                 for (const auto [offset, expected] : DreamsReadyWrites) {
                     if (offset >= base_size ||
                         *reinterpret_cast<u8*>(base_virtual_addr + offset) != expected) {
                         ready_writes_match = false;
+                        break;
+                    }
+                }
+                bool ready_lifecycle_match = true;
+                for (const auto [offset, expected] : DreamsReadyLifecycle) {
+                    if (offset >= base_size ||
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) != expected) {
+                        ready_lifecycle_match = false;
                         break;
                     }
                 }
@@ -677,7 +781,11 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                     *resource_aux_assign == 0x41 &&
                     *resource_primary_assign == 0x41 && *resource_assign == 0x43 &&
                     *resource_create == 0x89 && *resource_retire == 0x41 &&
-                    ready_writes_match && unresolved_consumers_match && unresolved_bitsets_match &&
+                    DreamsParentRebuildCompleteOffset < base_size &&
+                    DreamsParentStageImportOffset < base_size && *parent_stage_import == 0x45 &&
+                    *parent_rebuild_complete == 0x49 && ready_writes_match &&
+                    ready_lifecycle_match &&
+                    unresolved_consumers_match && unresolved_bitsets_match &&
                     builder_phases_match && gpu_handoff_phases_match) {
                     *record_builder = BreakpointByte;
                     *active_map = BreakpointByte;
@@ -712,7 +820,12 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                     *resource_assign = BreakpointByte;
                     *resource_create = BreakpointByte;
                     *resource_retire = BreakpointByte;
+                    *parent_stage_import = BreakpointByte;
+                    *parent_rebuild_complete = BreakpointByte;
                     for (const auto [offset, expected] : DreamsReadyWrites) {
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) = BreakpointByte;
+                    }
+                    for (const auto [offset, expected] : DreamsReadyLifecycle) {
                         *reinterpret_cast<u8*>(base_virtual_addr + offset) = BreakpointByte;
                     }
                     LOG_WARNING(Core_Linker,
@@ -720,6 +833,26 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 } else {
                     LOG_WARNING(Core_Linker,
                                 "Dreams CPU render-record trace did not match this executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_APPEND_TRACE")) {
+                constexpr u64 DreamsObjectAppendOffset = 0x9372ae;
+                constexpr u64 DreamsObjectParentWriteOffset = 0x93738e;
+                auto* object_append =
+                    reinterpret_cast<u8*>(base_virtual_addr + DreamsObjectAppendOffset);
+                auto* parent_write = reinterpret_cast<u8*>(
+                    base_virtual_addr + DreamsObjectParentWriteOffset);
+                if (DreamsObjectAppendOffset < base_size &&
+                    DreamsObjectParentWriteOffset < base_size && *object_append == 0x89 &&
+                    *parent_write == 0x66) {
+                    *object_append = 0xcc;
+                    *parent_write = 0xcc;
+                    LOG_WARNING(Core_Linker, "Applied focused Dreams object-append trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams object-append trace did not match this executable");
                 }
             }
 #endif

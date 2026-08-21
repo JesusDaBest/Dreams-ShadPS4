@@ -663,6 +663,10 @@ U32 IREmitter::QuadShuffle(const U32& value, const U32& index) {
     return Inst<U32>(Opcode::QuadShuffle, value, index);
 }
 
+U32 IREmitter::ShuffleXor(const U32& value, const U32& mask) {
+    return Inst<U32>(Opcode::ShuffleXor, value, mask);
+}
+
 U32 IREmitter::ReadFirstLane(const U32& value) {
     return Inst<U32>(Opcode::ReadFirstLane, value);
 }
@@ -904,6 +908,8 @@ Value IREmitter::Select(const U1& condition, const Value& true_value, const Valu
         return Inst(Opcode::SelectU32, condition, true_value, false_value);
     case Type::F32:
         return Inst(Opcode::SelectF32, condition, true_value, false_value);
+    case Type::F64:
+        return Inst(Opcode::SelectF64, condition, true_value, false_value);
     default:
         UNREACHABLE_MSG("Invalid type {}", true_value.Type());
     }
@@ -1845,6 +1851,8 @@ U32U64 IREmitter::ConvertFToU(size_t bitsize, const F32F64& value) {
         switch (value.Type()) {
         case Type::F32:
             return Inst<U32>(Opcode::ConvertU32F32, value);
+        case Type::F64:
+            return Inst<U32>(Opcode::ConvertU32F64, value);
         default:
             ThrowInvalidType(value.Type());
         }

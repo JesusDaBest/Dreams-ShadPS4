@@ -61,7 +61,8 @@ IR::Program TranslateProgram(const std::span<const u32>& code,
     program.blocks = GenerateBlocks(program.syntax_list);
     program.post_order_blocks = Shader::IR::PostOrder(program.syntax_list.front());
 
-    if (info.pgm_hash == DreamsCompat::IndirectArgsShader) {
+    if (info.pgm_hash == DreamsCompat::IndirectArgsShader || info.pgm_hash == 0x31f3dfbc ||
+        info.pgm_hash == 0x7ba4de5d) {
         Shader::IR::DumpProgram(program, info, "pre.");
     }
 

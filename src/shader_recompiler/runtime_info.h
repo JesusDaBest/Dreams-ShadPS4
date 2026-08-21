@@ -216,10 +216,12 @@ struct ComputeRuntimeInfo {
     std::array<u32, 3> workgroup_size;
     std::array<bool, 3> tgid_enable;
     bool tg_size_enable;
+    bool ordered_append_enable;
 
     bool operator==(const ComputeRuntimeInfo& other) const noexcept {
         return workgroup_size == other.workgroup_size && tgid_enable == other.tgid_enable &&
-               tg_size_enable == other.tg_size_enable;
+               tg_size_enable == other.tg_size_enable &&
+               ordered_append_enable == other.ordered_append_enable;
     }
 };
 

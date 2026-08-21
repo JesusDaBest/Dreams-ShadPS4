@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -348,6 +349,10 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
 
 void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms,
                     Id color) {
+    if (ctx.info.pgm_hash == 0x7ba4de5d &&
+        std::getenv("SHADPS4_DREAMS_GATHER_DISABLE_IMAGE_WRITES") != nullptr) {
+        return;
+    }
     const auto& texture = ctx.images[handle & 0xFFFF];
     Id image_ptr = texture.id;
     const Id color_type = texture.data_types->Get(4);

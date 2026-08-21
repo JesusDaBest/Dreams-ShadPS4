@@ -1,9 +1,26 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <string_view>
+
+#include "common/elf_info.h"
+#include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 
 namespace Shader::Gcn {
+
+namespace {
+
+bool ShouldFreezeDreamsProjectionJitter() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_FREEZE_PROJECTION_JITTER");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+} // Anonymous namespace
 
 void Translator::EmitVectorMemory(const GcnInst& inst) {
     switch (inst.opcode) {
@@ -313,6 +330,16 @@ void Translator::BUFFER_STORE(u32 num_dwords, bool is_inst_typed, bool is_buffer
             comps.push_back(ir.GetVectorReg<IR::U32>(src_reg_i));
         }
     }
+    if (info.stage == Stage::Compute &&
+        info.pgm_hash == DreamsCompat::ProjectionConstantsShader &&
+        pc == DreamsCompat::ProjectionJitterStorePc &&
+        mubuf.offset == DreamsCompat::ProjectionJitterStoreOffset && num_dwords == 4 &&
+        scalar_width == 32 && !buffer_info.typed && ShouldFreezeDreamsProjectionJitter()) {
+        // This store writes the projection matrix's Z column. Freeze only its X/Y center terms;
+        // preserve the guest-provided Z/W values and every other matrix written by the shader.
+        comps[0] = ir.Imm32(DreamsCompat::FrozenProjectionJitterX);
+        comps[1] = ir.Imm32(DreamsCompat::FrozenProjectionJitterY);
+    }
     if (buffer_info.typed) {
         for (u32 i = num_dwords; i < 4; i++) {
             comps.push_back(ir.Imm32(0.f));
@@ -419,7 +446,9 @@ void Translator::BUFFER_ATOMIC(AtomicOp op, const GcnInst& inst) {
 
     if (mubuf.glc) {
         if constexpr (std::is_same_v<T, IR::U64>) {
-            UNREACHABLE();
+            const auto vector = ir.UnpackUint2x32(IR::U64{original_val});
+            ir.SetVectorReg(vdata, IR::U32{ir.CompositeExtract(vector, 0)});
+            ir.SetVectorReg(vdata + 1, IR::U32{ir.CompositeExtract(vector, 1)});
         } else {
             ir.SetVectorReg(vdata, T{original_val});
         }

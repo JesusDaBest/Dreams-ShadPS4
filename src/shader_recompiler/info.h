@@ -163,6 +163,7 @@ struct Info : InfoPersistent {
     bool uses_image_atomic_float_min_max{};
     bool uses_lane_id{};
     bool uses_group_quad{};
+    bool uses_group_shuffle{};
     bool uses_group_ballot{};
     bool uses_group_vote{};
     IR::Type shared_types{};

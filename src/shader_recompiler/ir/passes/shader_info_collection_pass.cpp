@@ -89,6 +89,13 @@ void Visit(Info& info, const IR::Inst& inst) {
         info.uses_group_quad = true;
         break;
     case IR::Opcode::ReadLane:
+        info.uses_group_shuffle = true;
+        break;
+    case IR::Opcode::ShuffleXor:
+        info.uses_group_shuffle = true;
+        info.uses_group_ballot = true;
+        info.uses_lane_id = true;
+        break;
     case IR::Opcode::ReadFirstLane:
     case IR::Opcode::WriteLane:
     case IR::Opcode::Ballot:

@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <mutex>
+#include <string_view>
+
+#include "common/elf_info.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/position.h"
 #include "shader_recompiler/ir/reinterpret.h"
@@ -8,6 +14,22 @@
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Gcn {
+
+namespace {
+
+constexpr u64 DreamsFleckDecodeFragmentShader = 0xdcc325c2;
+
+bool ShouldForceDreamsDccFixedColor(const Info& info) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("SHADPS4_DREAMS_DCC_FIXED_COLOR");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && info.stage == Stage::Fragment &&
+           info.pgm_hash == DreamsFleckDecodeFragmentShader &&
+           Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+} // Anonymous namespace
 
 static AmdGpu::NumberFormat NumberFormatCompressed(AmdGpu::ShaderExportFormat export_format) {
     switch (export_format) {
@@ -51,6 +73,15 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
     const auto& exp = inst.control.exp;
     const IR::Attribute mrt{exp.target};
     info.mrt_mask |= 1u << static_cast<u8>(mrt);
+    const bool force_dreams_dcc_fixed_color =
+        mrt == IR::Attribute::RenderTarget2 && ShouldForceDreamsDccFixedColor(info);
+    if (force_dreams_dcc_fixed_color) {
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            LOG_WARNING(Render_Recompiler,
+                        "Dreams diagnostic: forcing FS dcc325c2 render-target 2 RGB to 0.75");
+        });
+    }
 
     // Dual source blending uses MRT1 for exporting src1
     u32 color_buffer_idx = static_cast<u32>(mrt) - static_cast<u32>(IR::Attribute::RenderTarget0);
@@ -113,6 +144,9 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
         if (needs_unorm_fixup) {
             // FIXME: Fix-up for GPUs where float-to-unorm rounding is off from expected.
             converted = ir.FPSub(converted, ir.Imm32(1.f / 127500.f));
+        }
+        if (force_dreams_dcc_fixed_color && i < 3) {
+            converted = ir.Imm32(0.75f);
         }
         ir.SetAttribute(mrt, converted, i);
     }

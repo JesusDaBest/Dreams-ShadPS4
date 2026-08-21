@@ -129,6 +129,15 @@ bool Swapchain::AcquireNextImage() {
 
 bool Swapchain::Present() {
 
+    if (std::getenv("SHADPS4_DREAMS_PRESENT_SYNC") != nullptr) {
+        const auto idle_result = instance.GetDevice().waitIdle();
+        LOG_WARNING(Render_Vulkan, "Dreams diagnostic: pre-present device idle result={}",
+                    vk::to_string(idle_result));
+        if (idle_result != vk::Result::eSuccess) {
+            return false;
+        }
+    }
+
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],

@@ -192,7 +192,11 @@ void Translator::DS_OP(const GcnInst& inst, AtomicOp op, bool rtn) {
     }();
     const IR::U32 offset =
         ir.Imm32((u32(inst.control.ds.offset1) << 8u) + u32(inst.control.ds.offset0));
-    const IR::U32 addr_offset = ir.IAdd(addr, offset);
+    IR::U32 addr_offset = ir.IAdd(addr, offset);
+    if (is_gds) {
+        const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+        addr_offset = ir.IAdd(base, addr_offset);
+    }
     const T original_val = [&] -> T {
         switch (op) {
         case AtomicOp::Add:
@@ -236,7 +240,11 @@ void Translator::DS_OP_F32(const GcnInst& inst, AtomicOp op, bool rtn) {
     const IR::U32 data{ir.BitCast<IR::U32>(GetSrc<IR::F32>(inst.src[1]))};
     const IR::U32 offset =
         ir.Imm32((u32(inst.control.ds.offset1) << 8u) + u32(inst.control.ds.offset0));
-    const IR::U32 addr_offset = ir.IAdd(addr, offset);
+    IR::U32 addr_offset = ir.IAdd(addr, offset);
+    if (is_gds) {
+        const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+        addr_offset = ir.IAdd(base, addr_offset);
+    }
 
     // This quick path assumes the values are in the non-negative float range, where integer
     // ordering matches IEEE-754 bit ordering. Dreams reaches this path while booting.
@@ -258,7 +266,11 @@ void Translator::DS_OP_F32(const GcnInst& inst, AtomicOp op, bool rtn) {
 void Translator::DS_WRITE(int bit_size, bool is_signed, bool is_pair, bool stride64,
                           const GcnInst& inst) {
     const bool is_gds = inst.control.ds.gds;
-    const IR::U32 addr{ir.GetVectorReg(IR::VectorReg(inst.src[0].code))};
+    IR::U32 addr{ir.GetVectorReg(IR::VectorReg(inst.src[0].code))};
+    if (is_gds) {
+        const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+        addr = ir.IAdd(base, addr);
+    }
     const IR::VectorReg data0{inst.src[1].code};
     const IR::VectorReg data1{inst.src[2].code};
     const u32 offset = (inst.control.ds.offset1 << 8u) + inst.control.ds.offset0;
@@ -309,7 +321,11 @@ void Translator::DS_WRITE(int bit_size, bool is_signed, bool is_pair, bool strid
 void Translator::DS_READ(int bit_size, bool is_signed, bool is_pair, bool stride64,
                          const GcnInst& inst) {
     const bool is_gds = inst.control.ds.gds;
-    const IR::U32 addr{ir.GetVectorReg(IR::VectorReg(inst.src[0].code))};
+    IR::U32 addr{ir.GetVectorReg(IR::VectorReg(inst.src[0].code))};
+    if (is_gds) {
+        const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+        addr = ir.IAdd(base, addr);
+    }
     IR::VectorReg dst_reg{inst.dst[0].code};
     const u32 offset = (inst.control.ds.offset1 << 8u) + inst.control.ds.offset0;
     if (info.stage == Stage::Fragment) {
@@ -372,6 +388,10 @@ void Translator::DS_SWIZZLE_B32(const GcnInst& inst) {
         const u8 and_mask = (offset0 & 0x1f) | (~u8{0} << 5);
         const u8 or_mask = (offset0 >> 5) | ((offset1 & 0x3) << 3);
         const u8 xor_mask = offset1 >> 2;
+        if (and_mask == 0xff && or_mask == 0) {
+            SetDst(inst.dst[0], ir.ShuffleXor(src, ir.Imm32(xor_mask)));
+            return;
+        }
         const IR::U32 index = ir.BitwiseXor(
             ir.BitwiseOr(ir.BitwiseAnd(lane_id, ir.Imm32(and_mask)), ir.Imm32(or_mask)),
             ir.Imm32(xor_mask));
@@ -381,14 +401,16 @@ void Translator::DS_SWIZZLE_B32(const GcnInst& inst) {
 
 void Translator::DS_APPEND(const GcnInst& inst) {
     const u32 inst_offset = (u32(inst.control.ds.offset1) << 8u) + inst.control.ds.offset0;
-    const IR::U32 gds_offset = ir.IAdd(ir.GetM0(), ir.Imm32(inst_offset));
+    const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+    const IR::U32 gds_offset = ir.IAdd(base, ir.Imm32(inst_offset));
     const IR::U32 prev = ir.DataAppend(gds_offset);
     SetDst(inst.dst[0], prev);
 }
 
 void Translator::DS_CONSUME(const GcnInst& inst) {
     const u32 inst_offset = (u32(inst.control.ds.offset1) << 8u) + inst.control.ds.offset0;
-    const IR::U32 gds_offset = ir.IAdd(ir.GetM0(), ir.Imm32(inst_offset));
+    const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+    const IR::U32 gds_offset = ir.IAdd(base, ir.Imm32(inst_offset));
     const IR::U32 prev = ir.DataConsume(gds_offset);
     SetDst(inst.dst[0], prev);
 }

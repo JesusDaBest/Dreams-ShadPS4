@@ -1,0 +1,2 @@
+# Preserve standalone patch bytes and their documented checksums across checkouts.
+patches/*.patch -text

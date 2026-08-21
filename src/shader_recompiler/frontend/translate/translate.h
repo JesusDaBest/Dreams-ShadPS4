@@ -121,6 +121,7 @@ public:
     void S_MOV(const GcnInst& inst);
     void S_MOV_B64(const GcnInst& inst);
     void S_NOT_B64(const GcnInst& inst);
+    void S_WQM_B64(const GcnInst& inst);
     void S_BREV_B32(const GcnInst& inst);
     void S_BCNT1_I32_B32(const GcnInst& inst);
     void S_BCNT1_I32_B64(const GcnInst& inst);
@@ -197,6 +198,7 @@ public:
     void V_MOV(const GcnInst& inst);
     void V_READFIRSTLANE_B32(const GcnInst& inst);
     void V_CVT_I32_F64(const GcnInst& inst);
+    void V_CVT_U32_F64(const GcnInst& inst);
     void V_CVT_F64_I32(const GcnInst& inst);
     void V_CVT_F64_U32(const GcnInst& inst);
     void V_CVT_F32_I32(const GcnInst& inst);

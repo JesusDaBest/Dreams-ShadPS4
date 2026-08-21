@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <unordered_set>
+#include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/program.h"
@@ -19,6 +20,47 @@ static bool IsWriteShared(const IR::Inst& inst) {
     return inst.GetOpcode() == IR::Opcode::WriteSharedU16 ||
            inst.GetOpcode() == IR::Opcode::WriteSharedU32 ||
            inst.GetOpcode() == IR::Opcode::WriteSharedU64;
+}
+
+// These reconstruction shaders exchange LDS values between lanes. An execution barrier would be
+// invalid in their divergent regions, but the LDS dependency still requires a memory barrier.
+// Insert exactly one immediately before the first LDS read after the shader's writes.
+static void EmitDreamsLdsMemoryBarrier(IR::Program& program) {
+    bool saw_shared_write{};
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        if (node.type != IR::AbstractSyntaxNode::Type::Block) {
+            continue;
+        }
+        IR::Block* const block = node.data.block;
+        for (IR::Inst& inst : block->Instructions()) {
+            if (IsWriteShared(inst)) {
+                saw_shared_write = true;
+                continue;
+            }
+            if (!saw_shared_write || !IsLoadShared(inst)) {
+                continue;
+            }
+            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+            ir.WorkgroupMemoryBarrier();
+            return;
+        }
+    }
+}
+
+// The spatial reconstruction shaders fill LDS in a divergent loop and reconverge at its merge.
+// Synchronize there, where every lane executes the same dynamic barrier instance, before any lane
+// starts consuming values written by another lane.
+static void EmitDreamsPostFillLdsControlBarrier(IR::Program& program) {
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        if (node.type != IR::AbstractSyntaxNode::Type::Loop) {
+            continue;
+        }
+        IR::Block* const merge = node.data.loop.merge;
+        const auto insert_point = std::ranges::find_if_not(merge->Instructions(), IR::IsPhi);
+        IR::IREmitter ir{*merge, insert_point};
+        ir.Barrier();
+        return;
+    }
 }
 
 // Inserts barriers when a shared memory write and read occur in the same basic block.
@@ -94,6 +136,14 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     // subgroup.
     if (shared_memory_size == 0 || threadgroup_size != GcnSubgroupSize ||
         !profile.needs_lds_barriers) {
+        return;
+    }
+    if (DreamsCompat::NeedsLdsMemoryBarrier(program.info.pgm_hash)) {
+        EmitDreamsLdsMemoryBarrier(program);
+        return;
+    }
+    if (DreamsCompat::NeedsPostFillLdsControlBarrier(program.info.pgm_hash)) {
+        EmitDreamsPostFillLdsControlBarrier(program);
         return;
     }
     using Type = IR::AbstractSyntaxNode::Type;

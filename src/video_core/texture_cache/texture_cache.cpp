@@ -3,11 +3,14 @@
 
 #include <xxhash.h>
 
+#include <cstdlib>
 #include <fstream>
+#include <string_view>
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/elf_info.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -23,6 +26,14 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+static bool PreserveDreamsGpuOverlap() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_PRESERVE_GPU_OVERLAP");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
@@ -113,32 +124,85 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 }
 
 void TextureCache::DumpImageLinear(ImageId image_id, const std::filesystem::path& path) {
-    Image& image = slot_images[image_id];
-    auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-    const u32 linear_size = image.info.pitch * image.info.size.height * image.info.size.depth *
-                            image.info.resources.layers * (image.info.num_bits / 8);
-    const auto [download, offset] = download_buffer.Map(linear_size);
-    download_buffer.Commit();
-    std::array image_download{vk::BufferImageCopy{
-        .bufferOffset = offset,
-        .bufferRowLength = image.info.pitch,
-        .bufferImageHeight = image.info.size.height,
-        .imageSubresource =
-            {
-                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
-                                                        : vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = image.info.resources.layers,
-            },
-        .imageOffset = {0, 0, 0},
-        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
-    }};
-    image.Download(image_download, download_buffer.Handle(), offset, linear_size);
-    scheduler.Finish();
+    const std::array dumps{LinearImageDump{image_id, path}};
+    DumpImagesLinear(dumps);
+}
 
-    std::ofstream stream{path, std::ios::binary | std::ios::trunc};
-    stream.write(reinterpret_cast<const char*>(download), linear_size);
+void TextureCache::DumpImagesLinear(std::span<const LinearImageDump> dumps) {
+    struct PendingDump {
+        const u8* data;
+        u64 size;
+        std::filesystem::path path;
+    };
+
+    auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+    std::vector<PendingDump> pending;
+    pending.reserve(dumps.size());
+    const auto flush_pending = [&](bool force_fence = false) {
+        if (pending.empty() && !force_fence) {
+            return;
+        }
+        scheduler.Finish();
+        for (const auto& dump : pending) {
+            std::ofstream stream{dump.path, std::ios::binary | std::ios::trunc};
+            if (!stream) {
+                LOG_ERROR(Render_Vulkan, "Failed to open linear image dump {}",
+                          dump.path.string());
+                continue;
+            }
+            stream.write(reinterpret_cast<const char*>(dump.data), dump.size);
+        }
+        pending.clear();
+    };
+
+    for (const auto& dump : dumps) {
+        if (!dump.image_id) {
+            continue;
+        }
+        Image& image = slot_images[dump.image_id];
+        const u64 linear_size = static_cast<u64>(image.info.pitch) * image.info.size.height *
+                                image.info.size.depth * image.info.resources.layers *
+                                (image.info.num_bits / 8);
+        if (linear_size == 0 || linear_size > download_buffer.SizeBytes()) {
+            LOG_ERROR(Render_Vulkan,
+                      "Cannot dump linear image id={} size={:#x}; download capacity is {:#x}",
+                      dump.image_id.index, linear_size, download_buffer.SizeBytes());
+            continue;
+        }
+
+        auto [download, offset] = download_buffer.Map(linear_size, 0, false);
+        if (download == nullptr) {
+            // The ring would wrap over work recorded earlier in this batch (or earlier this
+            // command buffer). Submit it and save those bytes before reusing the mapped range.
+            flush_pending(true);
+            std::tie(download, offset) = download_buffer.Map(linear_size);
+        }
+        if (download == nullptr) {
+            LOG_ERROR(Render_Vulkan, "Failed to reserve {:#x} bytes for linear image dump id={}",
+                      linear_size, dump.image_id.index);
+            continue;
+        }
+        download_buffer.Commit();
+        std::array image_download{vk::BufferImageCopy{
+            .bufferOffset = offset,
+            .bufferRowLength = image.info.pitch,
+            .bufferImageHeight = image.info.size.height,
+            .imageSubresource =
+                {
+                    .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                            : vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+        }};
+        image.Download(image_download, download_buffer.Handle(), offset, linear_size);
+        pending.push_back({download, linear_size, dump.path});
+    }
+
+    flush_pending();
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -304,6 +368,33 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
         scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
+    const auto preserve_gpu_overlap = [&](std::string_view branch) {
+        if (!PreserveDreamsGpuOverlap() || !cache_image.SafeToDownload()) {
+            return;
+        }
+
+        static u32 log_count{};
+        const u32 ordinal = log_count++;
+        if (ordinal < 128) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams GPU overlap preserve #{} branch={} id={} address={:#x}+{:#x} "
+                "format={} tile={} binding={} flags={:#x} gpu_modified={} dirty={} "
+                "safe_download={} tick={} age={} requested_format={} requested_tile={}",
+                ordinal + 1, branch, cache_image_id.index, cache_image.info.guest_address,
+                cache_image.info.guest_size, vk::to_string(cache_image.info.pixel_format),
+                static_cast<u32>(cache_image.info.tile_mode), static_cast<u32>(binding),
+                static_cast<u32>(cache_image.flags),
+                True(cache_image.flags & ImageFlagBits::GpuModified),
+                True(cache_image.flags & ImageFlagBits::Dirty), cache_image.SafeToDownload(),
+                scheduler.CurrentTick(), scheduler.CurrentTick() - cache_image.tick_accessed_last,
+                vk::to_string(image_info.pixel_format), static_cast<u32>(image_info.tile_mode));
+        }
+
+        // The replacement image will initially upload from guest memory. Make the guest backing
+        // authoritative before deleting a GPU-modified alias so that upload retains its contents.
+        DownloadImageMemory(cache_image_id, true);
+    };
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -313,6 +404,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
+                preserve_gpu_overlap("block-mismatch");
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
@@ -353,6 +445,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         // Likely the address is reused for a image with a different tiling mode.
         if (image_info.tile_mode != cache_image.info.tile_mode) {
             if (safe_to_delete) {
+                preserve_gpu_overlap("tile-mismatch");
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
@@ -476,6 +569,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Image isn't a subresource but a chance overlap.
         if (safe_to_delete) {
+            preserve_gpu_overlap("chance-right-overlap");
             FreeImage(cache_image_id);
         }
 

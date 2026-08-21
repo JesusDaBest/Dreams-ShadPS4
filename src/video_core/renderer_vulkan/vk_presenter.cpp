@@ -740,7 +740,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     const bool force_dreams_present_sync =
-        Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+        Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+        std::getenv("SHADPS4_DREAMS_FORCE_PRESENT_TRANSFER_SYNC") != nullptr;
     std::vector<ScreenshotReadback> pending_screenshots;
     if (capture_game_only_count > 0) {
         pending_screenshots.reserve(1);
@@ -791,6 +792,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    if (std::getenv("SHADPS4_DREAMS_PRESENTER_TRACE") != nullptr) {
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams presenter: PrepareFrame fence begin image={} guest={:#x} "
+                    "extent={}x{}",
+                    image_id.index, cpu_address, image_size.width, image_size.height);
+        draw_scheduler.Finish();
+        LOG_WARNING(Render_Vulkan, "Dreams presenter: PrepareFrame fence complete image={}",
+                    image_id.index);
+    }
     return frame;
 }
 
@@ -1103,6 +1113,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
+    if (std::getenv("SHADPS4_DREAMS_PRESENTER_TRACE") != nullptr) {
+        LOG_WARNING(Render_Vulkan, "Dreams presenter: host-frame fence begin");
+        scheduler.Finish();
+        LOG_WARNING(Render_Vulkan, "Dreams presenter: host-frame fence complete");
+    }
 
     // Present to swapchain.
     {

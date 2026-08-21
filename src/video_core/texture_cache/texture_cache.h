@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
@@ -102,6 +103,14 @@ public:
 
     /// Writes an image's linear GPU contents for targeted renderer diagnostics.
     void DumpImageLinear(ImageId image_id, const std::filesystem::path& path);
+
+    struct LinearImageDump {
+        ImageId image_id;
+        std::filesystem::path path;
+    };
+
+    /// Writes several images while batching downloads between the minimum required GPU fences.
+    void DumpImagesLinear(std::span<const LinearImageDump> dumps);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);

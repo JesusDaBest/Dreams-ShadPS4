@@ -384,7 +384,9 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             if (!current_block) {
                 break;
             }
-            EmitDreamsTraversalCompletion(ctx);
+            // The Dreams traversal shader is dispatched one workgroup at a time, in guest wave
+            // order. Preserve its own final-wave stores instead of replacing them with the older
+            // unordered-completion approximation.
             ctx.OpReturn();
             break;
         case IR::AbstractSyntaxNode::Type::Unreachable:
@@ -481,11 +483,14 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         ctx.AddExtension("SPV_EXT_shader_atomic_float_min_max");
         ctx.AddCapability(spv::Capability::AtomicFloat32MinMaxEXT);
     }
-    if (info.uses_lane_id) {
+    if (info.uses_lane_id || info.uses_group_shuffle) {
         ctx.AddCapability(spv::Capability::GroupNonUniform);
     }
     if (info.uses_group_quad) {
         ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
+    }
+    if (info.uses_group_shuffle) {
+        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
     }
     if (info.uses_group_ballot) {
         ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
