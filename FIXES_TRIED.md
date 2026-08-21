@@ -1,5 +1,55 @@
 # Fixes Tried
 
+## August 20–21 sculpt/fleck investigation
+
+### Confirmed correction: preserve the ordered-counter base
+
+- Correct formula: `((M0 >> 16) & 0xfffc) + (OFFSET0_bytes >> 2)`.
+- M0's high field is already in dwords. Only `OFFSET0` is byte encoded.
+- The prior combined divide remapped ordered counters into unrelated guest GDS.
+- The prior formula produced dark/grey fragmented cubes with flicker and camera jitter.
+- The corrected formula removes that known corruption, although the sculpt can return to
+  invisibility.
+- An off-by-default environment switch intentionally reproduces the wrong formula for a same-scene
+  A/B. It is labeled as corruption, not a fix.
+
+### Confirmed localization: the large root is absent from CPU records
+
+- Active large roots with roughly 5,133–5,134 objects were present and in phase 3.
+- All 19,264 captured type-1 entries belonged to four 52-object utility roots.
+- Pair publication remained 18 utility records per frame.
+- The large-root builder retained sentinel cached identity and two empty incremental tables.
+- Therefore forcing GPU command counts or the published traversal count is not justified in this
+  state; the missing producer is earlier.
+
+### Conditional cache-bootstrap candidate
+
+- The builder is called every frame; scheduling is not the exclusion.
+- The source preserves the original zero-token full-build branch.
+- It adds the ready + valid root identity + sentinel cached identity + both table sizes zero case.
+- Table size fields at builder `+0x243ff0` and `+0x244010` replaced an earlier expensive full-table
+  scan.
+- Guest `+0x8b7bc0` is intentionally not bypassed. A missing resource exits before cache mutation,
+  allowing a safe next-frame retry.
+- The candidate compiles and the closest pre-comparison build reached edit mode, but a clean visual
+  success has not been demonstrated.
+
+### Forced experiments that must not be repeated as fixes
+
+- Broadly inverting the zero-token branch enumerated the large root but did not produce model
+  output.
+- Skipping `+0x8b7bc0` admitted unresolved state and was followed by a stall/crash.
+- Manually forcing readiness, the published count, or the local-static guard changes symptoms
+  without restoring producer provenance.
+- Remapping/capping the 5,133–5,134-object root would hide valid content rather than repair it.
+
+### Next bounded experiment
+
+Log the first `+0x8b7bc0` rejection, its selected resource slot, and the source object, then emulate
+the original branch exactly. Continue only through cache commit, enumerated count, model output,
+and paired-record publication. Return to GPU ordered-count ordering only after the large root
+actually publishes records.
+
 ## August 19 correction and current experiments
 
 The previous section called full-screen 3D rendering confirmed. Later repeat tests invalidated that

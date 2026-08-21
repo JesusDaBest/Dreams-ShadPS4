@@ -3,94 +3,116 @@
 ## Setup
 
 - Windows
-- Legal `CUSA04301` game and firmware files
-- Release build made from the August 19 experimental source
-- Per-game readback mode used in the latest test: `1`
-- Present mode used in the latest test: `Immediate`
-- Pipeline cache disabled while shader behavior is changing
-- Offline environment used in the latest test: `SHADPS4_DREAMS_FAKE_PSN=offline`
+- Legal `CUSA04301` 1.00 game and firmware files
+- Release build from `dreams-dev-20260821-sculpt-handoff`, or both published patches
+- Required Sirit dependency patch applied after submodule initialization
+- Isolated portable user/cache directory
+- Offline baseline: `SHADPS4_DREAMS_FAKE_PSN=offline`
 
-These settings describe the captured run; they are not all proven requirements.
+These settings describe the captured investigation. They are not all proven requirements.
 
-Use a dedicated build directory with a local portable `user` folder. Do not point this experimental
-build at another shadPS4 installation's saves or caches.
+## Corrected baseline test
 
-## Stable-baseline test
+1. Leave `SHADPS4_DREAMS_REPRO_CORRUPTED_ORDERED_BASE` unset.
+2. Use a fresh shader/pipeline cache.
+3. Launch Dreams with only the focused experimental flags being tested.
+4. Enter DreamShaping, open one fixed saved scene, and enter edit mode.
+5. Record the imp, grid, UI, gadgets, tweak panels, sky flecks, sculpt preview, placed sculpt, and
+   paint stroke.
+6. Rotate the camera without changing the scene and check whether any generated geometry moves or
+   flickers.
+7. Record source commit, executable hash, environment, cache state, and game log.
 
-1. Launch Dreams without broad diagnostic environment variables.
-2. Pass Continue, consent/EULA, and Preferences if they appear.
-3. Enter DreamShaping, open a fixed saved scene, and enter edit mode.
-4. Record whether the imp, grid, UI, gadgets, tweak panels, sculpt preview, placed sculpt, and paint
-   stroke are visible.
-5. Rotate the camera without editing the scene and check whether geometry changes position.
-6. Preserve the game log immediately; the next launch can replace it.
+Expected checkpoint result is incomplete: UI/imp/grid/gadgets and sky flecks may render while the
+sculpt is absent. The corrected ordered address should not reproduce the dark fragmented cubes.
 
-Expected known result is incomplete: UI/imp/grid/gadgets can render, while sculpts and paint remain
-missing and tweak panels may be black.
+## Weird/corrupted cube comparison
 
-## Dispatch-base candidate test
+1. Start from the same source and scene.
+2. Use a different fresh shader/pipeline cache.
+3. Set:
 
-The August 19 candidate should create ordered-count compute pipelines with the Vulkan dispatch-base
-flag. In the known scene, this changed invisible geometry into oversized grey shapes. Correct output
-must not be assumed merely because more pixels appear.
+```text
+SHADPS4_DREAMS_REPRO_CORRUPTED_ORDERED_BASE=1
+```
 
-Reject the candidate if any of these occur:
+4. Launch, enter the same edit/sculpt state, and repeat the same camera movement.
+5. Confirm whether the dark/grey fragmented, flickering cube-like output returns.
 
-- tweak panels turn black;
-- geometry shifts when only the camera moves;
-- a sculpt is audible but invisible or unselectable;
-- paint/fleck strokes are absent;
-- the imp, grid, UI, or gadgets regress;
-- performance is measured while forced-wait diagnostics are active.
+This switch intentionally treats the already-dword M0 base as bytes. It is a known-bad A/B and
+must not be reported as a fix. The visual target is Dreams' coherent fleck/surface cube, not an
+opaque solid mesh.
 
-## Save-space test
+## Conditional cache-bootstrap test
+
+The candidate is gated by `SHADPS4_DREAMS_SCENE_READY_HANDOFF`.
+
+For one clean run, preserve guest `+0x8b7bc0` and observe:
+
+- root identity and cached builder identity;
+- readiness bytes and token/generation;
+- both incremental table active sizes;
+- the first resource rejection at `+0x8b7bc0`;
+- cache identity commit at `+0x8b8113`;
+- large-root enumerated count;
+- model output count; and
+- whether type-1/paired publication includes the large root.
+
+The candidate only adds full initialization for a nonzero token, ready inputs, sentinel cached
+identity, valid root identity, and two zero-sized incremental tables. A `0xffff` resource must take
+the original exit so the next frame retries without committing incomplete state.
+
+Success is not “more pixels.” Success requires the 5,133–5,134-object root to contribute CPU
+records, followed by a stable, selectable sculpt that does not move with the camera.
+
+## Main experimental flags
+
+The latest focused baseline used:
+
+```text
+SHADPS4_DREAMS_FAKE_PSN=offline
+SHADPS4_DREAMS_SYNC_COMPUTE_RELEASE_MEM=1
+SHADPS4_DREAMS_SCENE_COMPACT_ORDERED=1
+SHADPS4_DREAMS_ORDERED_COUNT_BATCH=1
+SHADPS4_DREAMS_GRAPHICS_BUFFER_STABILIZE=1
+SHADPS4_DREAMS_COMPUTE_INDIRECT_STABILIZE=1
+SHADPS4_DREAMS_VISIBILITY_LIST_ORDERED=1
+SHADPS4_DREAMS_48A_LDS_BARRIER=1
+SHADPS4_DREAMS_SCENE_READY_HANDOFF=1
+```
+
+Enable only one focused trace at a time. Many diagnostic paths force GPU completion and can reduce
+the game to about 1 FPS.
+
+## Save-space regression test
 
 1. Open Dreams' Limits Info page.
 2. Record local usage, maximum blocks, creations, versions, and photos.
-3. Attempt to create and save a small scene.
-4. Confirm that host free disk space is not confused with the game's 1 GiB save quota.
+3. Create and save a small scene.
+4. Confirm that the game's 1 GiB quota is not confused with host free disk space.
 
-The corrected emulator counts each regular file in rounded 32 KiB PS4 blocks and clamps free blocks
-at zero. It must not report an unsigned-underflow value such as the observed false `4 GB used` state.
+The corrected emulator rounds each regular file to 32 KiB PS4 save blocks and clamps subtraction
+at zero. It must not return the old unsigned-underflow `4 GB used` state.
 
-## Targeted diagnostics
+## Patch verification
 
-The source includes environment-gated and trigger-file diagnostics for:
+Apply the cumulative patch at upstream commit
+`555c458c9fdd33cb4686492374519c7bb112a891`:
 
-- compute and buffer dependency tracing;
-- ordered counters and GDS state;
-- producer records and input buffers;
-- indirect geometry command scanning;
-- geometry input dumps for shader `0xd25db925`;
-- one-shot GPU draw/dispatch timing;
-- RenderDoc capture support;
-- CPU-write watches and crash context.
-
-Environment-variable names and trigger handling are searchable under
-`src/video_core/renderer_vulkan/vk_rasterizer.cpp`. Enable only one focused diagnostic at a time.
-Many paths call `scheduler.Finish()` and can reduce Dreams to about 1 FPS.
-
-## High-value checks
-
-- traversal shader `0xb535c6c8` M0 value and logical wave ID;
-- all four `DS_ORDERED_COUNT` return values for one guest wave;
-- GDS ordered-counter values before and after release/done;
-- queue producer `0x2bfebd3c` record count;
-- scene-compaction shader `0x3937a849` output;
-- indirect-argument shader `0x90272fc4` command contents, not only nonzero count;
-- geometry draw VS `0xd25db925` and FS `0x3f6e1a00` input ranges;
-- whether camera-only changes alter generated position records;
-- unexpected full GPU waits during a non-diagnostic run.
-
-## Patch
-
-Apply `patches/dreams-focused-20260819-experimental.patch` to upstream commit
-`555c458c9fdd33cb4686492374519c7bb112a891`.
-
-Verify SHA-256:
-
-```text
-A7C1863086220579483BA4D4F9DB3E68F40E9B7BF4780D9B1CCF7F036460AEAF
+```bash
+git apply --check patches/dreams-focused-20260821-sculpt-handoff.patch
+git apply patches/dreams-focused-20260821-sculpt-handoff.patch
+git submodule update --init --recursive
+git -C externals/sirit apply --check ../../patches/sirit-group-nonuniform-shuffle-20260821.patch
+git -C externals/sirit apply ../../patches/sirit-group-nonuniform-shuffle-20260821.patch
 ```
 
-The patch is cumulative, experimental, and not upstream-ready.
+```text
+Cumulative patch SHA-256:
+43B4407F010D9E34930C035A2C0D15D6D626157B30D6593B2AD9D020D33249B8
+
+Sirit patch SHA-256:
+F9DBF0B7C8BD4F43EC2104D576C238195F69178082C53C76E55E4C4F5E9C0D06
+```
+
+The patches are cumulative, experimental, and not upstream-ready.

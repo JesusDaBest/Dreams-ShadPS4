@@ -1,5 +1,72 @@
 # Detailed Discoveries
 
+## August 21: ordered address correction and CPU producer localization
+
+### The weird cubes are a reproducible bad-address state
+
+`DS_ORDERED_COUNT` does not use normal GDS byte-address units for M0's high field. M0[31:16] is
+already the ordered-counter base in dwords. The correct lowering is:
+
+```text
+((M0 >> 16) & 0xfffc) + (OFFSET0_bytes >> 2)
+```
+
+The earlier lowering combined the base and selector and divided the whole value by four. That
+compacted/remapped the ordered counters into unrelated guest GDS slots. It produced the dark/grey,
+fragmented, flickering cube-like output and camera-relative jitter seen in edit mode. Preserving the
+base removes that corruption but does not by itself make the sculpt visible.
+
+The source keeps the wrong calculation only behind
+`SHADPS4_DREAMS_REPRO_CORRUPTED_ORDERED_BASE=1` for a fresh-cache A/B. It is not a supported
+rendering mode.
+
+### The active large root stops before traversal
+
+CPU tracing localized the current missing-sculpt state before shader `0xb535c6c8`:
+
+- the active sculpt roots contained roughly 5,133–5,134 objects and reached phase 3;
+- 19,264 captured type-1 entries all came from four 52-object utility roots;
+- no entry came from the large sculpt roots;
+- pair publication remained 18 utility records per frame; and
+- the published sculpt-record count consumed by traversal stayed zero.
+
+The builder for the large root retained cached identity `UINT64_MAX`. Its two 4,096-capacity
+incremental hash tables had active size zero and all keys zero. This rules out forcing the final
+draw, capping the root, or forcing the published count as a principled fix.
+
+### Conditional scene-cache bootstrap
+
+The large-root builder at guest `+0x8b7380` is called normally, so it is not excluded by scheduling.
+The original full build is selected by a zero token/generation branch at `+0x8b74c0`. A nonzero
+token with sentinel cached identity and empty incremental tables can otherwise remain on an empty
+incremental path.
+
+The current opt-in candidate preserves the original zero-token behavior and additionally selects
+full initialization only when the root is ready, its identity is valid, cached identity is the
+sentinel, and both incremental active-size fields are zero. Those size fields are at builder
+`+0x243ff0` and `+0x244010`; their layouts are pointer/capacity/size.
+
+The resource check at guest `+0x8b7bc0` is a required retry boundary. A `0xffff` slot returns before
+table reset or cached-identity mutation, and cached identity commits only at `+0x8b8113`. A previous
+forced experiment bypassed this check and admitted incomplete state; that result must not be used
+as evidence for the guarded candidate.
+
+Forced full initialization enumerated the large root, but downstream model/output records still
+stalled. The next trace should capture the first real resource rejection and follow its writer. The
+CPU model/output builder may be a second blocker after cache admission.
+
+### Readiness and false leads
+
+The focused scene-ready handoff at guest `+0x9ab22e` is a strict writer-equivalent case, separate
+from the cache bootstrap. It recorded `repaired=0` in the relevant run, so it was inert there.
+
+The byte near guest `+0x8b9867` is a C++ local-static guard using `__cxa_guard_acquire/release`, not
+a renderer-enable flag. It must not be forced.
+
+These findings move guest-wave `DS_ORDERED_COUNT` semantics from the immediate producer blocker to
+a later unresolved stage. Wave identity, release, and done still need a real implementation once
+the large root publishes CPU records.
+
 ## Correction to the August 17 conclusion
 
 The August 17 snapshot described full-screen 3D rendering at 30 FPS as confirmed. Later repeated
@@ -157,8 +224,12 @@ evidence.
 
 ## Highest-value next implementation
 
-Preserve M0 low-bit logical-wave data through IR and implement ordered-count release/done behavior
-in guest wave order. Validate it against one fixed scene using command contents and visible output,
+Trace the first resource rejection at guest `+0x8b7bc0` while preserving its original exit. Follow
+that resource's object/writer provenance, then verify cache commit, large-root enumeration, model
+output, and paired-record publication. Only after the large root reaches traversal should work
+resume on M0 logical-wave data and ordered-count release/done behavior.
+
+Validate against one fixed scene using producer provenance, command contents, and visible output,
 not only command counts. A candidate passes only if:
 
 1. tweak panels remain visible;
