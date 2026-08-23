@@ -4,7 +4,7 @@
 
 - Title: `Dreams`
 - Serial/version tested: `CUSA04301` / `01.00`
-- Status date: August 21, 2026
+- Status date: August 22, 2026
 - Playability: **not playable**
 - Cumulative patch base: `555c458c9fdd33cb4686492374519c7bb112a891`
 - Source checkpoint commit: `40c0731d78272e727adc3af2072733395db4e8ad`
@@ -39,6 +39,11 @@ Executable hashes identify local test artifacts only; binaries are not distribut
 
 ## Current pipeline conclusion
 
+The August 22 A/B identifies a second, later fault in sculpt-volume writer `0x84aa3dc9`: a
+leader-only atomic result is broadcast immediately after divergent control flow. Adding a subgroup
+barrier at that handoff improves tutorial/homespace geometry, but makes edit mode unusably slow.
+The fast default and slow visual comparison are both preserved; neither is a final fix.
+
 The malformed cubes are not evidence that a solid mesh path is required. Dreams should render a
 coherent fleck/surface cube. The cubes were caused by treating the `DS_ORDERED_COUNT` M0 dword base
 as bytes and dividing the combined address. The corrected formula preserves M0 and divides only
@@ -62,6 +67,8 @@ remains incomplete and should be revisited after large-root CPU records exist.
 | Correct ordered base | Corrupted cubes gone; sculpt can be invisible | Necessary correction, not sufficient |
 | Forced full cache init | Large root enumerates; output records still stall | Downstream CPU construction remains |
 | Conditional bootstrap | Builds and preserves safe resource rejection | Clean visual/result A/B still required |
+| Sculpt leader barrier off | Faster current baseline | Geometry remains malformed/incomplete |
+| Sculpt leader barrier on | Better tutorial/homespace geometry; edit mode too slow | Confirms handoff fault; implementation is too expensive |
 
 ## Performance observations
 

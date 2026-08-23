@@ -1,6 +1,7 @@
 # Continue Development
 
-Read [HANDOFF_20260821.md](HANDOFF_20260821.md) first. It records the exact corrected and corrupted
+Read [HANDOFF_20260822.md](HANDOFF_20260822.md) first, then
+[HANDOFF_20260821.md](HANDOFF_20260821.md). They record the sculpt-volume handoff A/B, corrected and corrupted
 ordered-base states, the CPU scene-cache invariant, unsafe experiments to avoid, and the next
 focused trace.
 
@@ -32,6 +33,12 @@ git submodule update --init --recursive
 git -C externals/sirit apply --check ../../patches/sirit-group-nonuniform-shuffle-20260821.patch
 git -C externals/sirit apply ../../patches/sirit-group-nonuniform-shuffle-20260821.patch
 ```
+
+For the complete August 22 checkpoint, use
+`patches/dreams-focused-20260822-sculpt-barrier-ab.patch` instead of the August 21 cumulative patch.
+It contains both sculpt-volume modes. The fast path is default; the slow visual comparison uses
+`SHADPS4_DREAMS_SCULPT_LEADER_BARRIER=1` and requires clearing cached shader
+`0x0000000084aa3dc9_0.spv` whenever toggled.
 
 Verified SHA-256 values:
 

@@ -2,7 +2,7 @@
 
 This repository tracks source-level work on `Dreams` (`CUSA04301`) in `shadPS4`.
 
-## Current status — August 21, 2026
+## Current status — August 22, 2026
 
 - **Not playable. Sculpt/fleck rendering is not fixed.**
 - Startup can reach offline menus, tutorial logic, DreamShaping, creation scenes, edit mode, and
@@ -13,6 +13,13 @@ This repository tracks source-level work on `Dreams` (`CUSA04301`) in `shadPS4`.
 - The target is Dreams' coherent fleck/surface cube, not an ordinary opaque mesh cube.
 
 ## Latest concrete result
+
+The newest A/B localizes a producer-side lane-handoff problem in sculpt-volume writer
+`0x84aa3dc9`. An opt-in subgroup barrier improves tutorial/homespace geometry but makes edit mode
+too slow. The repository retains both the fast default and the visually improved slow comparison;
+see [HANDOFF_20260822.md](HANDOFF_20260822.md). This is localization evidence, not a complete fix.
+
+The earlier ordered-address result remains valid:
 
 The corrupted cubes were traced to a wrong `DS_ORDERED_COUNT` address calculation. M0's high field
 is already a dword base; only the byte-encoded `OFFSET0` selector is divided by four:
@@ -61,6 +68,7 @@ not distribute executables.
 
 ## Repository contents
 
+- [HANDOFF_20260822.md](HANDOFF_20260822.md): sculpt-volume lane-handoff A/B and next target
 - [HANDOFF_20260821.md](HANDOFF_20260821.md): complete August 21 evidence and continuation order
 - [STATUS.md](STATUS.md): exact user-visible and build status
 - [DISCOVERIES.md](DISCOVERIES.md): evidence, shader IDs, and technical conclusions
@@ -69,6 +77,8 @@ not distribute executables.
 - [REPRO.md](REPRO.md): reproduction and diagnostic procedure
 - [DEVELOPMENT.md](DEVELOPMENT.md): clone, patch, and build handoff
 - `patches/dreams-focused-20260821-sculpt-handoff.patch`: cumulative experimental source patch
+- `patches/dreams-focused-20260822-sculpt-barrier-ab.patch`: latest cumulative patch with both
+  sculpt-volume modes
 - `patches/sirit-group-nonuniform-shuffle-20260821.patch`: required Sirit dependency patch
 
 ## Development snapshot
@@ -83,6 +93,9 @@ The cumulative patch applies to upstream commit
 ```text
 dreams-focused-20260821-sculpt-handoff.patch
 SHA-256: 43B4407F010D9E34930C035A2C0D15D6D626157B30D6593B2AD9D020D33249B8
+
+dreams-focused-20260822-sculpt-barrier-ab.patch
+SHA-256: 043C65CA801CB3CD053A200C9295485BC6CA69ED86C1E08FFEC70CF6D8E7ED15
 
 sirit-group-nonuniform-shuffle-20260821.patch
 SHA-256: F9DBF0B7C8BD4F43EC2104D576C238195F69178082C53C76E55E4C4F5E9C0D06
