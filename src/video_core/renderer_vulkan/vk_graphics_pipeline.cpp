@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -47,7 +48,8 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    std::span<const std::span<const u32>> dreams_diagnostic_spirv)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     const vk::Device device = instance.GetDevice();
@@ -423,6 +425,50 @@ GraphicsPipeline::GraphicsPipeline(
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+
+    constexpr u64 DreamsSculptFragmentShader = 0xce3b8413;
+    const auto* vertex_info = infos[u32(Shader::LogicalStage::Vertex)];
+    const auto* fragment_info = infos[u32(Shader::LogicalStage::Fragment)];
+    if (!preloading && Shader::DreamsCompat::CaptureVs370Interface() && vertex_info != nullptr &&
+        fragment_info != nullptr &&
+        vertex_info->pgm_hash == Shader::DreamsCompat::Vs370InterfaceCaptureShader &&
+        fragment_info->pgm_hash == DreamsSculptFragmentShader) {
+        constexpr u32 VertexStage = u32(Shader::LogicalStage::Vertex);
+        constexpr u32 FragmentStage = u32(Shader::LogicalStage::Fragment);
+        ASSERT_MSG(dreams_diagnostic_spirv.size() == MaxShaderStages &&
+                       !dreams_diagnostic_spirv[VertexStage].empty() &&
+                       !dreams_diagnostic_spirv[FragmentStage].empty(),
+                   "Exact effective SPIR-V is unavailable for the Dreams VS370 fresh-module "
+                   "diagnostic");
+        ASSERT_MSG(shader_stages.size() == 2 &&
+                       shader_stages[0].stage == vk::ShaderStageFlagBits::eVertex &&
+                       shader_stages[1].stage == vk::ShaderStageFlagBits::eFragment,
+                   "Unexpected stage set for the Dreams VS370 fresh-module diagnostic");
+
+        const vk::ShaderModule fresh_vertex_module =
+            CompileSPV(dreams_diagnostic_spirv[VertexStage], device);
+        const vk::ShaderModule fresh_fragment_module =
+            CompileSPV(dreams_diagnostic_spirv[FragmentStage], device);
+        ASSERT_MSG(fresh_vertex_module != modules[VertexStage] &&
+                       fresh_fragment_module != modules[FragmentStage],
+                   "Dreams VS370 fresh-module diagnostic did not receive new module handles");
+
+        // Keep every authoritative live create-info field and pointer unchanged. The prior
+        // empty-cache test already ruled out a fresh pipeline handle; only these two module handles
+        // differ in this rung.
+        shader_stages[0].module = fresh_vertex_module;
+        shader_stages[1].module = fresh_fragment_module;
+        auto [fresh_result, fresh_pipeline] =
+            device.createGraphicsPipelineUnique(vk::PipelineCache{}, pipeline_info);
+        device.destroyShaderModule(fresh_vertex_module);
+        device.destroyShaderModule(fresh_fragment_module);
+        ASSERT_MSG(fresh_result == vk::Result::eSuccess,
+                   "Failed to create fresh-module Dreams VS370 diagnostic pipeline: {}",
+                   vk::to_string(fresh_result));
+        dreams_vs370_fresh_pipeline = std::move(fresh_pipeline);
+        SetObjectName(device, *dreams_vs370_fresh_pipeline,
+                      "Dreams VS370 Fresh-Module Empty-Cache Diagnostic Pipeline {}", debug_str);
+    }
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;

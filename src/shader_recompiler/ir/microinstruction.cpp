@@ -86,6 +86,7 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::DataAppend:
     case Opcode::DataConsume:
     case Opcode::DataOrderedCount:
+    case Opcode::DreamsSculptCheckpoint:
     case Opcode::WriteSharedU16:
     case Opcode::WriteSharedU32:
     case Opcode::WriteSharedU64:

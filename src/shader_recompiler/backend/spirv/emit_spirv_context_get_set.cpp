@@ -5,11 +5,14 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/patch.h"
 #include "shader_recompiler/runtime_info.h"
 
 #include <magic_enum/magic_enum.hpp>
+
+#include <ranges>
 
 namespace Shader::Backend::SPIRV {
 
@@ -46,6 +49,20 @@ static std::pair<Id, bool> OutputAttrComponentType(EmitContext& ctx, IR::Attribu
 }
 
 Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
+    if (ctx.l_stage == LogicalStage::Vertex && ctx.runtime_info.is_indirect_draw) {
+        const auto matches_sgpr = [reg](s8 sgpr) {
+            return sgpr >= 0 && u32(reg) == static_cast<u32>(sgpr);
+        };
+        // The indirect packet writes START_INST_LOC after BASE_VTX_LOC. Preserve that
+        // last-write precedence if malformed state assigns both values to one SGPR.
+        if (matches_sgpr(ctx.runtime_info.indirect_start_instance_sgpr)) {
+            return ctx.OpLoad(ctx.U32[1], ctx.base_instance);
+        }
+        if (matches_sgpr(ctx.runtime_info.indirect_base_vertex_sgpr)) {
+            return ctx.OpLoad(ctx.U32[1], ctx.base_vertex);
+        }
+    }
+
     const u32 index = ctx.binding.user_data + ctx.info.ud_mask.Index(reg);
     const u32 half = PushData::UdRegsIndex + (index >> 2);
     const Id ud_ptr{ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
@@ -58,16 +75,77 @@ Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
 
 Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     const u32 flatbuf_off_dw = inst->Flags<u32>();
+    Id result{};
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled() && flatbuf_off_dw != 0) {
-        return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
-    }
-    // We can only provide a fallback for immediate offsets.
-    if (flatbuf_off_dw == 0) {
-        return ctx.OpFunctionCall(ctx.U32[1], ctx.read_const_dynamic, addr, offset);
+        result = ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
+    } else if (flatbuf_off_dw == 0) {
+        // We can only provide a fallback for immediate offsets.
+        result = ctx.OpFunctionCall(ctx.U32[1], ctx.read_const_dynamic, addr, offset);
     } else {
-        return ctx.OpFunctionCall(ctx.U32[1], ctx.read_const, addr, offset,
-                                  ctx.ConstU32(flatbuf_off_dw));
+        result = ctx.OpFunctionCall(ctx.U32[1], ctx.read_const, addr, offset,
+                                    ctx.ConstU32(flatbuf_off_dw));
     }
+
+    if (DreamsCompat::CaptureCe3ReadConst() &&
+        ctx.info.pgm_hash == DreamsCompat::Ce3ReadConstCaptureShader &&
+        ctx.stage == Stage::Fragment && ctx.l_stage == LogicalStage::Fragment &&
+        flatbuf_off_dw == 0) {
+        const u32 ordinal = ctx.dreams_ce3_readconst_capture_ordinal++;
+        if (ordinal < DreamsCompat::Ce3ReadConstCaptureDynamicReads) {
+            const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                               &EmitContext::BufferDefinition::buffer_type);
+            ASSERT_MSG(gds != ctx.buffers.end(), "ce3 ReadConst capture has no GDS descriptor");
+            const auto [buffer_id, pointer_type] = gds->Alias(PointerType::U32);
+            const auto pointer = [&](Id index) {
+                return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+            };
+
+            const Id arm = ctx.OpLoad(
+                ctx.U32[1], pointer(ctx.ConstU32(DreamsCompat::Ce3ReadConstCaptureArmDword)));
+            const Id subgroup_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Subgroup));
+            const Id active_mask =
+                ctx.OpGroupNonUniformBallot(ctx.U32[4], subgroup_scope, ctx.true_value);
+            const Id first_active =
+                ctx.OpGroupNonUniformBallotFindLSB(ctx.U32[1], subgroup_scope, active_mask);
+            const Id lane = ctx.OpLoad(ctx.U32[1], ctx.subgroup_local_invocation_id);
+            const Id armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+            const Id is_leader = ctx.OpIEqual(ctx.U1[1], lane, first_active);
+            const Id should_capture = ctx.OpLogicalAnd(ctx.U1[1], armed, is_leader);
+            const Id capture_label = ctx.OpLabel();
+            const Id merge_label = ctx.OpLabel();
+            ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+            ctx.OpBranchConditional(should_capture, capture_label, merge_label);
+
+            ctx.AddLabel(capture_label);
+            const Id tuple_base = ctx.ConstU32(
+                DreamsCompat::Ce3ReadConstCaptureTupleBaseDword +
+                ordinal * DreamsCompat::Ce3ReadConstCaptureTupleDwords);
+            const Id base_lo = ctx.OpCompositeExtract(ctx.U32[1], addr, 0);
+            const Id base_hi = ctx.OpCompositeExtract(ctx.U32[1], addr, 1);
+            const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+            const auto memory_semantics = spv::MemorySemanticsMask::AcquireRelease |
+                                          spv::MemorySemanticsMask::UniformMemory;
+            const Id semantics = ctx.ConstU32(static_cast<u32>(memory_semantics));
+            const auto store = [&](u32 lane_index, Id value) {
+                ctx.OpAtomicExchange(ctx.U32[1],
+                                     pointer(ctx.OpIAdd(ctx.U32[1], tuple_base,
+                                                       ctx.ConstU32(lane_index))),
+                                     device_scope, semantics, value);
+            };
+            store(0, offset);
+            store(1, result);
+            store(2, base_lo);
+            store(3, base_hi);
+            ctx.OpAtomicOr(
+                ctx.U32[1],
+                pointer(ctx.ConstU32(DreamsCompat::Ce3ReadConstCaptureSeenDword)), device_scope,
+                semantics, ctx.ConstU32(1U << ordinal));
+            ctx.OpBranch(merge_label);
+            ctx.AddLabel(merge_label);
+        }
+    }
+
+    return result;
 }
 
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
@@ -151,10 +229,20 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
 
 Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
     switch (attr) {
-    case IR::Attribute::VertexId:
-        return ctx.OpLoad(ctx.U32[1], ctx.vertex_index);
-    case IR::Attribute::InstanceId:
-        return ctx.OpLoad(ctx.U32[1], ctx.instance_id);
+    case IR::Attribute::VertexId: {
+        const Id vertex_id = ctx.OpLoad(ctx.U32[1], ctx.vertex_index);
+        return ctx.runtime_info.is_indirect_draw
+                   ? ctx.OpISub(ctx.U32[1], vertex_id,
+                                ctx.OpLoad(ctx.U32[1], ctx.base_vertex))
+                   : vertex_id;
+    }
+    case IR::Attribute::InstanceId: {
+        const Id instance_id = ctx.OpLoad(ctx.U32[1], ctx.instance_id);
+        return ctx.runtime_info.is_indirect_draw
+                   ? ctx.OpISub(ctx.U32[1], instance_id,
+                                ctx.OpLoad(ctx.U32[1], ctx.base_instance))
+                   : instance_id;
+    }
     case IR::Attribute::WorkgroupIndex:
         return ctx.workgroup_index_id;
     case IR::Attribute::WorkgroupId:
@@ -199,6 +287,94 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
     }
 }
 
+static void EmitVs370InterfaceCapture(EmitContext& ctx, IR::Attribute attr, Id value,
+                                      u32 element) {
+    if (!DreamsCompat::CaptureVs370Interface() ||
+        ctx.info.pgm_hash != DreamsCompat::Vs370InterfaceCaptureShader ||
+        ctx.stage != Stage::Vertex || ctx.l_stage != LogicalStage::Vertex) {
+        return;
+    }
+    const bool is_layer = attr == IR::Attribute::RenderTargetIndex;
+    u32 attribute{};
+    if (attr == IR::Attribute::Position0) {
+        attribute = 0;
+    } else if (attr >= IR::Attribute::Param0 && attr <= IR::Attribute::Param2) {
+        attribute = 1 + u32(attr) - u32(IR::Attribute::Param0);
+    } else if (is_layer) {
+        attribute = DreamsCompat::Vs370InterfaceCaptureAttributes;
+    } else {
+        return;
+    }
+    ASSERT(element < (is_layer ? 1U : DreamsCompat::Vs370InterfaceCaptureComponents));
+
+    const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                       &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds != ctx.buffers.end(), "VS370 interface capture has no GDS descriptor");
+    const auto [buffer_id, pointer_type] = gds->Alias(PointerType::U32);
+
+    const auto pointer = [&](Id index) {
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+    };
+    const Id arm = ctx.OpLoad(
+        ctx.U32[1], pointer(ctx.ConstU32(DreamsCompat::Vs370InterfaceCaptureArmDword)));
+    const Id instance = ctx.OpLoad(ctx.U32[1], ctx.instance_id);
+    const Id vertex = ctx.OpLoad(ctx.U32[1], ctx.vertex_index);
+    const Id is_armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+    const Id is_instance_captured = ctx.OpULessThan(ctx.U1[1], instance, arm);
+    const Id is_vertex_captured = ctx.OpULessThan(
+        ctx.U1[1], vertex, ctx.ConstU32(DreamsCompat::Vs370InterfaceCaptureVertices));
+    const Id should_capture =
+        ctx.OpLogicalAnd(ctx.U1[1], ctx.OpLogicalAnd(ctx.U1[1], is_armed, is_instance_captured),
+                         is_vertex_captured);
+
+    const Id capture_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(should_capture, capture_label, merge_label);
+
+    ctx.AddLabel(capture_label);
+    const Id lane = ctx.ConstU32(is_layer ? 16U
+                                         : attribute *
+                                                   DreamsCompat::Vs370InterfaceCaptureComponents +
+                                               element);
+    const Id instance_offset =
+        ctx.OpShiftLeftLogical(ctx.U32[1], instance, ctx.ConstU32(u32{7}));
+    const Id vertex_offset =
+        ctx.OpShiftLeftLogical(ctx.U32[1], vertex, ctx.ConstU32(u32{4}));
+    Id payload_index{};
+    if (is_layer) {
+        const Id layer_slot = ctx.OpIAdd(
+            ctx.U32[1],
+            ctx.OpShiftLeftLogical(ctx.U32[1], instance, ctx.ConstU32(u32{3})), vertex);
+        payload_index = ctx.OpIAdd(
+            ctx.U32[1], ctx.ConstU32(DreamsCompat::Vs370InterfaceCaptureLayerBaseDword),
+            layer_slot);
+    } else {
+        const Id slot = ctx.OpIAdd(
+            ctx.U32[1], ctx.OpIAdd(ctx.U32[1], instance_offset, vertex_offset), lane);
+        payload_index = ctx.OpIAdd(
+            ctx.U32[1], ctx.ConstU32(DreamsCompat::Vs370InterfaceCaptureBaseDword), slot);
+    }
+    const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const auto memory_semantics = spv::MemorySemanticsMask::AcquireRelease |
+                                  spv::MemorySemanticsMask::UniformMemory;
+    const Id semantics = ctx.ConstU32(static_cast<u32>(memory_semantics));
+    ctx.OpAtomicExchange(ctx.U32[1], pointer(payload_index), device_scope, semantics,
+                         ctx.OpBitcast(ctx.U32[1], value));
+    const Id validity_slot = ctx.OpIAdd(
+        ctx.U32[1],
+        ctx.OpShiftLeftLogical(ctx.U32[1], instance, ctx.ConstU32(u32{3})), vertex);
+    const Id validity_index = ctx.OpIAdd(
+        ctx.U32[1], ctx.ConstU32(DreamsCompat::Vs370InterfaceCaptureValidityBaseDword),
+        validity_slot);
+    const Id validity_bit = ctx.OpShiftLeftLogical(ctx.U32[1], ctx.u32_one_value, lane);
+    ctx.OpAtomicOr(
+        ctx.U32[1], pointer(validity_index), device_scope, semantics, validity_bit);
+    ctx.OpBranch(merge_label);
+
+    ctx.AddLabel(merge_label);
+}
+
 void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 element) {
     const auto op_store = [&](Id pointer) {
         const auto [component_type, is_integer] = OutputAttrComponentType(ctx, attr);
@@ -212,18 +388,20 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
         const u32 attr_index{u32(attr) - u32(IR::Attribute::Param0)};
         if (ctx.stage == Stage::Local) {
             const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
-            return op_store(ctx.OpAccessChain(component_ptr, ctx.output_attr_array,
-                                              ctx.ConstU32(attr_index), ctx.ConstU32(element)));
+            op_store(ctx.OpAccessChain(component_ptr, ctx.output_attr_array,
+                                       ctx.ConstU32(attr_index), ctx.ConstU32(element)));
         } else {
             const auto& info{ctx.output_params.at(attr_index)};
             ASSERT(info.num_components > 0);
             if (info.num_components == 1) {
-                return op_store(info.id);
+                op_store(info.id);
             } else {
-                return op_store(
-                    ctx.OpAccessChain(info.pointer_type, info.id, ctx.ConstU32(element)));
+                op_store(ctx.OpAccessChain(info.pointer_type, info.id,
+                                           ctx.ConstU32(element)));
             }
         }
+        EmitVs370InterfaceCapture(ctx, attr, value, element);
+        return;
     }
     if (IR::IsMrt(attr)) {
         const u32 index{u32(attr) - u32(IR::Attribute::RenderTarget0)};
@@ -235,9 +413,12 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
         }
     }
     switch (attr) {
-    case IR::Attribute::Position0:
-        return op_store(
-            ctx.OpAccessChain(ctx.output_f32, ctx.output_position, ctx.ConstU32(element)));
+    case IR::Attribute::Position0: {
+        op_store(ctx.OpAccessChain(ctx.output_f32, ctx.output_position,
+                                   ctx.ConstU32(element)));
+        EmitVs370InterfaceCapture(ctx, attr, value, element);
+        return;
+    }
     case IR::Attribute::ClipDistance:
         return op_store(
             ctx.OpAccessChain(ctx.output_f32, ctx.clip_distances, ctx.ConstU32(element)));
@@ -247,7 +428,9 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     case IR::Attribute::PointSize:
         return op_store(ctx.output_point_size);
     case IR::Attribute::RenderTargetIndex:
-        return op_store(ctx.output_layer);
+        op_store(ctx.output_layer);
+        EmitVs370InterfaceCapture(ctx, attr, value, element);
+        return;
     case IR::Attribute::ViewportIndex:
         return op_store(ctx.output_viewport_index);
     case IR::Attribute::Depth:
@@ -413,21 +596,142 @@ Id EmitLoadBufferFormatF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id addr
     UNREACHABLE_MSG("SPIR-V instruction");
 }
 
+template <u32 N>
+static void EmitImageGather3DConsumerStoreCapture(
+    EmitContext& ctx, u32 site, u32 handle, BufferType buffer_type, Id raw_address,
+    Id resolved_address, const std::array<Id, 4>& values, const std::array<Id, 4>& pointers) {
+    namespace Capture = DreamsCompat::ImageGather3DConsumerCapture;
+    const bool is_target_consumer =
+        ctx.info.pgm_hash == 0x2f555c74 || ctx.info.pgm_hash == 0xf030fdc4;
+    if (!DreamsCompat::CaptureImageGather3D() || ctx.stage != Stage::Compute ||
+        ctx.l_stage != LogicalStage::Compute || !is_target_consumer ||
+        site >= Capture::MaxSites) {
+        return;
+    }
+
+    ASSERT_MSG(Sirit::ValidId(ctx.workgroup_id) && Sirit::ValidId(ctx.local_invocation_id),
+               "3D ImageGather consumer capture has no compute invocation IDs");
+    const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                       &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds != ctx.buffers.end(), "3D ImageGather consumer capture has no GDS descriptor");
+    const auto [gds_id, gds_pointer_type] = gds->Alias(PointerType::U32);
+    const auto gds_pointer = [&](Id index) {
+        return ctx.OpAccessChain(gds_pointer_type, gds_id, ctx.u32_zero_value, index);
+    };
+
+    namespace Gather = DreamsCompat::ImageGather3DCapture;
+    const Id arm =
+        ctx.OpLoad(ctx.U32[1], gds_pointer(ctx.ConstU32(Gather::ArmDword)));
+    const Id target_hash_lo =
+        ctx.OpLoad(ctx.U32[1], gds_pointer(ctx.ConstU32(Gather::TargetHashLoDword)));
+    const Id target_hash_hi =
+        ctx.OpLoad(ctx.U32[1], gds_pointer(ctx.ConstU32(Gather::TargetHashHiDword)));
+    const Id is_armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+    const Id hash_lo_matches = ctx.OpIEqual(
+        ctx.U1[1], target_hash_lo, ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash)));
+    const Id hash_hi_matches = ctx.OpIEqual(
+        ctx.U1[1], target_hash_hi, ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash >> 32)));
+    const Id should_capture = ctx.OpLogicalAnd(
+        ctx.U1[1], is_armed,
+        ctx.OpLogicalAnd(ctx.U1[1], hash_lo_matches, hash_hi_matches));
+
+    const Id claim_label = ctx.OpLabel();
+    const Id record_label = ctx.OpLabel();
+    const Id claim_done_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(should_capture, claim_label, merge_label);
+
+    const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const auto memory_semantics = spv::MemorySemanticsMask::AcquireRelease |
+                                  spv::MemorySemanticsMask::UniformMemory;
+    const Id semantics = ctx.ConstU32(static_cast<u32>(memory_semantics));
+    ctx.AddLabel(claim_label);
+    const Id record_index = ctx.OpAtomicIIncrement(
+        ctx.U32[1], gds_pointer(ctx.ConstU32(Capture::CounterDword(site))), device_scope,
+        semantics);
+    const Id has_capacity = ctx.OpULessThan(
+        ctx.U1[1], record_index, ctx.ConstU32(Capture::MaxRecordsPerSite));
+    ctx.OpSelectionMerge(claim_done_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(has_capacity, record_label, claim_done_label);
+
+    ctx.AddLabel(record_label);
+    const Id workgroup = ctx.OpLoad(ctx.U32[3], ctx.workgroup_id);
+    const Id local = ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id);
+    const Id record_base = ctx.OpIAdd(
+        ctx.U32[1],
+        ctx.ConstU32(Capture::RecordDword(site, 0, 0)),
+        ctx.OpIMul(ctx.U32[1], record_index, ctx.ConstU32(Capture::RecordDwords)));
+    const auto store = [&](u32 field, Id value) {
+        ctx.OpStore(gds_pointer(ctx.OpIAdd(ctx.U32[1], record_base, ctx.ConstU32(field))), value);
+    };
+    store(Capture::ShaderHashLo, ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash)));
+    store(Capture::ShaderHashHi, ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash >> 32)));
+    store(Capture::Site, ctx.ConstU32(site));
+    for (u32 axis = 0; axis < 3; ++axis) {
+        store(Capture::Workgroup + axis,
+              ctx.OpCompositeExtract(ctx.U32[1], workgroup, axis));
+        store(Capture::LocalInvocation + axis,
+              ctx.OpCompositeExtract(ctx.U32[1], local, axis));
+    }
+    store(Capture::Handle, ctx.ConstU32(handle));
+    store(Capture::Components, ctx.ConstU32(N));
+    store(Capture::RawAddress, raw_address);
+    store(Capture::ResolvedAddress, resolved_address);
+    Id match_mask = ctx.u32_zero_value;
+    for (u32 component = 0; component < 4; ++component) {
+        const Id input = component < N ? values[component] : ctx.u32_zero_value;
+        const Id reloaded = component < N ? ctx.OpLoad(ctx.U32[1], pointers[component])
+                                          : ctx.u32_zero_value;
+        store(Capture::InputValues + component, input);
+        store(Capture::ReloadedValues + component, reloaded);
+        if (component < N) {
+            const Id matches = ctx.OpIEqual(ctx.U1[1], input, reloaded);
+            match_mask = ctx.OpBitwiseOr(
+                ctx.U32[1], match_mask,
+                ctx.OpSelect(ctx.U32[1], matches, ctx.ConstU32(1U << component),
+                             ctx.u32_zero_value));
+        }
+    }
+    store(Capture::MatchMask, match_mask);
+    store(Capture::BufferType, ctx.ConstU32(static_cast<u32>(buffer_type)));
+    ctx.OpAtomicOr(ctx.U32[1], gds_pointer(ctx.ConstU32(Capture::SeenDword)), device_scope,
+                   semantics, ctx.ConstU32(1U << site));
+    ctx.OpBranch(claim_done_label);
+    ctx.AddLabel(claim_done_label);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 template <u32 N, PointerType alias>
 static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address,
-                                 Id value) {
+                                  Id value) {
     const auto& spv_buffer = ctx.buffers[handle];
+    const Id raw_address = address;
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
+    std::array<Id, 4> stored_values{ctx.u32_zero_value, ctx.u32_zero_value,
+                                    ctx.u32_zero_value, ctx.u32_zero_value};
+    std::array<Id, 4> stored_pointers{};
 
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
         const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         const Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);
         ctx.OpStore(ptr_i, value_i);
+        if constexpr (alias == PointerType::U32) {
+            stored_values[i] = value_i;
+            stored_pointers[i] = ptr_i;
+        }
+    }
+    if constexpr (alias == PointerType::U32) {
+        const u32 capture_site = ctx.dreams_image_gather_3d_consumer_store_ordinal++;
+        EmitImageGather3DConsumerStoreCapture<N>(
+            ctx, capture_site, handle, spv_buffer.buffer_type, raw_address, address, stored_values,
+            stored_pointers);
     }
 }
 

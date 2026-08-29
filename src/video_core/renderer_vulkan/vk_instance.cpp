@@ -5,6 +5,8 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
@@ -93,11 +95,24 @@ Instance::Instance(bool enable_validation, bool enable_crash_diagnostic)
                               enable_crash_diagnostic)},
       physical_devices{EnumeratePhysicalDevices(instance)} {}
 
+Instance::Instance(HeadlessDeviceTag, s32 physical_device_index, bool enable_validation,
+                   bool enable_crash_diagnostic)
+    : instance{CreateInstance(Frontend::WindowSystemType::Headless, enable_validation,
+                              enable_crash_diagnostic)},
+      physical_devices{EnumeratePhysicalDevices(instance)} {
+    InitializeDevice(physical_device_index, enable_validation, false);
+}
+
 Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                    bool enable_validation /*= false*/, bool enable_crash_diagnostic /*= false*/)
     : instance{CreateInstance(window.GetWindowInfo().type, enable_validation,
                               enable_crash_diagnostic)},
       physical_devices{EnumeratePhysicalDevices(instance)} {
+    InitializeDevice(physical_device_index, enable_validation, true);
+}
+
+void Instance::InitializeDevice(s32 physical_device_index, bool enable_validation,
+                                bool enable_presentation) {
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
     }
@@ -163,15 +178,27 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
-    CreateDevice();
+    CreateDevice(enable_presentation);
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
 
 Instance::~Instance() {
-    ImGui::Core::Shutdown(GetDevice());
-    vmaDestroyAllocator(allocator);
+    if (device) {
+        if (ImGui::GetCurrentContext() != nullptr) {
+            ImGui::Core::Shutdown(*device);
+        } else {
+            const auto idle_result = device->waitIdle();
+            if (idle_result != vk::Result::eSuccess) {
+                LOG_WARNING(Render_Vulkan, "Failed to wait for headless Vulkan device: {}",
+                            vk::to_string(idle_result));
+            }
+        }
+    }
+    if (allocator != nullptr) {
+        vmaDestroyAllocator(allocator);
+    }
 }
 
 std::string Instance::GetDriverVersionName() {
@@ -193,7 +220,7 @@ std::string Instance::GetDriverVersionName() {
     return GetReadableVersion(version);
 }
 
-bool Instance::CreateDevice() {
+bool Instance::CreateDevice(bool enable_presentation) {
     const vk::StructureChain feature_chain =
         physical_device
             .getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
@@ -238,8 +265,10 @@ bool Instance::CreateDevice() {
     };
 
     // Required
-    ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (enable_presentation) {
+        ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
+                   "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    }
     ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME),
@@ -288,11 +317,22 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- primitiveTopologyPatchListRestart: {}",
                  list_restart_features.primitiveTopologyPatchListRestart);
     }
-    amd_shader_explicit_vertex_parameter =
+    const bool force_khr_barycentric = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_FORCE_KHR_BARYCENTRIC");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    const bool amd_explicit_vertex_parameter_available =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
-    if (!amd_shader_explicit_vertex_parameter) {
+    amd_shader_explicit_vertex_parameter =
+        amd_explicit_vertex_parameter_available && !force_khr_barycentric;
+    if (force_khr_barycentric || !amd_explicit_vertex_parameter_available) {
         fragment_shader_barycentric =
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    }
+    if (force_khr_barycentric) {
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams diagnostic: forcing KHR fragment barycentrics (supported={})",
+                    fragment_shader_barycentric);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);

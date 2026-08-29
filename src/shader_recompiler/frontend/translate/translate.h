@@ -26,7 +26,14 @@ enum class ConditionOp : u32 {
     LT,
     LE,
     TRU,
+    O,
     U,
+    NGE,
+    NLG,
+    NGT,
+    NLE,
+    NEQ,
+    NLT,
 };
 
 enum class AtomicOp : u32 {

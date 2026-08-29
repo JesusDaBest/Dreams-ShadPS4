@@ -175,7 +175,9 @@ public:
 
     [[nodiscard]] U32 DataAppend(const U32& counter);
     [[nodiscard]] U32 DataConsume(const U32& counter);
-    [[nodiscard]] U32 DataOrderedCount(const U32& counter, const U32& value, u32 op);
+    [[nodiscard]] U32 DataOrderedCount(const U32& counter, const U32& value,
+                                       const U32& ordered_token, u32 op);
+    void DreamsSculptCheckpoint(const Value& state0, const Value& state1, const U1& exec);
     [[nodiscard]] U32 LaneId();
     [[nodiscard]] U32 WarpId();
     [[nodiscard]] U32 QuadShuffle(const U32& value, const U32& index);

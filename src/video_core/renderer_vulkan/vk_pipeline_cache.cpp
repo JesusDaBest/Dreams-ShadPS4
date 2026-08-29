@@ -14,6 +14,7 @@
 #include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
+#include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
@@ -30,14 +31,65 @@ using Shader::Output;
 using Shader::Stage;
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
+constexpr static u64 IndirectVertexProgramDomain = 0x494e445244524157ULL; // "INDRDRAW"
 
-static bool ForceDreamsLdsMemoryBarrier(u64 hash) {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("SHADPS4_DREAMS_48A_LDS_BARRIER");
-        return value != nullptr && value[0] == '1' && value[1] == '\0';
-    }();
-    return enabled && Shader::DreamsCompat::NeedsDreamsLdsBarrier(hash) &&
-           Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+ProgramCacheKey::ProgramCacheKey(u64 pgm_hash_, Shader::Stage stage_, Shader::LogicalStage l_stage,
+                                 const Shader::RuntimeInfo& runtime_info)
+    : pgm_hash{pgm_hash_} {
+    if (l_stage != Shader::LogicalStage::Vertex || !runtime_info.is_indirect_draw) {
+        return;
+    }
+    stage = stage_;
+    indirect_base_vertex_sgpr = runtime_info.indirect_base_vertex_sgpr;
+    indirect_start_instance_sgpr = runtime_info.indirect_start_instance_sgpr;
+    is_indirect_vertex = true;
+}
+
+u64 ProgramCacheKey::CacheHash() const noexcept {
+    if (!is_indirect_vertex) {
+        return pgm_hash;
+    }
+    u64 draw_identity = HashCombine(IndirectVertexProgramDomain, static_cast<u64>(stage));
+    draw_identity = HashCombine(draw_identity,
+                                static_cast<u64>(static_cast<s32>(indirect_base_vertex_sgpr) + 1));
+    draw_identity = HashCombine(
+        draw_identity, static_cast<u64>(static_cast<s32>(indirect_start_instance_sgpr) + 1));
+    return HashCombine(pgm_hash, draw_identity);
+}
+
+static s8 DecodeIndirectUserDataSgpr(u32 location, Stage stage) {
+    if (location == 0) {
+        return -1;
+    }
+
+    u32 stage_base{};
+    switch (stage) {
+    case Stage::Vertex:
+        stage_base = 0x4c;
+        break;
+    case Stage::Export:
+        stage_base = 0xcc;
+        break;
+    case Stage::Local:
+        stage_base = 0x14c;
+        break;
+    default:
+        return -1;
+    }
+
+    if (location < stage_base || location >= stage_base + Shader::NUM_USER_DATA_REGS) {
+        return -1;
+    }
+    return static_cast<s8>(location - stage_base);
+}
+
+static bool RequiresDreamsWave64LdsSynchronization(u64 hash) {
+    // These shaders use LDS as wave64 scratch and then consume values written by other lanes.
+    // Liverpool executes that exchange as one wave64. A Vulkan implementation may execute the
+    // emulated wave in narrower hardware subgroups, so the inter-lane LDS dependency must be made
+    // explicit. This is required guest synchronization, not an optional diagnostic.
+    return Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+           Shader::DreamsCompat::NeedsDreamsLdsBarrier(hash);
 }
 
 constexpr static std::array DescriptorHeapSizes = {
@@ -99,7 +151,8 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
-const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalStage l_stage) {
+const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(
+    Stage stage, LogicalStage l_stage, const IndirectDrawParameters* indirect_draw) {
     auto& info = runtime_infos[u32(l_stage)];
     const auto& regs = liverpool->regs;
     const auto BuildCommon = [&](const auto& program) {
@@ -112,6 +165,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         info.fp_round_mode16_64 = program.settings.fp_round_mode64;
     };
     info.Initialize(stage);
+    if (l_stage == LogicalStage::Vertex && indirect_draw != nullptr) {
+        info.is_indirect_draw = true;
+        info.indirect_base_vertex_sgpr =
+            DecodeIndirectUserDataSgpr(indirect_draw->base_vertex_location, stage);
+        info.indirect_start_instance_sgpr =
+            DecodeIndirectUserDataSgpr(indirect_draw->start_instance_location, stage);
+    }
     switch (stage) {
     case Stage::Local: {
         BuildCommon(regs.ls_program);
@@ -341,8 +401,18 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() = default;
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
-    if (!RefreshGraphicsKey()) {
+std::vector<u8> PipelineCache::GetVulkanPipelineCacheData() const {
+    auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (result != vk::Result::eSuccess) {
+        LOG_ERROR(Render_Vulkan, "Failed to read Vulkan pipeline cache: {}", vk::to_string(result));
+        return {};
+    }
+    return data;
+}
+
+const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
+    const IndirectDrawParameters* indirect_draw) {
+    if (!RefreshGraphicsKey(indirect_draw)) {
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -350,12 +420,38 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        constexpr size_t VertexStage = static_cast<size_t>(Shader::LogicalStage::Vertex);
+        constexpr size_t FragmentStage = static_cast<size_t>(Shader::LogicalStage::Fragment);
+        constexpr u64 DreamsSculptFragmentShader = 0xce3b8413;
+        const bool dreams_vs370_capture_pipeline =
+            Shader::DreamsCompat::CaptureVs370Interface() && infos[VertexStage] != nullptr &&
+            infos[VertexStage]->pgm_hash == Shader::DreamsCompat::Vs370InterfaceCaptureShader;
+        const bool dreams_vs370_fresh_module_pipeline =
+            dreams_vs370_capture_pipeline && infos[FragmentStage] != nullptr &&
+            infos[FragmentStage]->pgm_hash == DreamsSculptFragmentShader;
+        const bool dreams_ce3_capture_pipeline =
+            (Shader::DreamsCompat::CaptureCe3ReadConst() ||
+             Shader::DreamsCompat::CaptureCe3FleckTrace()) &&
+            infos[FragmentStage] != nullptr &&
+            infos[FragmentStage]->pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader;
+
+        std::array<std::span<const u32>, MaxShaderStages> dreams_diagnostic_spirv{};
+        if (dreams_vs370_fresh_module_pipeline) {
+            dreams_diagnostic_spirv[VertexStage] =
+                GetCurrentShaderSpirv(Shader::LogicalStage::Vertex);
+            dreams_diagnostic_spirv[FragmentStage] =
+                GetCurrentShaderSpirv(Shader::LogicalStage::Fragment);
+        }
+
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+            runtime_infos, fetch_shader, modules, sdata, false,
+            std::span<const std::span<const u32>>{dreams_diagnostic_spirv});
 
-        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+        if (!dreams_vs370_capture_pipeline && !dreams_ce3_capture_pipeline) {
+            RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+        }
         ++num_new_pipelines;
 
         if (EmulatorSettings.IsShaderCollect()) {
@@ -395,7 +491,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
-bool PipelineCache::RefreshGraphicsKey() {
+bool PipelineCache::RefreshGraphicsKey(const IndirectDrawParameters* indirect_draw) {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -441,7 +537,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
-    if (!RefreshGraphicsStages()) {
+    if (!RefreshGraphicsStages(indirect_draw)) {
         return false;
     }
 
@@ -488,7 +584,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
-bool PipelineCache::RefreshGraphicsStages() {
+bool PipelineCache::RefreshGraphicsStages(const IndirectDrawParameters* indirect_draw) {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
     fetch_shader = std::nullopt;
@@ -514,7 +610,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
+            GetProgram(stage_in, stage_out, params, binding, indirect_draw);
         if (fetch_shader_) {
             fetch_shader = fetch_shader_;
         }
@@ -623,10 +719,11 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code,
                                               const std::span<const u32>& code_data,
-                                              size_t perm_idx, Shader::Backend::Bindings& binding) {
+                                              const ProgramCacheKey& program_key, size_t perm_idx,
+                                              Shader::Backend::Bindings& binding) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
-    DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");
+    DumpShader(code, program_key, info.stage, perm_idx, "bin");
 
     if (info.pgm_hash == 0x7ba4de5d &&
         std::getenv("SHADPS4_DREAMS_GATHER_INFLATE_LDS") != nullptr) {
@@ -636,26 +733,47 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     }
 
     auto shader_profile = profile;
-    if (ForceDreamsLdsMemoryBarrier(info.pgm_hash)) {
+    if (RequiresDreamsWave64LdsSynchronization(info.pgm_hash)) {
         shader_profile.needs_lds_barriers = true;
-        LOG_WARNING(Render_Vulkan, "Dreams diagnostic: forcing LDS memory barrier for shader {:#x}",
-                    info.pgm_hash);
+        LOG_INFO(Render_Vulkan, "Dreams wave64 LDS synchronization enabled for shader {:#x}",
+                 info.pgm_hash);
     }
     const auto ir_program =
         Shader::TranslateProgram(code, code_data, pools, info, runtime_info, shader_profile);
-    auto spv =
-        Shader::Backend::SPIRV::EmitSPIRV(shader_profile, runtime_info, ir_program, binding);
-    DumpShader(spv, info.pgm_hash, info.stage, perm_idx, "spv");
+    auto spv = Shader::Backend::SPIRV::EmitSPIRV(shader_profile, runtime_info, ir_program, binding);
+    DumpShader(spv, program_key, info.stage, perm_idx, "spv");
 
     vk::ShaderModule module;
 
-    auto patch = GetShaderPatch(info.pgm_hash, info.stage, perm_idx, "spv");
+    auto patch = GetShaderPatch(program_key, info.stage, perm_idx, "spv");
     const bool dreams_sprite_patch = std::getenv("SHADPS4_DREAMS_SPRITE_SHADER_PATCH") &&
-                                      Shader::DreamsCompat::IsSpriteCullShader(info.pgm_hash);
-    const bool dreams_gather_patch = std::getenv("SHADPS4_DREAMS_GATHER_SHADER_PATCH") &&
-                                     info.pgm_hash == 0x7ba4de5d;
+                                     Shader::DreamsCompat::IsSpriteCullShader(info.pgm_hash);
+    const bool dreams_gather_patch =
+        std::getenv("SHADPS4_DREAMS_GATHER_SHADER_PATCH") && info.pgm_hash == 0x7ba4de5d;
+    const bool dreams_vs370_capture =
+        Shader::DreamsCompat::CaptureVs370Interface() &&
+        info.pgm_hash == Shader::DreamsCompat::Vs370InterfaceCaptureShader &&
+        info.stage == Shader::Stage::Vertex;
+    const bool dreams_ce3_readconst_capture =
+        (Shader::DreamsCompat::CaptureCe3ReadConst() ||
+         Shader::DreamsCompat::CaptureCe3FleckTrace()) &&
+        info.pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader &&
+        info.stage == Shader::Stage::Fragment;
+    const bool dreams_image_gather_3d_capture = Shader::DreamsCompat::CaptureImageGather3D() &&
+                                                info.stage == Shader::Stage::Compute &&
+                                                info.has_image_gather;
+    const bool dreams_ordered_specialized =
+        Shader::DreamsCompat::UsesExactOrderedCountReplay(info.pgm_hash);
     const bool is_patched =
-        patch && (EmulatorSettings.IsPatchShaders() || dreams_sprite_patch || dreams_gather_patch);
+        !dreams_vs370_capture && !dreams_ce3_readconst_capture && !dreams_image_gather_3d_capture &&
+        !dreams_ordered_specialized && patch &&
+        (EmulatorSettings.IsPatchShaders() || dreams_sprite_patch || dreams_gather_patch);
+    if (dreams_ordered_specialized && patch && EmulatorSettings.IsPatchShaders()) {
+        LOG_WARNING(Loader,
+                    "Ignoring external patch for Dreams shader {:#x}: the exact ordered-count "
+                    "path requires its phase specialization constant",
+                    info.pgm_hash);
+    }
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.stage, info.pgm_hash);
         module = CompileSPV(*patch, instance.GetDevice());
@@ -663,9 +781,15 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         module = CompileSPV(spv, instance.GetDevice());
     }
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    const std::span<const u32> effective_code =
+        is_patched ? std::span<const u32>{*patch} : std::span<const u32>{spv};
+    effective_spirv.insert_or_assign(
+        module, std::vector<u32>{effective_code.begin(), effective_code.end()});
 
-    const auto name = GetShaderName(info.stage, info.pgm_hash, perm_idx);
+    // Keep `spv` alive for the exact effective-code capture and shader-debug collection below.
+    RegisterShaderBinary(std::vector<u32>{spv}, info, program_key, perm_idx);
+
+    const auto name = GetShaderName(info.stage, program_key, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
     if (EmulatorSettings.IsShaderCollect()) {
         DebugState.CollectShader(name, info.l_stage, module, spv, code,
@@ -676,17 +800,19 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
-                                                Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(stage, l_stage);
-    auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
+                                                Shader::Backend::Bindings& binding,
+                                                const IndirectDrawParameters* indirect_draw) {
+    auto runtime_info = BuildRuntimeInfo(stage, l_stage, indirect_draw);
+    const ProgramCacheKey program_key{params.hash, stage, l_stage, runtime_info};
+    auto [it_pgm, new_program] = program_cache.try_emplace(program_key);
     if (new_program) {
-        it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
+        it_pgm.value() = std::make_unique<Program>(stage, l_stage, params, program_key);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module =
-            CompileModule(program->info, runtime_info, params.code, params.code_data, 0, binding);
+        const auto module = CompileModule(program->info, runtime_info, params.code,
+                                          params.code_data, program_key, 0, binding);
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = HashCombine(program_key.CacheHash(), 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
@@ -695,6 +821,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     }
 
     auto& program = it_pgm.value();
+    ASSERT(program->cache_key == program_key);
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
@@ -702,15 +829,15 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
-    u64 perm_hash = HashCombine(params.hash, perm_idx);
+    u64 perm_hash = HashCombine(program_key.CacheHash(), perm_idx);
 
     vk::ShaderModule module{};
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(stage, l_stage, params);
-        module =
-            CompileModule(new_info, runtime_info, params.code, params.code_data, perm_idx, binding);
+        module = CompileModule(new_info, runtime_info, params.code, params.code_data, program_key,
+                               perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
@@ -718,7 +845,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         info.AddBindings(binding);
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
-        perm_hash = HashCombine(params.hash, perm_idx);
+        perm_hash = HashCombine(program_key.CacheHash(), perm_idx);
     }
     return std::make_tuple(&program->info, module,
                            program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
@@ -730,9 +857,19 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {
             if (m.module == module) {
+                if (Shader::DreamsCompat::UsesExactOrderedCountReplay(program->info.pgm_hash)) {
+                    LOG_WARNING(Loader,
+                                "Refusing live replacement of Dreams shader {:#x}: the exact "
+                                "ordered-count path requires its phase specialization constant",
+                                program->info.pgm_hash);
+                    return std::nullopt;
+                }
                 const auto& d = instance.GetDevice();
                 d.destroyShaderModule(m.module);
+                effective_spirv.erase(m.module);
                 m.module = CompileSPV(spv_code, d);
+                effective_spirv.insert_or_assign(
+                    m.module, std::vector<u32>{spv_code.begin(), spv_code.end()});
                 new_module = m.module;
             }
         }
@@ -752,6 +889,12 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
     return new_module;
 }
 
+std::span<const u32> PipelineCache::GetCurrentShaderSpirv(Shader::LogicalStage stage) const {
+    const auto module = modules[static_cast<u32>(stage)];
+    const auto it = effective_spirv.find(module);
+    return it == effective_spirv.end() ? std::span<const u32>{} : std::span<const u32>{it->second};
+}
+
 std::string PipelineCache::GetShaderName(Shader::Stage stage, u64 hash,
                                          std::optional<size_t> perm) {
     if (perm) {
@@ -760,8 +903,26 @@ std::string PipelineCache::GetShaderName(Shader::Stage stage, u64 hash,
     return fmt::format("{}_{:#018x}", stage, hash);
 }
 
+std::string PipelineCache::GetShaderName(Shader::Stage stage, const ProgramCacheKey& program_key,
+                                         std::optional<size_t> perm) {
+    if (!program_key.is_indirect_vertex) {
+        return GetShaderName(stage, program_key.pgm_hash, perm);
+    }
+    const auto base_name = fmt::format("{}_{:#018x}_indirect_{}_{}_{}", stage, program_key.pgm_hash,
+                                       static_cast<u32>(program_key.stage),
+                                       static_cast<s32>(program_key.indirect_base_vertex_sgpr),
+                                       static_cast<s32>(program_key.indirect_start_instance_sgpr));
+    return perm ? fmt::format("{}_{}", base_name, *perm) : base_name;
+}
+
 void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage,
                                size_t perm_idx, std::string_view ext) {
+    DumpShader(code, ProgramCacheKey{hash}, stage, perm_idx, ext);
+}
+
+void PipelineCache::DumpShader(std::span<const u32> code, const ProgramCacheKey& program_key,
+                               Shader::Stage stage, size_t perm_idx, std::string_view ext) {
+    const u64 hash = program_key.pgm_hash;
     if (!EmulatorSettings.IsDumpShaders() && hash != 0x2bfebd3c && hash != 0x692f0f7f &&
         hash != 0x3937a849 && !Shader::DreamsCompat::IsSpriteCullShader(hash)) {
         return;
@@ -772,13 +933,13 @@ void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::Stag
     if (!std::filesystem::exists(dump_dir)) {
         std::filesystem::create_directories(dump_dir);
     }
-    const auto filename = fmt::format("{}.{}", GetShaderName(stage, hash, perm_idx), ext);
+    const auto filename = fmt::format("{}.{}", GetShaderName(stage, program_key, perm_idx), ext);
     const auto file = IOFile{dump_dir / filename, FileAccessMode::Create};
     file.WriteSpan(code);
 }
 
-std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::Stage stage,
-                                                              size_t perm_idx,
+std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(const ProgramCacheKey& program_key,
+                                                              Shader::Stage stage, size_t perm_idx,
                                                               std::string_view ext) {
 
     using namespace Common::FS;
@@ -786,7 +947,7 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     if (!std::filesystem::exists(patch_dir)) {
         std::filesystem::create_directories(patch_dir);
     }
-    const auto filename = fmt::format("{}.{}", GetShaderName(stage, hash, perm_idx), ext);
+    const auto filename = fmt::format("{}.{}", GetShaderName(stage, program_key, perm_idx), ext);
     const auto filepath = patch_dir / filename;
     if (!std::filesystem::exists(filepath)) {
         return {};

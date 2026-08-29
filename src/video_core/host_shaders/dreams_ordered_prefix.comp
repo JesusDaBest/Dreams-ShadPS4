@@ -1,0 +1,59 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer global_data_share {
+    uint gds[];
+};
+
+layout(push_constant) uniform push_constants {
+    uvec4 streams[5];
+    uint stream_count;
+    uint entry_stride;
+    uint group_count_from_gds_mask;
+    uint matrix_group_count;
+    uint matrix_stream_count;
+    uint matrix_counter_base;
+    uint matrix_counter_row_stride;
+    uint matrix_counter_columns;
+    uint matrix_scratch_base;
+    uint matrix_scratch_stream_stride;
+};
+
+void main() {
+    const bool matrix_mode = matrix_stream_count != 0;
+    const uint stream_index =
+        matrix_mode ? gl_GlobalInvocationID.x : gl_LocalInvocationID.x;
+    const uint active_stream_count = matrix_mode ? matrix_stream_count : stream_count;
+    if (stream_index >= active_stream_count) {
+        return;
+    }
+
+    uvec4 stream;
+    uint count;
+    if (matrix_mode) {
+        const uint row = stream_index / matrix_counter_columns;
+        const uint column = stream_index % matrix_counter_columns;
+        stream = uvec4(matrix_group_count,
+                       matrix_counter_base + row * matrix_counter_row_stride + column,
+                       matrix_scratch_base + stream_index * matrix_scratch_stream_stride, 0);
+        count = matrix_group_count;
+    } else {
+        stream = streams[stream_index];
+        const bool group_count_from_gds =
+            (group_count_from_gds_mask & (1u << stream_index)) != 0;
+        count = group_count_from_gds ? min(gds[stream.w], stream.x) : stream.x;
+    }
+
+    uint running = gds[stream.y];
+    for (uint group = 0; group < count; ++group) {
+        const uint entry = stream.z + group * entry_stride;
+        const uint payload = gds[entry];
+        gds[entry + 1] = running;
+        running += payload;
+    }
+    gds[stream.y] = running;
+}

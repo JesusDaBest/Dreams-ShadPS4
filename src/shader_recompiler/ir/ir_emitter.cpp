@@ -647,8 +647,13 @@ U32 IREmitter::DataConsume(const U32& counter) {
     return Inst<U32>(Opcode::DataConsume, counter, Imm32(0));
 }
 
-U32 IREmitter::DataOrderedCount(const U32& counter, const U32& value, u32 op) {
-    return Inst<U32>(Opcode::DataOrderedCount, counter, value, Imm32(op));
+U32 IREmitter::DataOrderedCount(const U32& counter, const U32& value, const U32& ordered_token,
+                                u32 op) {
+    return Inst<U32>(Opcode::DataOrderedCount, counter, value, ordered_token, Imm32(op));
+}
+
+void IREmitter::DreamsSculptCheckpoint(const Value& state0, const Value& state1, const U1& exec) {
+    Inst(Opcode::DreamsSculptCheckpoint, state0, state1, exec);
 }
 
 U32 IREmitter::LaneId() {

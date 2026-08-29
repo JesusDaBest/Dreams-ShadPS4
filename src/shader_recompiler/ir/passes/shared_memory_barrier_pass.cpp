@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <unordered_set>
+#include <vector>
+#include "common/assert.h"
 #include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -60,6 +63,83 @@ static void EmitDreamsPostFillLdsControlBarrier(IR::Program& program) {
         IR::IREmitter ir{*merge, insert_point};
         ir.Barrier();
         return;
+    }
+}
+
+// GatherVoxels uses LDS as wave64 scratch in five producer phases. Liverpool's scalar waitcnts
+// and wave issue order make every phase complete before the next one starts. The structured host
+// shader needs that ordering stated explicitly, but a control barrier at a translated S_WAITCNT
+// would be invalid wherever EXEC is divergent. Insert barriers only at the five uniform phase
+// boundaries: once after the top-level prefill and once at each top-level producer-loop merge.
+static void EmitDreamsGatherVoxelsLdsPhaseBarriers(IR::Program& program) {
+    struct LoopState {
+        IR::Block* merge{};
+        u32 if_depth{};
+        bool has_shared_write{};
+    };
+
+    using Type = IR::AbstractSyntaxNode::Type;
+    u32 if_depth{};
+    std::vector<LoopState> loop_stack;
+    std::vector<IR::Block*> prefill_blocks;
+    std::vector<IR::Block*> producer_loop_merges;
+
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        switch (node.type) {
+        case Type::Block: {
+            IR::Block* const block = node.data.block;
+            const bool has_shared_write =
+                std::ranges::any_of(block->Instructions(), IsWriteShared);
+            if (!has_shared_write) {
+                break;
+            }
+            for (LoopState& loop : loop_stack) {
+                loop.has_shared_write = true;
+            }
+            if (if_depth == 0 && loop_stack.empty()) {
+                prefill_blocks.push_back(block);
+            }
+            break;
+        }
+        case Type::If:
+            ++if_depth;
+            break;
+        case Type::EndIf:
+            ASSERT_MSG(if_depth != 0, "GatherVoxels LDS barrier scan has unmatched EndIf");
+            --if_depth;
+            break;
+        case Type::Loop:
+            loop_stack.push_back({.merge = node.data.loop.merge, .if_depth = if_depth});
+            break;
+        case Type::Repeat: {
+            ASSERT_MSG(!loop_stack.empty(), "GatherVoxels LDS barrier scan has unmatched Repeat");
+            const LoopState loop = loop_stack.back();
+            loop_stack.pop_back();
+            ASSERT_MSG(loop.merge == node.data.repeat.merge,
+                       "GatherVoxels LDS barrier scan closed the wrong loop");
+            if (loop.if_depth == 0 && loop.has_shared_write) {
+                producer_loop_merges.push_back(loop.merge);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    ASSERT_MSG(if_depth == 0, "GatherVoxels LDS barrier scan has an unterminated If");
+    ASSERT_MSG(loop_stack.empty(), "GatherVoxels LDS barrier scan has an unterminated loop");
+    ASSERT_MSG(prefill_blocks.size() == 1,
+               "GatherVoxels LDS barrier scan expected one top-level prefill, found {}",
+               prefill_blocks.size());
+    ASSERT_MSG(producer_loop_merges.size() == 4,
+               "GatherVoxels LDS barrier scan expected four producer loops, found {}",
+               producer_loop_merges.size());
+
+    IR::IREmitter{*prefill_blocks.front()}.Barrier();
+    for (IR::Block* const merge : producer_loop_merges) {
+        const auto insert_point = std::ranges::find_if_not(merge->Instructions(), IR::IsPhi);
+        IR::IREmitter{*merge, insert_point}.Barrier();
     }
 }
 
@@ -140,6 +220,10 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     }
     if (DreamsCompat::NeedsLdsMemoryBarrier(program.info.pgm_hash)) {
         EmitDreamsLdsMemoryBarrier(program);
+        return;
+    }
+    if (DreamsCompat::NeedsGatherVoxelsLdsPhaseBarriers(program.info.pgm_hash)) {
+        EmitDreamsGatherVoxelsLdsPhaseBarriers(program);
         return;
     }
     if (DreamsCompat::NeedsPostFillLdsControlBarrier(program.info.pgm_hash)) {

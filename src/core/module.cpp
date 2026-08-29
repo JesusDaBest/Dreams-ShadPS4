@@ -399,7 +399,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             }
 
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
-                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SKIP_UNRESOLVED_BUILDER_RESOURCE")) {
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SKIP_UNRESOLVED_BUILDER_RESOURCE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SCULPT_PROVENANCE_TRACE")) {
                 constexpr u64 DreamsBuilderUnresolvedReturnOffset = 0x8b7bc0;
                 constexpr std::array<u8, 6> ExpectedBytes = {0x0f, 0x84, 0x55,
                                                               0xf9, 0xff, 0xff};
@@ -422,6 +423,97 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             }
 
 #ifdef _WIN32
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_VISIBLE_SCULPTS_TRACE")) {
+                constexpr std::array<u64, 8> DreamsTranslationLookupOffsets{
+                    0x148a3a0, 0x148a530, 0x148a6c0, 0x148a780,
+                    0x148a8c0, 0x148ac00, 0x148ad40, 0x148ada0,
+                };
+                u32 applied = 0;
+                for (const u64 offset : DreamsTranslationLookupOffsets) {
+                    auto* translation_lookup =
+                        reinterpret_cast<u8*>(base_virtual_addr + offset);
+                    if (offset < base_size && *translation_lookup == 0x55) {
+                        *translation_lookup = 0xcc;
+                        ++applied;
+                    } else {
+                        LOG_WARNING(Core_Linker,
+                                    "Dreams VisibleSculpts warning trace lookup {:#x} did not "
+                                    "match this executable",
+                                    offset);
+                    }
+                }
+                LOG_WARNING(Core_Linker,
+                            "Applied semantics-preserving Dreams VisibleSculpts warning trace "
+                            "to {} translation lookup routes",
+                            applied);
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SCULPT_PROVENANCE_TRACE")) {
+                struct DreamsSculptProvenancePoint {
+                    u64 offset;
+                    std::array<u8, 24> expected;
+                    size_t size;
+                };
+                constexpr std::array<DreamsSculptProvenancePoint, 26>
+                    DreamsSculptProvenancePoints{{
+                        {0x8b7380, {0x55}, 1},
+                        {0x8b7511, {0xeb, 0x08}, 2},
+                        {0x8b751b, {0x48, 0x8b, 0x05, 0x96, 0xf7, 0x39, 0x01}, 7},
+                        {0x8b8113, {0x49, 0x89, 0x87, 0xc8, 0xbf, 0x1c, 0x00}, 7},
+                        {0x8b851f, {0x83, 0x7c, 0x24, 0x40, 0x00}, 5},
+                        {0x8b8860, {0x41, 0xbc, 0x01, 0x00, 0x00, 0x00}, 6},
+                        {0x8b8a22, {0x4c, 0x89, 0xf2}, 3},
+                        {0x8b8a31,
+                         {0x80, 0xbc, 0x24, 0xc0, 0x00, 0x00, 0x00, 0x01, 0x48, 0x8b, 0xbc,
+                          0x24, 0xa0, 0x00, 0x00, 0x00, 0x0f, 0x85, 0x29, 0xfe, 0xff, 0xff},
+                         22},
+                        {0x8b8a67,
+                         {0x48, 0x83, 0x3d, 0xf9, 0xf3, 0xda, 0x05, 0x00, 0x0f, 0x84, 0x22,
+                          0x2f, 0x00, 0x00},
+                         14},
+                        {0x8b8cd5, {0x4b, 0x8b, 0x9c, 0xf2, 0xc0, 0x58, 0x09, 0x01}, 8},
+                        {0x8b95df, {0x44, 0x0f, 0xb7, 0x18}, 4},
+                        {0x8b9867, {0x8a, 0x05, 0x03, 0xe6, 0xda, 0x05}, 6},
+                        {0x8ba0a9, {0x41, 0xff, 0x87, 0x38, 0xff, 0x31, 0x00}, 7},
+                        {0x987998, {0x48, 0x8b, 0x84, 0x24, 0x50, 0x06, 0x00, 0x00}, 8},
+                        {0x71c622, {0x41, 0x89, 0x45, 0x1c}, 4},
+                        {0x71c8b8, {0x41, 0x89, 0x45, 0x00}, 4},
+                        {0x71cd98, {0x43, 0x89, 0x44, 0x37, 0x20}, 5},
+                        {0x72aa3e, {0x89, 0x54, 0x07, 0x20}, 4},
+                        {0x729da5, {0x41, 0xc7, 0x02, 0xff, 0xff, 0xff, 0xff}, 7},
+                        // Bounded lifecycle trace for the first unresolved sculpt resource.
+                        {0x9c47cc, {0x3b, 0x15, 0x76, 0x03, 0xb1, 0x03}, 6},
+                        {0x9c47d4, {0x66, 0x41, 0x89, 0x4e, 0x40}, 5},
+                        {0x9c486a, {0x66, 0x41, 0x89, 0x46, 0x42}, 5},
+                        {0x9aaf51, {0x89, 0x05, 0xf1, 0x9b, 0xb2, 0x03}, 6},
+                        {0x71cb3a, {0x43, 0x86, 0x44, 0x3b, 0x1c}, 5},
+                        {0x71e626, {0x41, 0x86, 0x44, 0x18, 0x1c}, 5},
+                        {0x72a9e9, {0x86, 0x54, 0x07, 0x1c}, 4},
+                    }};
+
+                bool trace_points_match = true;
+                for (const auto& point : DreamsSculptProvenancePoints) {
+                    if (point.offset + point.size > base_size ||
+                        std::memcmp(reinterpret_cast<u8*>(base_virtual_addr + point.offset),
+                                    point.expected.data(), point.size) != 0) {
+                        trace_points_match = false;
+                        break;
+                    }
+                }
+                if (trace_points_match) {
+                    for (const auto& point : DreamsSculptProvenancePoints) {
+                        *reinterpret_cast<u8*>(base_virtual_addr + point.offset) = 0xcc;
+                    }
+                    LOG_WARNING(Core_Linker,
+                                "Applied semantics-preserving Dreams sculpt provenance trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams sculpt provenance trace did not match this executable");
+                }
+            }
+
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
                 IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE")) {
                 constexpr std::array<std::pair<u64, u8>, 11> DreamsModelRecordTracePoints{{
@@ -475,6 +567,54 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 } else {
                     LOG_WARNING(Core_Linker,
                                 "Dreams scene-ready/cache-bootstrap repair did not match this "
+                                "executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SCENE_WAKE_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SCENE_READY_HANDOFF")) {
+                constexpr u64 DreamsSceneReadyHandoffOffset = 0x9ab22e;
+                constexpr u64 DreamsSceneBuilderGateObservedOffset = 0x987976;
+                constexpr std::array<u8, 5> ExpectedReadyCall{{0xe8, 0x2d, 0xd5, 0xf9, 0xff}};
+                constexpr std::array<u8, 8> ExpectedGateLoad{{
+                    0x48, 0x8b, 0x84, 0x24, 0x50, 0x06, 0x00, 0x00,
+                }};
+                constexpr u8 BreakpointByte = 0xcc;
+                auto* scene_ready =
+                    reinterpret_cast<u8*>(base_virtual_addr + DreamsSceneReadyHandoffOffset);
+                auto* scene_gate = reinterpret_cast<u8*>(
+                    base_virtual_addr + DreamsSceneBuilderGateObservedOffset);
+                const bool points_match =
+                    DreamsSceneReadyHandoffOffset + ExpectedReadyCall.size() <= base_size &&
+                    DreamsSceneBuilderGateObservedOffset + ExpectedGateLoad.size() <= base_size &&
+                    std::equal(ExpectedReadyCall.begin(), ExpectedReadyCall.end(), scene_ready) &&
+                    std::equal(ExpectedGateLoad.begin(), ExpectedGateLoad.end(), scene_gate);
+                if (points_match) {
+                    *scene_ready = BreakpointByte;
+                    *scene_gate = BreakpointByte;
+                    LOG_WARNING(Core_Linker,
+                                "Applied semantics-preserving Dreams scene wake/gate trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams scene wake/gate trace did not match this executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SCENE_CACHE_BOOTSTRAP_ONLY") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SCENE_READY_HANDOFF")) {
+                constexpr u64 DreamsSceneCacheBootstrapOffset = 0x8b74c0;
+                auto* scene_cache_bootstrap = reinterpret_cast<u8*>(
+                    base_virtual_addr + DreamsSceneCacheBootstrapOffset);
+                if (DreamsSceneCacheBootstrapOffset < base_size &&
+                    *scene_cache_bootstrap == 0x0f) {
+                    *scene_cache_bootstrap = 0xcc;
+                    LOG_WARNING(Core_Linker,
+                                "Applied isolated Dreams scene-cache bootstrap repair");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams isolated scene-cache bootstrap repair did not match this "
                                 "executable");
                 }
             }
@@ -594,7 +734,48 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             }
 
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CSG_COMPLETION_TRACE")) {
+                // Trace only the boundaries needed to distinguish guest worker delay, event wait,
+                // and completion-marker submission. Every replaced instruction is emulated by
+                // HandleDreamsCpuRootTrace, so this does not alter the guest control flow.
+                constexpr std::array<std::pair<u64, u8>, 7> DreamsCsgCompletionTracePoints{{
+                    {0x12850c1, 0xe8}, // Enter one CSG voxel compute pass.
+                    {0x1287bd0, 0x55}, // Enter the GPU completion wait.
+                    {0x1287bf7, 0x8b}, // Completion-marker submission returned.
+                    {0x1287c83, 0xe8}, // Wait for the CSG GPU event.
+                    {0x1287c88, 0x49}, // Event wait returned; read completion value.
+                    {0x1287d23, 0x44}, // Publish the next completion target.
+                    {0x1287e20, 0x48}, // Completion write packet was emitted.
+                }};
+                constexpr u8 BreakpointByte = 0xcc;
+                bool trace_points_match = true;
+                for (const auto [offset, expected] : DreamsCsgCompletionTracePoints) {
+                    if (offset >= base_size) {
+                        trace_points_match = false;
+                        break;
+                    }
+                    const u8 current = *reinterpret_cast<u8*>(base_virtual_addr + offset);
+                    // SHADPS4_DREAMS_STAMP_TRACE may already own the same focused points.
+                    if (current != expected && current != BreakpointByte) {
+                        trace_points_match = false;
+                        break;
+                    }
+                }
+                if (trace_points_match) {
+                    for (const auto [offset, expected] : DreamsCsgCompletionTracePoints) {
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) = BreakpointByte;
+                    }
+                    LOG_WARNING(Core_Linker,
+                                "Applied semantics-preserving Dreams CSG completion timing trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams CSG completion timing trace did not match this executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
                 IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CPU_ROOT_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_SCULPT_PROVENANCE_TRACE") &&
                 !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_STAMP_TRACE") &&
                 !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_APPEND_TRACE")) {
                 constexpr u64 DreamsRecordBuilderOffset = 0x8b7380;

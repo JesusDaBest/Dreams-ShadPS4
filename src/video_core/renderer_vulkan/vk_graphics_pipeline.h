@@ -90,7 +90,8 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading,
+                     std::span<const std::span<const u32>> dreams_diagnostic_spirv = {});
     ~GraphicsPipeline();
 
     const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
@@ -99,6 +100,10 @@ public:
 
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
+    }
+
+    vk::Pipeline GetDreamsVs370FreshPipeline() const noexcept {
+        return dreams_vs370_fresh_pipeline ? *dreams_vs370_fresh_pipeline : vk::Pipeline{};
     }
 
     /// Gets the attributes and bindings for vertex inputs.
@@ -114,6 +119,7 @@ private:
 private:
     GraphicsPipelineKey key;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    vk::UniquePipeline dreams_vs370_fresh_pipeline{};
 };
 
 struct ClipDistanceShaderKey {

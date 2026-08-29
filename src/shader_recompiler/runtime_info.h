@@ -252,13 +252,25 @@ struct RuntimeInfo {
         CommonHsEsVsRuntimeInfo hs_es_vs_info;
         CommonEsVsRuntimeInfo es_vs_info;
     };
+    // Keep draw-parameter specialization state at the end. RuntimeInfo is persisted as a raw
+    // record, so appending preserves the layout of the pre-draw-parameters cache prefix.
+    bool is_indirect_draw{};
+    s8 indirect_base_vertex_sgpr{-1};
+    s8 indirect_start_instance_sgpr{-1};
 
     void Initialize(Stage stage_) {
         memset(this, 0, sizeof(*this));
         stage = stage_;
+        indirect_base_vertex_sgpr = -1;
+        indirect_start_instance_sgpr = -1;
     }
 
     bool operator==(const RuntimeInfo& other) const noexcept {
+        if (is_indirect_draw != other.is_indirect_draw ||
+            indirect_base_vertex_sgpr != other.indirect_base_vertex_sgpr ||
+            indirect_start_instance_sgpr != other.indirect_start_instance_sgpr) {
+            return false;
+        }
         switch (stage) {
         case Stage::Fragment:
             return fs_info == other.fs_info;

@@ -150,6 +150,7 @@ public:
     }
 
     void Fill(u64 offset, u32 num_bytes, u32 value);
+    void InvalidateMappedRange(u64 offset, u64 size);
 
 public:
     VAddr cpu_addr = 0;

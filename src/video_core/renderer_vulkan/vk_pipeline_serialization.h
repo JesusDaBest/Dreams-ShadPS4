@@ -16,6 +16,7 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
-void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+void RegisterShaderBinary(std::vector<u32>&& spv, const Shader::Info& info,
+                          const ProgramCacheKey& program_key, size_t perm_idx);
 
 } // namespace Vulkan

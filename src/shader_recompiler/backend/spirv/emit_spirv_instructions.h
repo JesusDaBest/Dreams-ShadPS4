@@ -476,7 +476,9 @@ Id EmitBallotFindLsb(EmitContext& ctx, Id mask);
 Id EmitGroupAny(EmitContext& ctx, Id bit);
 Id EmitDataAppend(EmitContext& ctx, u32 gds_addr, u32 binding);
 Id EmitDataConsume(EmitContext& ctx, u32 gds_addr, u32 binding);
-Id EmitDataOrderedCount(EmitContext& ctx, Id gds_index, Id value, u32 packed_control);
+Id EmitDataOrderedCount(EmitContext& ctx, Id gds_index, Id value, Id ordered_token,
+                        u32 packed_control);
+void EmitDreamsSculptCheckpoint(EmitContext& ctx, IR::Inst* inst, Id state0, Id state1, Id exec);
 
 void EmitEmitVertex(EmitContext& ctx);
 void EmitEmitPrimitive(EmitContext& ctx);

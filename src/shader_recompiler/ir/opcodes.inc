@@ -459,5 +459,6 @@ OPCODE(Ballot,                                              U32x4,          U1, 
 OPCODE(BallotFindLsb,                                       U32,            U32x4,                                                                          )
 OPCODE(DataAppend,                                          U32,            U32,            U32                                                             )
 OPCODE(DataConsume,                                         U32,            U32,            U32                                                             )
-OPCODE(DataOrderedCount,                                    U32,            U32,            U32,            U32                                             )
+OPCODE(DataOrderedCount,                                    U32,            U32,            U32,            U32,            U32                             )
+OPCODE(DreamsSculptCheckpoint,                              Void,           U32x4,          U32x3,          U1                                              )
 OPCODE(GroupAny,                                            U1,             U1,                                                                             )

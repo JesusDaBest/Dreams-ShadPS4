@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <ranges>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -21,6 +22,9 @@
 
 namespace Shader::Backend::SPIRV {
 namespace {
+
+using PointerSize = EmitContext::PointerSize;
+using PointerType = EmitContext::PointerType;
 
 static constexpr spv::ExecutionMode GetInputPrimitiveType(AmdGpu::PrimitiveType type) {
     switch (type) {
@@ -230,10 +234,8 @@ void EmitDreamsTraversalCompletion(EmitContext& ctx) {
     const Id workgroup_x = ctx.OpCompositeExtract(ctx.U32[1], workgroup, 0);
     const Id local_x = ctx.OpCompositeExtract(ctx.U32[1], local, 0);
     const Id global_id = ctx.OpIAdd(
-        ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], workgroup_x, ctx.ConstU32(u32{6})),
-        local_x);
-    const Id total =
-        ctx.OpLoad(ctx.U32[1], BufferU32Pointer(ctx, gds, ctx.ConstU32(u32{321})));
+        ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], workgroup_x, ctx.ConstU32(u32{6})), local_x);
+    const Id total = ctx.OpLoad(ctx.U32[1], BufferU32Pointer(ctx, gds, ctx.ConstU32(u32{321})));
     const Id is_active = ctx.OpULessThan(ctx.U1[1], global_id, total);
 
     const Id active_label = ctx.OpLabel();
@@ -243,8 +245,8 @@ void EmitDreamsTraversalCompletion(EmitContext& ctx) {
 
     ctx.AddLabel(active_label);
     const Id scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
-    const auto memory_semantics = spv::MemorySemanticsMask::AcquireRelease |
-                                  spv::MemorySemanticsMask::UniformMemory;
+    const auto memory_semantics =
+        spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::UniformMemory;
     const Id semantics = ctx.ConstU32(static_cast<u32>(memory_semantics));
     const Id completion_ptr =
         BufferU32Pointer(ctx, gds, ctx.ConstU32(DreamsCompat::TraversalCompletionIndex));
@@ -259,32 +261,30 @@ void EmitDreamsTraversalCompletion(EmitContext& ctx) {
     ctx.OpBranchConditional(is_last, final_label, final_merge_label);
 
     ctx.AddLabel(final_label);
-    const Id base =
-        ctx.OpLoad(ctx.U32[1], BufferU32Pointer(ctx, gds, ctx.ConstU32(u32{320})));
-    const Id output_count = MinU32(
-        ctx,
-        ctx.OpLoad(ctx.U32[1],
-                   BufferU32Pointer(ctx, gds,
-                                    ctx.ConstU32(DreamsCompat::TraversalOutputCounterIndex))),
-        3145728);
+    const Id base = ctx.OpLoad(ctx.U32[1], BufferU32Pointer(ctx, gds, ctx.ConstU32(u32{320})));
+    const Id output_count =
+        MinU32(ctx,
+               ctx.OpLoad(ctx.U32[1],
+                          BufferU32Pointer(
+                              ctx, gds, ctx.ConstU32(DreamsCompat::TraversalOutputCounterIndex))),
+               3145728);
     const Id secondary_count = MinU32(
         ctx,
-        ctx.OpLoad(ctx.U32[1],
-                   BufferU32Pointer(ctx, gds,
-                                    ctx.ConstU32(DreamsCompat::TraversalSecondaryCounterIndex))),
+        ctx.OpLoad(
+            ctx.U32[1],
+            BufferU32Pointer(ctx, gds, ctx.ConstU32(DreamsCompat::TraversalSecondaryCounterIndex))),
         1048576);
-    const Id compact_count = MinU32(
-        ctx,
-        ctx.OpLoad(ctx.U32[1],
-                   BufferU32Pointer(ctx, gds,
-                                    ctx.ConstU32(DreamsCompat::TraversalCompactCounterIndex))),
-        16384);
+    const Id compact_count =
+        MinU32(ctx,
+               ctx.OpLoad(ctx.U32[1],
+                          BufferU32Pointer(
+                              ctx, gds, ctx.ConstU32(DreamsCompat::TraversalCompactCounterIndex))),
+               16384);
 
     const Id next_base = ctx.OpIAdd(ctx.U32[1], base, total);
     const Id has_next = ctx.OpUGreaterThanEqual(ctx.U1[1], output_count, next_base);
-    const Id next_count =
-        ctx.OpSelect(ctx.U32[1], has_next,
-                     ctx.OpISub(ctx.U32[1], output_count, next_base), ctx.u32_zero_value);
+    const Id next_count = ctx.OpSelect(
+        ctx.U32[1], has_next, ctx.OpISub(ctx.U32[1], output_count, next_base), ctx.u32_zero_value);
     StoreBufferU32(ctx, gds, 320, next_base);
     StoreBufferU32(ctx, gds, 321, next_count);
 
@@ -297,15 +297,13 @@ void EmitDreamsTraversalCompletion(EmitContext& ctx) {
     const Id dispatch_count = ctx.EmitFlatbufferLoad(ctx.ConstU32(u32{22}));
     const Id output_dispatch_count = ctx.EmitFlatbufferLoad(ctx.ConstU32(u32{18}));
 
-    EmitConditionalStore(ctx,
-                         ctx.OpUGreaterThan(ctx.U1[1], dispatch_count, ctx.u32_zero_value), 1,
+    EmitConditionalStore(ctx, ctx.OpUGreaterThan(ctx.U1[1], dispatch_count, ctx.u32_zero_value), 1,
                          0, next_groups);
-    EmitConditionalStore(ctx,
-                         ctx.OpUGreaterThan(ctx.U1[1], dispatch_count, ctx.u32_one_value), 1,
+    EmitConditionalStore(ctx, ctx.OpUGreaterThan(ctx.U1[1], dispatch_count, ctx.u32_one_value), 1,
                          8, secondary_groups);
     EmitConditionalStore(ctx,
-                         ctx.OpUGreaterThan(ctx.U1[1], output_dispatch_count, ctx.u32_one_value),
-                         0, 1, compact_count);
+                         ctx.OpUGreaterThan(ctx.U1[1], output_dispatch_count, ctx.u32_one_value), 0,
+                         1, compact_count);
     ctx.OpBranch(final_merge_label);
 
     ctx.AddLabel(final_merge_label);
@@ -326,8 +324,122 @@ IR::BlockList EmitBlocks(const IR::Program& program) {
     return blocks;
 }
 
+void PrepareDreamsSculptReplay(EmitContext& ctx, const IR::Program& program) {
+    if (program.info.pgm_hash != DreamsCompat::SculptVolumeWriterShader) {
+        return;
+    }
+
+    ASSERT_MSG(!program.blocks.empty(), "Dreams 84aa replay has no entry block");
+    IR::Inst* checkpoint{};
+    IR::Block* doc_block{};
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::DreamsSculptCheckpoint) {
+                ASSERT_MSG(checkpoint == nullptr, "Dreams 84aa has multiple checkpoints");
+                checkpoint = &inst;
+                doc_block = block;
+            }
+        }
+    }
+    ASSERT_MSG(checkpoint != nullptr && doc_block != nullptr,
+               "Dreams 84aa replay checkpoint was not found");
+    ASSERT_MSG(program.syntax_list.size() >= 2 &&
+                   program.syntax_list[0].type == IR::AbstractSyntaxNode::Type::Block &&
+                   program.syntax_list[0].data.block == program.blocks.front() &&
+                   program.syntax_list[1].type == IR::AbstractSyntaxNode::Type::If &&
+                   program.syntax_list[1].data.if_node.merge == doc_block,
+               "Dreams 84aa replay cut no longer matches the outer prefix branch");
+
+    ctx.dreams_sculpt_replay_entry_block = program.blocks.front();
+    ctx.dreams_sculpt_post_doc_label = ctx.OpLabel();
+}
+
+void EmitDreamsSculptReplayGate(EmitContext& ctx) {
+    ASSERT_MSG(Sirit::ValidId(ctx.dreams_sculpt_post_doc_label),
+               "Dreams 84aa replay gate has no post-DOC label");
+    const auto gds_it = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                          &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds_it != ctx.buffers.end(), "Dreams 84aa replay gate has no GDS buffer");
+    const auto& buffer = *gds_it;
+    const auto [buffer_id, pointer_type] = buffer.Alias(PointerType::U32);
+    const auto get_pointer = [&](Id address) {
+        if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+            address = ctx.OpIAdd(ctx.U32[1], address, offset);
+        }
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, address);
+    };
+
+    ASSERT_MSG(Sirit::ValidId(ctx.dreams_ordered_phase),
+               "Dreams 84aa replay gate has no phase specialization constant");
+    const Id phase = ctx.dreams_ordered_phase;
+    const Id is_replay =
+        ctx.OpIEqual(ctx.U1[1], phase, ctx.ConstU32(DreamsCompat::OrderedPhaseReplay));
+    const Id replay_label = ctx.OpLabel();
+    const Id normal_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(ctx.dreams_sculpt_post_doc_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(is_replay, replay_label, normal_label);
+
+    ctx.AddLabel(replay_label);
+    const Id workgroup_x =
+        ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), 0);
+    const Id local_x =
+        ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id), 0);
+    const Id workgroup_state_base =
+        ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(DreamsCompat::SculptOrderedStateBaseDword),
+                   ctx.OpIMul(ctx.U32[1], workgroup_x,
+                              ctx.ConstU32(DreamsCompat::SculptOrderedStateDwordsPerWorkgroup)));
+    const auto load_state = [&](u32 index) {
+        const Id component_base = ctx.OpIAdd(
+            ctx.U32[1], workgroup_state_base,
+            ctx.ConstU32(DreamsCompat::SculptOrderedStateComponentOffset(index)));
+        const Id address = ctx.OpIAdd(ctx.U32[1], component_base, local_x);
+        return ctx.OpLoad(ctx.U32[1], get_pointer(address));
+    };
+
+    // Only lanes 0..31 consume the first four values after the replay cut. Keep those arrays at
+    // half-wave width and do not issue pointless loads for the upper half.
+    const Id lower_half_label = ctx.OpLabel();
+    const Id lower_half_merge_label = ctx.OpLabel();
+    const Id is_lower_half = ctx.OpULessThan(
+        ctx.U1[1], local_x, ctx.ConstU32(DreamsCompat::SculptOrderedLowerHalfLanes));
+    ctx.OpSelectionMerge(lower_half_merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(is_lower_half, lower_half_label, lower_half_merge_label);
+
+    ctx.AddLabel(lower_half_label);
+    std::array<Id, DreamsCompat::SculptOrderedLowerHalfStateComponents> lower_half_values{};
+    for (u32 index = 0; index < lower_half_values.size(); ++index) {
+        lower_half_values[index] = load_state(index);
+    }
+    ctx.OpBranch(lower_half_merge_label);
+
+    ctx.AddLabel(lower_half_merge_label);
+    for (u32 index = 0; index < lower_half_values.size(); ++index) {
+        ctx.dreams_sculpt_replay_values[index] =
+            ctx.OpPhi(ctx.U32[1], lower_half_values[index], lower_half_label, ctx.u32_zero_value,
+                      replay_label);
+    }
+    for (u32 index = DreamsCompat::SculptOrderedLowerHalfStateComponents;
+         index < DreamsCompat::SculptOrderedStateValueCount; ++index) {
+        ctx.dreams_sculpt_replay_values[index] = load_state(index);
+    }
+    ctx.dreams_sculpt_replay_values[7] = ctx.true_value;
+    const Id prefix_entry = ctx.OpIAdd(
+        ctx.U32[1],
+        ctx.ConstU32(DreamsCompat::OrderedScratchStreamBaseDword(
+            DreamsCompat::SculptOrderedScratchStream)),
+        ctx.OpIMul(ctx.U32[1], workgroup_x, ctx.ConstU32(DreamsCompat::OrderedEntryDwords)));
+    const Id prefix_index =
+        ctx.OpIAdd(ctx.U32[1], prefix_entry, ctx.ConstU32(DreamsCompat::SculptOrderedPrefixOffset));
+    ctx.dreams_sculpt_replay_doc_result = ctx.OpLoad(ctx.U32[1], get_pointer(prefix_index));
+    ctx.dreams_sculpt_replay_parent = lower_half_merge_label;
+    ctx.OpBranch(ctx.dreams_sculpt_post_doc_label);
+
+    ctx.AddLabel(normal_label);
+}
+
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    bool defined_workgroup_index{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         if (!IsReachableNode(program, node)) {
             continue;
@@ -340,8 +452,20 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (!defined_workgroup_index &&
+                (program.info.loads.GetAny(IR::Attribute::WorkgroupIndex) ||
+                 DreamsCompat::UsesExactOrderedCountReplay(program.info.pgm_hash))) {
+                // Exact DOC lowering consumes a flat guest creation index even when the guest's
+                // ordered-token calculation optimized away. Define it once in the entry block so
+                // it dominates every ordered-count instruction and replay branch.
+                ctx.DefineWorkgroupIndex();
+                defined_workgroup_index = true;
+            }
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
+            }
+            if (node.data.block == ctx.dreams_sculpt_replay_entry_block) {
+                EmitDreamsSculptReplayGate(ctx);
             }
             ctx.first_to_last_label_map[label.value] = ctx.last_label;
             break;
@@ -411,6 +535,7 @@ Id DefineMain(EmitContext& ctx, const IR::Program& program, const IR::BlockList&
     for (IR::Block* const block : emitted_blocks) {
         block->SetDefinition(ctx.OpLabel());
     }
+    PrepareDreamsSculptReplay(ctx, program);
     Traverse(ctx, program);
     ctx.OpFunctionEnd();
     return main;
@@ -499,7 +624,7 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         ctx.AddCapability(spv::Capability::GroupNonUniformVote);
     }
     const auto stage = info.l_stage;
-    if (stage == LogicalStage::Vertex) {
+    if (stage == LogicalStage::Vertex && runtime_info.is_indirect_draw) {
         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
         ctx.AddCapability(spv::Capability::DrawParameters);
     }
@@ -842,7 +967,28 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(ctx);
     binding.user_data += program.info.ud_mask.NumRegs();
-    return ctx.Assemble();
+    std::vector<u32> spirv = ctx.Assemble();
+    if (DreamsCompat::UsesExactOrderedCountReplay(program.info.pgm_hash)) {
+        ASSERT_MSG(Sirit::ValidId(ctx.dreams_ordered_phase),
+                   "Dreams exact DOC shader has no phase specialization constant");
+        bool patched{};
+        for (size_t offset = 5; offset < spirv.size();) {
+            const u32 word_count = spirv[offset] >> 16;
+            const auto opcode = static_cast<spv::Op>(spirv[offset] & 0xffff);
+            ASSERT_MSG(word_count != 0 && offset + word_count <= spirv.size(),
+                       "Malformed SPIR-V instruction at dword {}", offset);
+            if (opcode == spv::Op::OpConstant && word_count >= 4 &&
+                spirv[offset + 2] == ctx.dreams_ordered_phase.value) {
+                ASSERT_MSG(!patched,
+                           "Dreams exact DOC phase constant was declared more than once");
+                spirv[offset] = (word_count << 16) | static_cast<u32>(spv::Op::OpSpecConstant);
+                patched = true;
+            }
+            offset += word_count;
+        }
+        ASSERT_MSG(patched, "Dreams exact DOC phase constant declaration was not found");
+    }
+    return spirv;
 }
 
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {

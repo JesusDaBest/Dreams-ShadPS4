@@ -19,9 +19,16 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Vulkan {
 
+struct HeadlessDeviceTag {};
+inline constexpr HeadlessDeviceTag HeadlessDevice{};
+
 class Instance {
 public:
+    /// Creates an instance for physical-device enumeration only.
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
+    /// Creates a complete Vulkan device without a presentation surface.
+    explicit Instance(HeadlessDeviceTag, s32 physical_device_index = -1,
+                      bool enable_validation = false, bool enable_crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
     ~Instance();
@@ -451,8 +458,12 @@ public:
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
 private:
+    /// Selects a physical device and initializes all device-owned state.
+    void InitializeDevice(s32 physical_device_index, bool enable_validation,
+                          bool enable_presentation);
+
     /// Creates the logical device opportunistically enabling extensions
-    bool CreateDevice();
+    bool CreateDevice(bool enable_presentation);
 
     /// Creates the VMA allocator handle
     void CreateAllocator();

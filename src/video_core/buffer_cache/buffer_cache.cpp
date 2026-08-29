@@ -16,8 +16,10 @@
 
 namespace VideoCore {
 
-// The first 64 KiB remain guest-visible GDS. Extra capacity is private shader scratch.
-static constexpr size_t DataShareBufferSize = 8_MB;
+// The first 64 KiB remain guest-visible GDS. Dreams uses the next private ranges for ordered-count
+// metadata and exact diagnostic checkpoints. 32 MiB covers Dreams' ordered-count replay state;
+// ordered-chain captures use the final 20 MiB for address-preserving B1 writer provenance.
+static constexpr size_t DataShareBufferSize = 52_MB;
 static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
@@ -157,8 +159,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
 
 void BufferCache::BindVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline,
-    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
-    bool preflight_only) {
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers, bool preflight_only) {
     const auto& regs = liverpool->regs;
     Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -455,6 +456,10 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
+}
+
+bool BufferCache::IsRegionGpuModifiedExact(VAddr addr, size_t size) const {
+    return gpu_modified_ranges.Intersects(addr, size);
 }
 
 BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
@@ -792,6 +797,20 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
     }
     if (copy_size == 0) {
         return false;
+    }
+    // TileImage writes the cached buffer from a compute shader without going through Buffer's
+    // access tracker. Record that write state explicitly: the normal descriptor binding barrier
+    // can then make the detiled data visible to the following shader read.
+    scheduler.EndRendering();
+    if (auto barrier =
+            buffer.GetBarrier(vk::AccessFlagBits2::eShaderWrite,
+                              vk::PipelineStageFlagBits2::eComputeShader, buf_offset, true)) {
+        const auto cmdbuf = scheduler.CommandBuffer();
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &*barrier,
+        });
     }
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);

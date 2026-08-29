@@ -22,6 +22,7 @@
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "imgui/big_picture/big_picture.h"
+#include "video_core/renderer_vulkan/dreams_draw_replay.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -66,6 +67,8 @@ int main(int argc, char* argv[]) {
 
     std::optional<std::filesystem::path> addGameFolder;
     std::optional<std::filesystem::path> setAddonFolder;
+    std::optional<std::filesystem::path> dreamsDrawReplay;
+    std::optional<std::filesystem::path> dreamsDrawReplayCandidates;
     std::optional<std::string> patchFile;
 
     std::vector<std::pair<std::filesystem::path, std::string>> mounts;
@@ -96,6 +99,12 @@ int main(int argc, char* argv[]) {
 
     app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
+    app.add_option("--dreams-draw-replay", dreamsDrawReplay,
+                   "Replay a captured Dreams draw without starting the game")
+        ->check(CLI::ExistingDirectory);
+    app.add_option("--dreams-draw-replay-candidates", dreamsDrawReplayCandidates,
+                   "Replay every U32x2 visibility-list .bin in this directory")
+        ->check(CLI::ExistingDirectory);
     app.add_option("--mount", mounts, "Mount source to destination");
     app.add_option("-e,--env", env_vars, "Environment variables to pass to the guest");
 
@@ -161,6 +170,14 @@ int main(int argc, char* argv[]) {
 
     // Configure logger appropriately
     Common::Log::g_should_append |= EmulatorSettings.IsLogAppend();
+
+    if (dreamsDrawReplayCandidates && !dreamsDrawReplay) {
+        LOG_ERROR(Debug, "--dreams-draw-replay-candidates requires --dreams-draw-replay");
+        return 2;
+    }
+    if (dreamsDrawReplay) {
+        return Vulkan::DreamsDrawReplay::Run(*dreamsDrawReplay, dreamsDrawReplayCandidates);
+    }
 
     if (bigPicture) {
         BigPictureMode::Launch(argv[0], sameProcess);

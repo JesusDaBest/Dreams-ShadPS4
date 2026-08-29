@@ -3,6 +3,7 @@
 
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
+#include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
@@ -12,12 +13,106 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 3u;
-static constexpr u32 ShaderMetaVersion = 4u;
+// Liverpool DS_ORDERED_COUNT supplies its ordered-counter base in M0's high half in bytes, and
+// OFFSET0 is byte encoded too. Version 17 incorrectly treated the M0 base as a dword index,
+// aliasing Dreams compaction counters into unrelated guest GDS words.
+static constexpr u32 ShaderBinaryVersion = 18u;
+static constexpr u32 ShaderMetaVersion = 6u;
+static constexpr u32 PreviousShaderMetaVersion = 5u;
 static constexpr u32 PipelineKeyVersion = 3u;
+static constexpr size_t PreviousRuntimeInfoSize = 248u;
+static_assert(sizeof(Shader::RuntimeInfo) == 256u);
 } // namespace Serialization
 
 namespace Vulkan {
+namespace {
+
+std::string ShaderBinaryCacheKey(const Shader::Info& info,
+                                 const ProgramCacheKey& program_key, size_t perm_idx) {
+    const u64 pgm_hash = info.pgm_hash;
+    // Vertex ID lowering changed independently of every compute/fragment shader. Keep that
+    // invalidation stage-local so a vertex fix cannot force Dreams' expensive compute shaders to
+    // rebuild, while also preventing binaries made by the incomplete lowering from being reused.
+    if (info.l_stage == Shader::LogicalStage::Vertex) {
+        if (program_key.is_indirect_vertex) {
+            return fmt::format("{:#018x}_{}_drawparams4_indirect_{}_{}_{}", pgm_hash, perm_idx,
+                               static_cast<u32>(program_key.stage),
+                               static_cast<s32>(program_key.indirect_base_vertex_sgpr),
+                               static_cast<s32>(program_key.indirect_start_instance_sgpr));
+        }
+        return fmt::format("{:#018x}_{}_drawparams4", pgm_hash, perm_idx);
+    }
+    if (pgm_hash == Shader::DreamsCompat::TraversalShader) {
+        if (Shader::DreamsCompat::CaptureB535Membership()) {
+            return fmt::format(
+                "{:#018x}_{}_doc{}_membership_capture{}{}", pgm_hash, perm_idx,
+                Shader::DreamsCompat::TraversalCacheRevision,
+                Shader::DreamsCompat::ForceB535FirstGateFailure()
+                    ? "_force_first_gate_failure"
+                    : "",
+                Shader::DreamsCompat::CaptureB535InstructionTrace()
+                    ? fmt::format("_microtrace{}",
+                                  Shader::DreamsCompat::B535InstructionTraceCacheRevision)
+                    : std::string{});
+        }
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::TraversalCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::QueueProducerShader &&
+        Shader::DreamsCompat::CaptureOrderedChain()) {
+        return fmt::format("{:#018x}_{}_ordered_chain_capture{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::QueueProducerCapture::Schema);
+    }
+    if (pgm_hash == Shader::DreamsCompat::QueueProducerShaderAlt) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::QueueProducerAltCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::B1SeedWriterShader) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::B1SeedWriterCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::SceneCompactShader &&
+        Shader::DreamsCompat::UseSceneCompactExactOrderedCountReplay()) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::SceneCompactCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::SculptVolumeWriterShader) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::SculptVolumeWriterCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::SculptSurfaceCompactShader) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::SculptSurfaceCompactCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::SculptSurfaceFinalizeShader) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::SculptSurfaceFinalizeCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::IndirectArgsShader) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::IndirectArgsCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::VisibilityCandidateCompactShader) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::VisibilityCandidateCompactCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::GatherInputCompactShader) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::GatherInputCompactCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::GatherVoxelsShader) {
+        return fmt::format("{:#018x}_{}_lds{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::GatherVoxelsCacheRevision);
+    }
+    if (pgm_hash == Shader::DreamsCompat::VisibilityListCompactShader ||
+        pgm_hash == Shader::DreamsCompat::VisibilityListCompactShaderAlt) {
+        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                           Shader::DreamsCompat::VisibilityListCompactCacheRevision);
+    }
+    return fmt::format("{:#018x}_{}", pgm_hash, perm_idx);
+}
+
+} // Anonymous namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -61,7 +156,8 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash,
                         size_t perm_idx) {
-    if (!Storage::DataBase::Instance().IsOpened()) {
+    if (!Storage::DataBase::Instance().IsOpened() ||
+        Shader::DreamsCompat::IsCaptureInstrumentedShader(info.pgm_hash)) {
         return;
     }
 
@@ -81,13 +177,15 @@ void RegisterShaderMeta(const Shader::Info& info,
                                        fmt::format("{:#018x}", perm_hash), ar.TakeOff());
 }
 
-void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
-    if (!Storage::DataBase::Instance().IsOpened()) {
+void RegisterShaderBinary(std::vector<u32>&& spv, const Shader::Info& info,
+                          const ProgramCacheKey& program_key, size_t perm_idx) {
+    if (!Storage::DataBase::Instance().IsOpened() ||
+        Shader::DreamsCompat::IsCaptureInstrumentedShader(info.pgm_hash)) {
         return;
     }
 
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
+                                       ShaderBinaryCacheKey(info, program_key, perm_idx),
                                        std::move(spv));
 }
 
@@ -98,7 +196,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    if (meta_version != Serialization::ShaderMetaVersion &&
+        meta_version != Serialization::PreviousShaderMetaVersion) {
         return false;
     }
 
@@ -112,8 +211,21 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_hash_ar);
     meta.Read(perm_idx);
 
-    spec.Deserialize(ar);
+    // Meta v5 stored RuntimeInfo before the indirect-draw specialization fields were appended.
+    // Read precisely that stable prefix so existing compute/fragment caches remain usable.
+    const size_t runtime_info_size =
+        meta_version == Serialization::PreviousShaderMetaVersion
+            ? Serialization::PreviousRuntimeInfoSize
+            : sizeof(Shader::RuntimeInfo);
+    spec.Deserialize(ar, runtime_info_size);
     info.Deserialize(ar);
+
+    // Capture variants inject diagnostic writes into the translated shader. A normal cached
+    // binary has the same guest program hash but none of those writes, so it must not satisfy a
+    // capture-enabled load.
+    if (Shader::DreamsCompat::IsCaptureInstrumentedShader(info.pgm_hash)) {
+        return false;
+    }
 
     fetch_shader_data = spec.fetch_shader_data;
     return true;
@@ -209,10 +321,59 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    // A stale pipeline can fail after loading only some stages. Never let those partial stage
+    // arrays or fetch metadata leak into the next pipeline considered by cache warmup.
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader.reset();
+
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
+
+    if (Shader::DreamsCompat::CaptureVs370Interface() ||
+        Shader::DreamsCompat::CaptureCe3ReadConst() ||
+        Shader::DreamsCompat::CaptureCe3FleckTrace()) {
+        // Reject target-containing pipelines before LoadPipelineStage mutates the program cache,
+        // stage arrays, or fetch-shader state. All unrelated cached graphics pipelines still warm
+        // normally; the instrumented VS and its pipelines compile on demand.
+        for (const auto hash : graphics_key.stage_hashes) {
+            if (!hash) {
+                continue;
+            }
+            std::vector<u8> meta_blob;
+            Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
+                                               fmt::format("{:#018x}", hash), meta_blob);
+            if (meta_blob.empty()) {
+                return false;
+            }
+
+            Serialization::Archive meta_ar{std::move(meta_blob)};
+            Shader::Info info{};
+            std::optional<Shader::Gcn::FetchShaderData> fetch_shader_data;
+            Shader::StageSpecialization spec{};
+            spec.info = &info;
+            size_t perm_idx{};
+            if (!LoadShaderMeta(meta_ar, info, fetch_shader_data, spec, perm_idx)) {
+                return false;
+            }
+            const bool target_vs370 =
+                Shader::DreamsCompat::CaptureVs370Interface() &&
+                info.pgm_hash == Shader::DreamsCompat::Vs370InterfaceCaptureShader &&
+                info.stage == Shader::Stage::Vertex &&
+                info.l_stage == Shader::LogicalStage::Vertex;
+            const bool target_ce3 =
+                (Shader::DreamsCompat::CaptureCe3ReadConst() ||
+                 Shader::DreamsCompat::CaptureCe3FleckTrace()) &&
+                info.pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader &&
+                info.stage == Shader::Stage::Fragment &&
+                info.l_stage == Shader::LogicalStage::Fragment;
+            if (target_vs370 || target_ce3) {
+                return false;
+            }
+        }
+    }
 
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
@@ -257,9 +418,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         return false;
     }
 
+    const ProgramCacheKey program_key{program->info.pgm_hash, program->info.stage,
+                                      program->info.l_stage, spec.runtime_info};
+    program->cache_key = program_key;
+
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
+                                       ShaderBinaryCacheKey(program->info, program_key, perm_idx),
                                        spv);
     if (spv.empty()) {
         return false;
@@ -270,7 +435,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     vk::ShaderModule module{};
 
-    auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
+    auto [it_pgm, new_program] = program_cache.try_emplace(program_key);
     if (new_program) {
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
@@ -293,7 +458,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
+    spec.info = &it_pgm.value()->info;
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    effective_spirv.insert_or_assign(module, spv);
 
     infos[stage] = &it_pgm.value()->info;
     modules[stage] = module;
@@ -302,6 +469,14 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 }
 
 void PipelineCache::WarmUp() {
+    if (Shader::DreamsCompat::CaptureB1WriterProvenance()) {
+        LOG_INFO(Render, "Pipeline cache disabled while Dreams B1 writer provenance is active");
+        return;
+    }
+    if (Shader::DreamsCompat::CaptureImageGather3D()) {
+        LOG_INFO(Render, "Pipeline cache disabled while 3D ImageGather capture is active");
+        return;
+    }
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
     }
@@ -469,11 +644,18 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
     spec.Write(samplers);
 }
 
-bool StageSpecialization::Deserialize(Serialization::Archive& ar) {
+bool StageSpecialization::Deserialize(Serialization::Archive& ar, size_t runtime_info_size) {
     Serialization::Reader spec{ar};
 
     spec.Read(start);
-    spec.Read(runtime_info);
+    ASSERT(runtime_info_size <= sizeof(runtime_info));
+    std::memset(&runtime_info, 0, sizeof(runtime_info));
+    spec.Read(&runtime_info, runtime_info_size);
+    if (runtime_info_size < sizeof(runtime_info)) {
+        runtime_info.is_indirect_draw = false;
+        runtime_info.indirect_base_vertex_sgpr = -1;
+        runtime_info.indirect_start_instance_sgpr = -1;
+    }
 
     std::string bits{};
     spec.Read(bits);

@@ -1,7 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string_view>
+
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
 #include "shader_recompiler/resource.h"
@@ -17,6 +26,48 @@ namespace VideoCore {
 using namespace Vulkan;
 using Libraries::VideoOut::TilingMode;
 using VideoOutFormat = Libraries::VideoOut::PixelFormat;
+
+static bool TraceDreamsVolumeImages() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_VOLUME_TRACE");
+        return value != nullptr && std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
+static bool IsDreamsVolumeTraceCandidate(const AmdGpu::TileMode tile_mode,
+                                         const AmdGpu::ImageType type, const Extent3D size,
+                                         const u32 num_bits) {
+    // Use the raw tile mode here. Thin3DThinPrt is currently classified as Array3DTiledThin1,
+    // which is exactly the kind of mapping error this diagnostic is meant to expose.
+    const bool is_prt_3d = tile_mode == AmdGpu::TileMode::Thin3DThinPrt ||
+                           tile_mode == AmdGpu::TileMode::Thick3DThickPrt;
+    const u64 logical_texels =
+        static_cast<u64>(size.width) * size.height * size.depth;
+    const u64 logical_bytes = logical_texels * num_bits / 8;
+    const bool is_large_volume = type == AmdGpu::ImageType::Color3D &&
+                                 (logical_texels >= 64_MB || logical_bytes >= 64_MB);
+    return is_prt_3d || is_large_volume;
+}
+
+static bool TraceFirst3DXThickImage(const AmdGpu::ArrayMode array_mode) {
+    static std::atomic_bool traced = false;
+    return array_mode == AmdGpu::ArrayMode::Array3DTiledXThick &&
+           !traced.exchange(true, std::memory_order_relaxed);
+}
+
+static bool ShouldLogVolumeTraceCount(const u64 count) {
+    return count <= 4 || std::has_single_bit(count);
+}
+
+using DreamsVolumeRawDescriptor = std::array<u64, sizeof(AmdGpu::Image) / sizeof(u64)>;
+
+static u64 NextVolumeConstructionCount(const DreamsVolumeRawDescriptor& raw) {
+    // ImageInfo construction runs on the GPU command processor thread. Keying by the complete raw
+    // descriptor ensures a frequently-bound volume cannot suppress the first report for a new one.
+    static std::map<DreamsVolumeRawDescriptor, u64> counts;
+    return ++counts[raw];
+}
 
 static vk::Format ConvertPixelFormat(const VideoOutFormat format) {
     switch (format) {
@@ -143,7 +194,41 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     guest_address = image.Address();
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
+    DreamsVolumeRawDescriptor raw{};
+    std::memcpy(raw.data(), &image, sizeof(image));
+    const bool trace_volume = TraceDreamsVolumeImages() &&
+                              IsDreamsVolumeTraceCandidate(tile_mode, type, size, num_bits);
+    const bool trace_xthick = TraceFirst3DXThickImage(array_mode);
+    const u64 trace_count = trace_volume ? NextVolumeConstructionCount(raw) : trace_xthick ? 1 : 0;
+    const bool report_trace = trace_xthick ||
+                              (trace_volume && ShouldLogVolumeTraceCount(trace_count));
+    if (report_trace) {
+        static_assert(sizeof(raw) == sizeof(image));
+        const u64 logical_texels =
+            static_cast<u64>(size.width) * size.height * size.depth * resources.layers;
+        const u64 logical_bytes = logical_texels * num_bits * num_samples / 8;
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams volume descriptor: count={} guest={:#x} raw={:#018x},{:#018x},"
+                    "{:#018x},{:#018x} tile={} array={} type={} dims={}x{}x{} pitch={} "
+                    "levels={} layers={} bits={} samples={} logical_texels={} logical_bytes={:#x} "
+                    "depth={} written={} sampled={} atomic={} pow2pad={} alt_tile={}",
+                    trace_count, guest_address, raw[0], raw[1], raw[2], raw[3],
+                    static_cast<u32>(tile_mode), static_cast<u32>(array_mode),
+                    static_cast<u32>(type), size.width, size.height, size.depth, pitch,
+                    resources.levels, resources.layers, num_bits, num_samples, logical_texels,
+                    logical_bytes, desc.is_depth, desc.is_written, desc.is_sampled, desc.is_atomic,
+                    static_cast<u32>(image.pow2pad), static_cast<u32>(image.alt_tile_mode));
+    }
     UpdateSize();
+    if (report_trace) {
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams volume layout: count={} guest={:#x} guest_size={:#x} array={} "
+                    "dims={}x{}x{} pitch={} levels={} layers={} mip0_size={:#x} "
+                    "mip0_pitch={} mip0_height={}",
+                    trace_count, guest_address, guest_size, static_cast<u32>(array_mode),
+                    size.width, size.height, size.depth, pitch, resources.levels, resources.layers,
+                    mips_layout[0].size, mips_layout[0].pitch, mips_layout[0].height);
+    }
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {
@@ -188,8 +273,15 @@ void ImageInfo::UpdateSize() {
                 ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, num_samples);
             break;
         }
+        case AmdGpu::ArrayMode::Array3DTiledXThick:
+            ASSERT_MSG(resources.levels == 1 && resources.layers == 1,
+                       "Exact 3D XThick sizing currently requires one mip and one layer; got {} "
+                       "mips and {} layers",
+                       resources.levels, resources.layers);
+            [[fallthrough]];
+        case AmdGpu::ArrayMode::ArrayPrt3DTiledThick:
         case AmdGpu::ArrayMode::Array2DTiledThick:
-            thickness = 4;
+            thickness = AmdGpu::GetMicroTileThickness(array_mode);
             mip_d += (-mip_d) & (thickness - 1);
             [[fallthrough]];
         case AmdGpu::ArrayMode::Array2DTiledThin1: {

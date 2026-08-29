@@ -254,6 +254,7 @@ public:
     Id instance_id{};
     Id push_data_block{};
     Id base_vertex{};
+    Id base_instance{};
     Id frag_coord{};
     Id front_facing{};
     Id frag_depth{};
@@ -349,6 +350,14 @@ public:
     boost::container::small_vector<BufferDefinition, 16> buffers;
     std::vector<IR::Inst*> deferred_phi_insts;
     std::vector<std::vector<size_t>> deferred_phi_args;
+    IR::Block* dreams_sculpt_replay_entry_block{};
+    std::array<IR::Inst*, 8> dreams_sculpt_state_insts{};
+    std::array<Id, 8> dreams_sculpt_normal_values{};
+    std::array<Id, 8> dreams_sculpt_replay_values{};
+    Id dreams_sculpt_replay_parent{};
+    Id dreams_sculpt_replay_doc_result{};
+    Id dreams_sculpt_post_doc_label{};
+    Id dreams_ordered_phase{};
     boost::container::small_vector<TextureDefinition, 8> images;
     boost::container::small_vector<Id, 4> samplers;
     std::unordered_map<u32, Id> first_to_last_label_map;
@@ -388,6 +397,10 @@ public:
 
     Id read_const{};
     Id read_const_dynamic{};
+    u32 dreams_ce3_readconst_capture_ordinal{};
+    u32 dreams_ce3_fleck_sample_ordinal{};
+    u32 dreams_image_gather_3d_capture_ordinal{};
+    u32 dreams_image_gather_3d_consumer_store_ordinal{};
 
 private:
     void DefineArithmeticTypes();

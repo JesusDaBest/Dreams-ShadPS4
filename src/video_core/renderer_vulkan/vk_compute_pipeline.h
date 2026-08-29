@@ -50,8 +50,12 @@ public:
                     vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
     ~ComputePipeline();
 
+    [[nodiscard]] vk::Pipeline HandleDreamsOrderedPhase(u32 phase) const noexcept;
+
 private:
     ComputePipelineKey compute_key;
+    vk::UniquePipeline dreams_ordered_collect_pipeline;
+    vk::UniquePipeline dreams_ordered_replay_pipeline;
 };
 
 } // namespace Vulkan

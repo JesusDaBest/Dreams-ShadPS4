@@ -1,8 +1,7 @@
 # Dreams Development Snapshot
 
 This branch is the complete experimental source used to investigate `Dreams` (`CUSA04301`) through
-August 21, 2026. It is intended for emulator development, not normal gameplay. Read
-[`DREAMS_HANDOFF_20260821.md`](DREAMS_HANDOFF_20260821.md) before changing the sculpt path.
+August 19, 2026. It is intended for emulator development, not normal gameplay.
 
 ## Exact status
 
@@ -14,10 +13,9 @@ August 21, 2026. It is intended for emulator development, not normal gameplay. R
   intro can be black with severely delayed audio.
 - The earlier stable executable ran the tested creation scene at roughly 15-16 FPS but left
   sculpts and paint invisible.
-- The malformed dark/grey cubes were caused by a wrong ordered-counter base calculation. The
-  corrected calculation removes that corruption but does not yet restore the missing sculpt.
-- The large sculpt root currently stops in the CPU scene-cache/model-record path before the paired
-  record count is published to traversal.
+- The newest August 19 candidate restores a required Vulkan dispatch-base pipeline flag. It makes
+  previously missing geometry appear as oversized grey, unstable shapes. This is a useful
+  localization result, not a rendering fix.
 
 Do not describe the August 17 full-screen/30 FPS observation as a verified general fix. Later
 same-machine tests contradicted it.
@@ -37,24 +35,12 @@ same-machine tests contradicted it.
   `VK_PIPELINE_CREATE_DISPATCH_BASE_BIT` before `vkCmdDispatchBase` is used. The previous
   combination was invalid Vulkan usage.
 
-## Current upstream blocker
-
-The active large sculpt root contains roughly 5,133–5,134 objects, but captured type-1 entries and
-published paired records come only from small 52-object sky/menu roots. The large-root builder has
-a sentinel cached identity and two empty incremental tables. With a nonzero token it can stay on an
-empty incremental path instead of entering full initialization.
-
-The opt-in conditional cache bootstrap in `src/core/module.cpp` and `src/core/signals.cpp` preserves
-the original zero-token branch and admits the sentinel/empty-table state. It must keep the resource
-rejection at guest `+0x8b7bc0`; bypassing that check installs incomplete state. This candidate
-builds, but it is not yet a confirmed visual fix.
-
-## Ordered count remains incomplete
+## Main unresolved rendering error
 
 Dreams traversal compute shader `0xb535c6c8` uses `DS_ORDERED_COUNT`. The current backend reduces it
 to ordinary atomics and does not reproduce guest wave-creation ordering:
 
-- M0 high bits are correctly preserved as a dword base. Only `OFFSET0` is divided by four.
+- M0 high bits select the GDS ordered-count base and are tracked.
 - M0 low bits containing the logical wave ID/wave-crawler increment are currently discarded.
 - `wave_release` and `wave_done` are decoded but do not control a guest-order queue.
 - Splitting direct traversal into ordered host workgroup dispatches does not order multiple guest
@@ -63,7 +49,7 @@ to ordinary atomics and does not reproduce guest wave-creation ordering:
   enabled.
 
 The captured shader has four ordered-count operations. All release the wave; the final operation
-also marks it done. Revisit guest-wave ordering after the large root produces CPU records.
+also marks it done. Correct guest-wave ordering is the highest-value next implementation target.
 
 The dominant captured geometry draw was indexed-indirect vertex shader `0xd25db925`, fragment
 shader `0x3f6e1a00`, `max_count=897`, stride 20, and approximately 46.3 ms in that diagnostic run.
@@ -81,20 +67,32 @@ The diagnostics are disabled unless their environment variables or trigger files
 Many force GPU waits and can reduce performance to about 1 FPS, so diagnostic results are not valid
 performance measurements.
 
-## Required Sirit patch
-
-The source uses `OpGroupNonUniformShuffle`, supplied as a separate patch because the Sirit
-submodule was locally modified without a publishable gitlink commit:
-
-```bash
-git submodule update --init --recursive
-git -C externals/sirit apply ../../patches/sirit-group-nonuniform-shuffle-20260821.patch
-```
-
-The corrected path is the default. Set
-`SHADPS4_DREAMS_REPRO_CORRUPTED_ORDERED_BASE=1` before shader compilation only when intentionally
-reproducing the earlier dark, fragmented, flickering cubes for an A/B comparison.
-
 Current status, evidence, and priorities are maintained on the repository's `main` branch:
 
 https://github.com/JesusDaBest/Dreams-ShadPS4
+
+## August 22 sculpt-volume A/B
+
+The malformed sculpt path is now localized more narrowly than the August 19 snapshot above:
+
+- Captured sculpt vertex boxes and the four GPU-visible compact-record selectors are complete,
+  finite, and coherent. The large `0x800000` selector is an intentional out-of-range sentinel;
+  Vulkan robustness correctly returns zero for it. Do not remap it or widen the descriptor.
+- The `0x84aa3dc9` sculpt-volume writer performs a leader-only ordered-count atomic, merges the
+  leader result with follower zeros, and immediately broadcasts the first lane without an
+  explicit reconvergence point.
+- Adding a subgroup control barrier between that merge and broadcast improved visible geometry in
+  the tutorial and homespace. Edit mode became too slow, so this is evidence for the faulty
+  handoff rather than a shippable fix.
+- The fragment raymarch shader `0xce3b8413`, R8 volume aliasing, tile-19 addressing, gather write
+  coordinates, and captured vertex inputs were audited and did not provide a stronger visual
+  fault.
+
+Both observed modes are retained in source. The default is the faster baseline. Set
+`SHADPS4_DREAMS_SCULPT_LEADER_BARRIER=1` before shader compilation to enable the visually improved
+but slow mode. Changing this option requires deleting the cached
+`0x0000000084aa3dc9_0.spv`; otherwise the previous compiled mode remains in use.
+
+The next implementation target is an efficient reconvergence or lane-handoff mechanism that
+preserves the barrier mode's visual result without synchronizing thousands of workgroups. Full
+guest `DS_ORDERED_COUNT` wave ordering is still independently incomplete.

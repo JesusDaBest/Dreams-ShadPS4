@@ -379,23 +379,53 @@ void Translator::DS_SWIZZLE_B32(const GcnInst& inst) {
     const u8 offset1 = inst.control.ds.offset1;
     const IR::U32 src{GetSrc(inst.src[0])};
     const IR::U32 lane_id = ir.LaneId();
+    const IR::Value active_mask{ir.Ballot(ir.GetExec())};
+    const IR::U32 active_lo{ir.CompositeExtract(active_mask, 0)};
+    const IR::U32 active_hi{ir.CompositeExtract(active_mask, 1)};
+
+    const auto source_lane_active = [&](const IR::U32& index) {
+        const IR::U1 high_lane{ir.IGreaterThanEqual(index, ir.Imm32(32), false)};
+        const IR::U32 active_word{ir.Select(high_lane, active_hi, active_lo)};
+        const IR::U32 shift{ir.BitwiseAnd(index, ir.Imm32(31))};
+        const IR::U32 active_bit{
+            ir.BitwiseAnd(ir.ShiftRightLogical(active_word, shift), ir.Imm32(1))};
+        return IR::U1{ir.INotEqual(active_bit, ir.Imm32(0))};
+    };
+
     if (offset1 & 0x80) {
         const IR::U32 id_in_group = ir.BitwiseAnd(lane_id, ir.Imm32(0b11));
         const IR::U32 base = ir.ShiftLeftLogical(id_in_group, ir.Imm32(1));
         const IR::U32 index = ir.BitFieldExtract(ir.Imm32(offset0), base, ir.Imm32(2));
-        SetDst(inst.dst[0], ir.QuadShuffle(src, index));
+        const IR::U32 quad_base{ir.BitwiseAnd(lane_id, ir.Imm32(~u32{3}))};
+        const IR::U32 source_lane{ir.BitwiseOr(quad_base, index)};
+        const IR::U1 target_active{source_lane_active(source_lane)};
+        const IR::U32 current_quad_lane{ir.BitwiseAnd(lane_id, ir.Imm32(3))};
+        const IR::U32 safe_index{ir.Select(target_active, index, current_quad_lane)};
+        const IR::U32 shuffled{ir.QuadShuffle(src, safe_index)};
+        SetDst(inst.dst[0], IR::U32{ir.Select(target_active, shuffled, ir.Imm32(0))});
     } else {
         const u8 and_mask = (offset0 & 0x1f) | (~u8{0} << 5);
         const u8 or_mask = (offset0 >> 5) | ((offset1 & 0x3) << 3);
         const u8 xor_mask = offset1 >> 2;
         if (and_mask == 0xff && or_mask == 0) {
-            SetDst(inst.dst[0], ir.ShuffleXor(src, ir.Imm32(xor_mask)));
+            const IR::U32 index{ir.BitwiseXor(lane_id, ir.Imm32(xor_mask))};
+            const IR::U1 target_active{source_lane_active(index)};
+            const IR::U32 safe_mask{ir.Select(target_active, ir.Imm32(xor_mask), ir.Imm32(0))};
+            const IR::U32 shuffled{ir.ShuffleXor(src, safe_mask)};
+            SetDst(inst.dst[0], IR::U32{ir.Select(target_active, shuffled, ir.Imm32(0))});
             return;
         }
         const IR::U32 index = ir.BitwiseXor(
             ir.BitwiseOr(ir.BitwiseAnd(lane_id, ir.Imm32(and_mask)), ir.Imm32(or_mask)),
             ir.Imm32(xor_mask));
-        SetDst(inst.dst[0], ir.ReadLane(src, index));
+        // GCN DS_SWIZZLE returns zero when the selected source lane is inactive. A raw Vulkan
+        // subgroup shuffle has undefined results in that case, which corrupts wave-prefix scans
+        // such as Dreams' ordered append compaction. Redirect inactive reads to the current lane
+        // (so the host shuffle itself remains valid), then explicitly select the required zero.
+        const IR::U1 target_active{source_lane_active(index)};
+        const IR::U32 safe_index{ir.Select(target_active, index, lane_id)};
+        const IR::U32 shuffled{ir.ReadLane(src, safe_index)};
+        SetDst(inst.dst[0], IR::U32{ir.Select(target_active, shuffled, ir.Imm32(0))});
     }
 }
 
@@ -422,12 +452,17 @@ void Translator::DS_ORDERED_COUNT(const GcnInst& inst) {
     // backend's single host-lane implementation is independent of which guest lanes are active.
     const IR::U32 first_active_value = ir.ReadLane(value, first_active_lane);
 
-    const IR::U32 gds_offset = ir.GetM0();
+    const IR::U32 m0 = ir.GetM0();
+    // Preserve M0's complete low 16 bits separately from the high-half GDS base. The 84aa shader
+    // puts its 11-bit ordered-append term here; other shaders may retain additional ordered-token
+    // fields. Resource tracking must not discard them when it converts the high half to a buffer
+    // index.
+    const IR::U32 ordered_token = ir.BitwiseAnd(m0, ir.Imm32(0xffff));
     const u32 ordered_count_control = ((inst.control.ds.offset1 >> 4) & 0x3) |
                                       ((inst.control.ds.offset1 & 0x3) << 2) |
                                       (u32(inst.control.ds.offset0) << 8);
-    const IR::U32 prev = ir.DataOrderedCount(gds_offset, first_active_value,
-                                             ordered_count_control);
+    const IR::U32 prev =
+        ir.DataOrderedCount(m0, first_active_value, ordered_token, ordered_count_control);
     SetDst(inst.dst[0], ir.ReadFirstLane(prev));
 }
 

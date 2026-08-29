@@ -3,6 +3,7 @@
 
 #include <boost/container/small_vector.hpp>
 
+#include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -24,13 +25,6 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
     };
-    const vk::PipelineShaderStageCreateInfo shader_ci = {
-        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
-        .stage = vk::ShaderStageFlagBits::eCompute,
-        .module = module,
-        .pName = "main",
-    };
-
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     for (const auto& buffer : info->buffers) {
@@ -103,21 +97,70 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
-    const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
-        .flags = (info->uses_ordered_count || info->pgm_hash == 0x7ba4de5d)
-                     ? vk::PipelineCreateFlagBits::eDispatchBase
-                     : vk::PipelineCreateFlags{},
-        .stage = shader_ci,
-        .layout = *pipeline_layout,
+    const bool uses_dreams_ordered_replay =
+        Shader::DreamsCompat::UsesExactOrderedCountReplay(info->pgm_hash);
+    const vk::SpecializationMapEntry phase_map_entry = {
+        .constantID = Shader::DreamsCompat::OrderedPhaseSpecId,
+        .offset = 0,
+        .size = sizeof(u32),
     };
-    auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
-               vk::to_string(pipeline_result));
-    pipeline = std::move(pipe);
-    SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
+    const auto create_phase_pipeline = [&](u32 phase, std::string_view phase_name) {
+        const vk::SpecializationInfo specialization_info = {
+            .mapEntryCount = 1,
+            .pMapEntries = &phase_map_entry,
+            .dataSize = sizeof(phase),
+            .pData = &phase,
+        };
+        const vk::PipelineShaderStageCreateInfo shader_ci = {
+            .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
+            .stage = vk::ShaderStageFlagBits::eCompute,
+            .module = module,
+            .pName = "main",
+            .pSpecializationInfo = uses_dreams_ordered_replay ? &specialization_info : nullptr,
+        };
+        const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+            .flags = (info->uses_ordered_count || info->pgm_hash == 0x7ba4de5d)
+                         ? vk::PipelineCreateFlagBits::eDispatchBase
+                         : vk::PipelineCreateFlags{},
+            .stage = shader_ci,
+            .layout = *pipeline_layout,
+        };
+        auto [pipeline_result, pipe] =
+            device.createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+        ASSERT_MSG(pipeline_result == vk::Result::eSuccess,
+                   "Failed to create compute pipeline {}: {}", phase_name,
+                   vk::to_string(pipeline_result));
+        SetObjectName(device, *pipe, "Compute Pipeline {} {}", debug_str, phase_name);
+        return std::move(pipe);
+    };
+
+    pipeline = create_phase_pipeline(Shader::DreamsCompat::OrderedPhaseNative, "native");
+    if (uses_dreams_ordered_replay) {
+        dreams_ordered_collect_pipeline =
+            create_phase_pipeline(Shader::DreamsCompat::OrderedPhaseCollect, "collect");
+        dreams_ordered_replay_pipeline =
+            create_phase_pipeline(Shader::DreamsCompat::OrderedPhaseReplay, "replay");
+    }
 }
 
 ComputePipeline::~ComputePipeline() = default;
+
+vk::Pipeline ComputePipeline::HandleDreamsOrderedPhase(u32 phase) const noexcept {
+    ASSERT_MSG(phase == Shader::DreamsCompat::OrderedPhaseNative ||
+                   phase == Shader::DreamsCompat::OrderedPhaseCollect ||
+                   phase == Shader::DreamsCompat::OrderedPhaseReplay,
+               "Invalid Dreams ordered-count phase {}", phase);
+    if (phase == Shader::DreamsCompat::OrderedPhaseCollect) {
+        ASSERT_MSG(dreams_ordered_collect_pipeline,
+                   "Dreams ordered-count collect pipeline was not constructed");
+        return *dreams_ordered_collect_pipeline;
+    }
+    if (phase == Shader::DreamsCompat::OrderedPhaseReplay) {
+        ASSERT_MSG(dreams_ordered_replay_pipeline,
+                   "Dreams ordered-count replay pipeline was not constructed");
+        return *dreams_ordered_replay_pipeline;
+    }
+    return *pipeline;
+}
 
 } // namespace Vulkan

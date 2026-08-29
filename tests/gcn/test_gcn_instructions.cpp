@@ -26,6 +26,70 @@ struct F32x2 {
     float b;
 };
 
+TEST_F(GcnTest, float_compare_op16_truth_table) {
+    auto runner = gcn_test::Runner::instance().value();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const std::array relation_inputs{
+        F32x2{-1.0f, 1.0f}, // less than
+        F32x2{1.0f, 1.0f},  // equal
+        F32x2{1.0f, -1.0f}, // greater than
+        F32x2{nan, 1.0f},   // unordered
+    };
+
+    // OP16's low nibble is its truth table over LT, EQ, GT, and unordered.
+    for (u32 predicate = 0; predicate < 16; ++predicate) {
+        for (const bool set_exec : {false, true}) {
+            const auto opcode =
+                static_cast<OpcodeVOP3>(predicate + (set_exec ? 16U : 0U));
+            const std::array<u64, 2> instructions{
+                VOP3A(opcode, VOperand8::V106, SOperand9::V0, SOperand9::V1).Get(),
+                VOP3A(OpcodeVOP3::V_CNDMASK_B32, VOperand8::V0, SOperand9::Const0,
+                      SOperand9::Const1, SOperand9::VccLo)
+                    .Get(),
+            };
+            const auto spirv = TranslateToSpirv(instructions);
+
+            for (u32 relation = 0; relation < relation_inputs.size(); ++relation) {
+                const auto result = runner->run<u32>(spirv, relation_inputs[relation]);
+                ASSERT_TRUE(result.has_value());
+                EXPECT_EQ(*result, (predicate >> relation) & 1U)
+                    << "predicate=" << predicate << " cmpx=" << set_exec
+                    << " relation=" << relation;
+            }
+        }
+    }
+}
+
+TEST_F(GcnTest, vector_compare_masks_destination_with_exec) {
+    auto runner = gcn_test::Runner::instance().value();
+    constexpr std::array compare_opcodes{
+        OpcodeVOP3::V_CMP_TRU_F32,
+        OpcodeVOP3::V_CMP_TRU_F64,
+        OpcodeVOP3::V_CMP_TRU_U32,
+        OpcodeVOP3::V_CMP_TRU_U64,
+        OpcodeVOP3::V_CMP_CLASS_F32,
+    };
+    // The CLASS operands select +infinity and therefore make its unmasked result true. The TRU
+    // predicates ignore these operands and are also unconditionally true.
+    constexpr std::array<u32, 2> inputs{0x7f800000U, 1U << 9};
+
+    for (const auto opcode : compare_opcodes) {
+        const std::array<u64, 4> instructions{
+            SOP1(OpcodeSOP1::S_MOV_B64, SOperand7::ExecLo, SOperand8::Const0).Get(),
+            VOP3A(opcode, VOperand8::V106, SOperand9::V0, SOperand9::V1).Get(),
+            SOP1(OpcodeSOP1::S_MOV_B64, SOperand7::ExecLo, SOperand8::ConstNeg1).Get(),
+            VOP3A(OpcodeVOP3::V_CNDMASK_B32, VOperand8::V0, SOperand9::Const0,
+                  SOperand9::Const1, SOperand9::VccLo)
+                .Get(),
+        };
+        const auto spirv = TranslateToSpirv(instructions);
+        const auto result = runner->run<u32>(spirv, inputs);
+
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(*result, 0U) << "opcode=" << static_cast<u32>(opcode);
+    }
+}
+
 // Example
 // TEST_F(GcnTest, test_name) {
 //     // Runner sets the vulkan context

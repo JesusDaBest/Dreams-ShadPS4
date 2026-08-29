@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/dreams_compat.h"
+#include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/debug_print.h"
 
 namespace Shader::Backend::SPIRV {
@@ -78,7 +81,76 @@ void EmitDiscard(EmitContext& ctx) {
     ctx.OpDemoteToHelperInvocationEXT();
 }
 
+static void EmitCe3FleckDiscardCapture(EmitContext& ctx, Id condition) {
+    namespace Capture = DreamsCompat::Ce3FleckTrace;
+    if (!DreamsCompat::CaptureCe3FleckTrace() ||
+        ctx.info.pgm_hash != DreamsCompat::Ce3ReadConstCaptureShader ||
+        ctx.stage != Stage::Fragment || ctx.l_stage != LogicalStage::Fragment) {
+        return;
+    }
+
+    const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                       &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds != ctx.buffers.end(), "ce3 fleck discard trace has no GDS descriptor");
+    const auto [buffer_id, pointer_type] = gds->Alias(EmitContext::PointerType::U32);
+    const auto pointer = [&](Id index) {
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+    };
+
+    const Id arm =
+        ctx.OpLoad(ctx.U32[1], pointer(ctx.ConstU32(Capture::ArmDword)));
+    const Id armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+    const Id armed_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(armed, armed_label, merge_label);
+
+    ctx.AddLabel(armed_label);
+    const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const auto acquire_release = spv::MemorySemanticsMask::AcquireRelease |
+                                 spv::MemorySemanticsMask::UniformMemory;
+    const auto acquire =
+        spv::MemorySemanticsMask::Acquire | spv::MemorySemanticsMask::UniformMemory;
+    const Id acquire_release_semantics =
+        ctx.ConstU32(static_cast<u32>(acquire_release));
+    const Id acquire_semantics = ctx.ConstU32(static_cast<u32>(acquire));
+    const Id candidate = ctx.OpBitcast(
+        ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param1, 0, 0));
+    const Id claimed = ctx.OpAtomicLoad(
+        ctx.U32[1], pointer(ctx.ConstU32(Capture::ClaimedParam1Dword)), device_scope,
+        acquire_semantics);
+    const Id id_matches = ctx.OpIEqual(ctx.U1[1], claimed, candidate);
+    const Id match_label = ctx.OpLabel();
+    const Id match_merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(match_merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(id_matches, match_label, match_merge_label);
+
+    ctx.AddLabel(match_label);
+    constexpr u32 DiscardBit = 1U << Capture::StaticSampleSites;
+    const Id previous = ctx.OpAtomicOr(
+        ctx.U32[1], pointer(ctx.ConstU32(Capture::SeenDword)), device_scope,
+        acquire_release_semantics, ctx.ConstU32(DiscardBit));
+    const Id already_seen = ctx.OpBitwiseAnd(ctx.U32[1], previous,
+                                             ctx.ConstU32(DiscardBit));
+    const Id won = ctx.OpIEqual(ctx.U1[1], already_seen, ctx.u32_zero_value);
+    const Id store_label = ctx.OpLabel();
+    const Id store_merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(store_merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(won, store_label, store_merge_label);
+
+    ctx.AddLabel(store_label);
+    ctx.OpStore(pointer(ctx.ConstU32(Capture::DiscardConditionDword)),
+                ctx.OpSelect(ctx.U32[1], condition, ctx.u32_one_value, ctx.u32_zero_value));
+    ctx.OpBranch(store_merge_label);
+    ctx.AddLabel(store_merge_label);
+    ctx.OpBranch(match_merge_label);
+    ctx.AddLabel(match_merge_label);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 void EmitDiscardCond(EmitContext& ctx, Id condition) {
+    EmitCe3FleckDiscardCapture(ctx, condition);
     const Id kill_label{ctx.OpLabel()};
     const Id merge_label{ctx.OpLabel()};
     ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);

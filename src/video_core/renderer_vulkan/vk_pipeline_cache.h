@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <span>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -37,6 +38,34 @@ class Instance;
 class Scheduler;
 class ShaderCache;
 
+struct IndirectDrawParameters {
+    u32 base_vertex_location{};
+    u32 start_instance_location{};
+};
+
+struct ProgramCacheKey {
+    u64 pgm_hash{};
+    Shader::Stage stage{};
+    s8 indirect_base_vertex_sgpr{-1};
+    s8 indirect_start_instance_sgpr{-1};
+    bool is_indirect_vertex{};
+
+    ProgramCacheKey() = default;
+    explicit ProgramCacheKey(u64 pgm_hash_) : pgm_hash{pgm_hash_} {}
+    ProgramCacheKey(u64 pgm_hash_, Shader::Stage stage_, Shader::LogicalStage l_stage,
+                    const Shader::RuntimeInfo& runtime_info);
+
+    [[nodiscard]] u64 CacheHash() const noexcept;
+
+    bool operator==(const ProgramCacheKey&) const noexcept = default;
+};
+
+struct ProgramCacheKeyHash {
+    size_t operator()(const ProgramCacheKey& key) const noexcept {
+        return static_cast<size_t>(key.CacheHash());
+    }
+};
+
 struct Program {
     struct Module {
         vk::ShaderModule module;
@@ -46,11 +75,13 @@ struct Program {
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
     Shader::Info info;
+    ProgramCacheKey cache_key{};
     ModuleList modules{};
 
     Program() = default;
-    Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
-        : info{stage, l_stage, params} {}
+    Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params,
+            ProgramCacheKey cache_key_)
+        : info{stage, l_stage, params}, cache_key{cache_key_} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
         modules.emplace_back(module, std::move(spec));
@@ -76,14 +107,16 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline();
+    const GraphicsPipeline* GetGraphicsPipeline(
+        const IndirectDrawParameters* indirect_draw = nullptr);
 
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
                               std::optional<Shader::Gcn::FetchShaderData>, u64>;
     Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
-                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
+                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding,
+                      const IndirectDrawParameters* indirect_draw = nullptr);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
@@ -95,20 +128,36 @@ public:
         return profile;
     }
 
+    /// Returns the exact effective SPIR-V words backing the currently selected logical stage.
+    /// The span remains valid until that shader module is replaced or the cache is destroyed.
+    std::span<const u32> GetCurrentShaderSpirv(Shader::LogicalStage stage) const;
+
+    /// Returns the driver's opaque cache blob for the live Vulkan pipeline cache.
+    /// An empty vector means the driver rejected the query.
+    std::vector<u8> GetVulkanPipelineCacheData() const;
+
 private:
-    bool RefreshGraphicsKey();
-    bool RefreshGraphicsStages();
+    static std::string GetShaderName(Shader::Stage stage, const ProgramCacheKey& program_key,
+                                     std::optional<size_t> perm = {});
+    bool RefreshGraphicsKey(const IndirectDrawParameters* indirect_draw);
+    bool RefreshGraphicsStages(const IndirectDrawParameters* indirect_draw);
     bool RefreshComputeKey();
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
-    std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::Stage stage, size_t perm_idx,
+    void DumpShader(std::span<const u32> code, const ProgramCacheKey& program_key,
+                    Shader::Stage stage, size_t perm_idx, std::string_view ext);
+    std::optional<std::vector<u32>> GetShaderPatch(const ProgramCacheKey& program_key,
+                                                   Shader::Stage stage, size_t perm_idx,
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code,
-                                   const std::span<const u32>& code_data, size_t perm_idx,
+                                   const std::span<const u32>& code_data,
+                                   const ProgramCacheKey& program_key, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
-    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
+    const Shader::RuntimeInfo& BuildRuntimeInfo(
+        Shader::Stage stage, Shader::LogicalStage l_stage,
+        const IndirectDrawParameters* indirect_draw = nullptr);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
@@ -123,12 +172,13 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
-    tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
+    tsl::robin_map<ProgramCacheKey, std::unique_ptr<Program>, ProgramCacheKeyHash> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    tsl::robin_map<vk::ShaderModule, std::vector<u32>> effective_spirv;
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};

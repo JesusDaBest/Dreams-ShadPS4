@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -28,6 +29,16 @@ u32 ParamStoreMask(const Info& info) {
         }
     }
     return mask;
+}
+
+bool NeedsImageGather3DCapture(const Info& info, Stage stage, LogicalStage l_stage) {
+    if (!DreamsCompat::CaptureImageGather3D() || stage != Stage::Compute ||
+        l_stage != LogicalStage::Compute || !info.has_image_gather) {
+        return false;
+    }
+    return std::ranges::any_of(info.images, [&](const ImageResource& image) {
+        return image.GetSharp(info).GetViewType(image.is_array) == AmdGpu::ImageType::Color3D;
+    });
 }
 
 u32 FindAuxLocation(u32 used_locations) {
@@ -101,6 +112,14 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
 
     AddCapability(spv::Capability::Shader);
     DefineArithmeticTypes();
+    if (DreamsCompat::UsesExactOrderedCountReplay(info.pgm_hash)) {
+        // Sirit currently exposes OpConstant but not OpSpecConstant. Emit a uniquely identifiable
+        // scalar declaration here; EmitSPIRV changes only its opcode after assembly. Keeping the ID
+        // in the normal declaration stream preserves canonical SPIR-V section ordering.
+        dreams_ordered_phase = Constant(U32[1], DreamsCompat::OrderedPhaseUnspecialized);
+        Decorate(dreams_ordered_phase, spv::Decoration::SpecId,
+                 DreamsCompat::OrderedPhaseSpecId);
+    }
     DefineInterfaces();
     DefineSharedMemory();
     DefineBuffers();
@@ -332,12 +351,20 @@ void EmitContext::DefineInputs() {
     if (info.uses_lane_id) {
         subgroup_local_invocation_id = DefineVariable(
             U32[1], spv::BuiltIn::SubgroupLocalInvocationId, spv::StorageClass::Input);
+        if (l_stage == LogicalStage::Fragment) {
+            Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
+        }
     }
     switch (l_stage) {
     case LogicalStage::Vertex: {
         vertex_index = DefineVariable(U32[1], spv::BuiltIn::VertexIndex, spv::StorageClass::Input);
-        base_vertex = DefineVariable(U32[1], spv::BuiltIn::BaseVertex, spv::StorageClass::Input);
         instance_id = DefineVariable(U32[1], spv::BuiltIn::InstanceIndex, spv::StorageClass::Input);
+        if (runtime_info.is_indirect_draw) {
+            base_vertex =
+                DefineVariable(U32[1], spv::BuiltIn::BaseVertex, spv::StorageClass::Input);
+            base_instance =
+                DefineVariable(U32[1], spv::BuiltIn::BaseInstance, spv::StorageClass::Input);
+        }
 
         const auto fetch_shader = Gcn::ParseFetchShader(info);
         if (!fetch_shader) {
@@ -469,21 +496,28 @@ void EmitContext::DefineInputs() {
         }
         break;
     }
-    case LogicalStage::Compute:
-        if (info.loads.GetAny(IR::Attribute::WorkgroupIndex) ||
+    case LogicalStage::Compute: {
+        const bool needs_image_gather_3d_capture =
+            NeedsImageGather3DCapture(info, stage, l_stage);
+        const bool needs_workgroup_index =
+            info.loads.GetAny(IR::Attribute::WorkgroupIndex) ||
+            DreamsCompat::UsesExactOrderedCountReplay(info.pgm_hash);
+        if (needs_image_gather_3d_capture || needs_workgroup_index ||
             info.loads.GetAny(IR::Attribute::WorkgroupId)) {
             workgroup_id =
                 DefineVariable(U32[3], spv::BuiltIn::WorkgroupId, spv::StorageClass::Input);
         }
-        if (info.loads.GetAny(IR::Attribute::WorkgroupIndex)) {
+        if (needs_workgroup_index) {
             num_workgroups_id =
                 DefineVariable(U32[3], spv::BuiltIn::NumWorkgroups, spv::StorageClass::Input);
         }
-        if (info.loads.GetAny(IR::Attribute::LocalInvocationId)) {
+        if (needs_image_gather_3d_capture ||
+            info.loads.GetAny(IR::Attribute::LocalInvocationId)) {
             local_invocation_id =
                 DefineVariable(U32[3], spv::BuiltIn::LocalInvocationId, spv::StorageClass::Input);
         }
         break;
+    }
     case LogicalStage::Geometry: {
         primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
         const auto gl_per_vertex =
@@ -759,7 +793,7 @@ void EmitContext::DefineOutputs() {
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4],
-                                         U32[4], U32[4], U32[4], U32[2]),
+                                         U32[4], U32[4], U32[4], U32[2], U32[2]),
                               "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -773,6 +807,7 @@ void EmitContext::DefinePushDataBlock() {
     MemberName(struct_type, PushData::BufOffsetIndex + 0, "buf_offsets0");
     MemberName(struct_type, PushData::BufOffsetIndex + 1, "buf_offsets1");
     MemberName(struct_type, PushData::BufOffsetIndex + 2, "buf_offsets2");
+    MemberName(struct_type, PushData::HostDataIndex, "host_data");
     MemberDecorate(struct_type, PushData::XOffsetIndex, spv::Decoration::Offset, 0U);
     MemberDecorate(struct_type, PushData::YOffsetIndex, spv::Decoration::Offset, 4U);
     MemberDecorate(struct_type, PushData::XScaleIndex, spv::Decoration::Offset, 8U);
@@ -784,6 +819,7 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 80U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 96U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 112U);
+    MemberDecorate(struct_type, PushData::HostDataIndex, spv::Decoration::Offset, 120U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -844,6 +880,64 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_storage, bool is_writte
 };
 
 void EmitContext::DefineBuffers() {
+    if (NeedsImageGather3DCapture(info, stage, l_stage)) {
+        auto gds =
+            std::ranges::find(info.buffers, BufferType::GdsBuffer, &BufferResource::buffer_type);
+        if (gds == info.buffers.end()) {
+            ASSERT_MSG(info.buffers.size() < NUM_BUFFERS,
+                       "3D ImageGather capture has no spare buffer descriptor");
+            info.buffers.push_back({
+                .used_types = IR::Type::U32,
+                .inline_cbuf = AmdGpu::Buffer::Null(),
+                .buffer_type = BufferType::GdsBuffer,
+                .is_written = true,
+            });
+        } else {
+            gds->used_types |= IR::Type::U32;
+            gds->is_written = true;
+        }
+    }
+
+    if (DreamsCompat::CaptureVs370Interface() &&
+        info.pgm_hash == DreamsCompat::Vs370InterfaceCaptureShader && stage == Stage::Vertex &&
+        l_stage == LogicalStage::Vertex) {
+        auto gds =
+            std::ranges::find(info.buffers, BufferType::GdsBuffer, &BufferResource::buffer_type);
+        if (gds == info.buffers.end()) {
+            ASSERT_MSG(info.buffers.size() < NUM_BUFFERS,
+                       "VS370 Position0 capture has no spare buffer descriptor");
+            info.buffers.push_back({
+                .used_types = IR::Type::U32,
+                .inline_cbuf = AmdGpu::Buffer::Null(),
+                .buffer_type = BufferType::GdsBuffer,
+                .is_written = true,
+            });
+        } else {
+            gds->used_types |= IR::Type::U32;
+            gds->is_written = true;
+        }
+    }
+
+    if ((DreamsCompat::CaptureCe3ReadConst() || DreamsCompat::CaptureCe3FleckTrace()) &&
+        info.pgm_hash == DreamsCompat::Ce3ReadConstCaptureShader && stage == Stage::Fragment &&
+        l_stage == LogicalStage::Fragment) {
+        auto gds =
+            std::ranges::find(info.buffers, BufferType::GdsBuffer, &BufferResource::buffer_type);
+        if (gds == info.buffers.end()) {
+            ASSERT_MSG(info.buffers.size() < NUM_BUFFERS,
+                       "ce3 fragment capture has no spare buffer descriptor");
+            info.buffers.push_back({
+                .used_types = IR::Type::U32,
+                .inline_cbuf = AmdGpu::Buffer::Null(),
+                .buffer_type = BufferType::GdsBuffer,
+                .is_written = true,
+            });
+        } else {
+            gds->used_types |= IR::Type::U32;
+            gds->is_written = true;
+        }
+    }
+
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
         const bool is_storage = desc.IsStorage(buf_sharp);

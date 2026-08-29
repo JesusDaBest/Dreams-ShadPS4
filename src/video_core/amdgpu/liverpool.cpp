@@ -4,7 +4,9 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <fstream>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -31,30 +33,108 @@ static bool DreamsDiagnosticsEnabled() {
     return enabled;
 }
 
+static bool DreamsGds902TraceEnabled() {
+    static const bool enabled = std::getenv("SHADPS4_DREAMS_GDS_902_TRACE") != nullptr;
+    return enabled;
+}
+
+static bool DispatchPatchTraceEnabled() {
+    static const bool enabled = std::getenv("SHADPS4_DISPATCH_PATCH_TRACE") != nullptr;
+    return enabled;
+}
+
 static bool DreamsSyncComputeReleaseMem() {
     static const bool enabled =
         std::getenv("SHADPS4_DREAMS_SYNC_COMPUTE_RELEASE_MEM") != nullptr;
     return enabled;
 }
 
+static bool DreamsComputeStallTraceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_COMPUTE_STALL_TRACE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
+static void TraceDreamsComputeStall(const u32 vqid, const PM4ItOpcode opcode,
+                                    const ComputeProgram& program, const u64 elapsed_us,
+                                    const u32 pending_submits) {
+    if (!DreamsComputeStallTraceEnabled() || elapsed_us < 2'000) {
+        return;
+    }
+    static std::atomic<u32> trace_count{};
+    const u32 ordinal = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (ordinal >= 4096) {
+        return;
+    }
+    static std::ofstream file{"dreams-compute-stall-trace.txt", std::ios::out | std::ios::trunc};
+    const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    file << "compute_stall=" << ordinal << " time_us=" << now_us << " queue=" << vqid
+         << " opcode=" << static_cast<u32>(opcode) << " elapsed_us=" << elapsed_us
+         << " program=0x" << std::hex << program.address << std::dec << " dims=" << program.dim_x
+         << 'x' << program.dim_y << 'x' << program.dim_z << " pending_submits=" << pending_submits
+         << '\n';
+    file.flush();
+}
+
 static void TraceDreamsGdsDma(const PM4DmaData& packet, const char* queue_name) {
     static std::atomic<u32> trace_count{};
-    if (!DreamsDiagnosticsEnabled() ||
+    const bool trace_902 = DreamsGds902TraceEnabled();
+    if ((!DreamsDiagnosticsEnabled() && !trace_902) ||
         (packet.src_sel != DmaDataSrc::Gds && packet.dst_sel != DmaDataDst::Gds)) {
         return;
     }
     const u32 index = trace_count.fetch_add(1, std::memory_order_relaxed);
-    if (index >= 128) {
+    if (index >= (trace_902 ? 4096 : 128)) {
         return;
     }
     LOG_WARNING(Render,
-             "Dreams GDS DMA #{} queue={} header={:#010x} control={:#010x} src_lo={:#010x} "
-             "src_hi={:#010x} dst_lo={:#010x} dst_hi={:#010x} command={:#010x} "
-             "src_sel={} dst_sel={} bytes={:#x}",
-             index, queue_name, packet.header.raw, reinterpret_cast<const u32*>(&packet)[1],
-             packet.src_addr_lo, packet.src_addr_hi, packet.dst_addr_lo, packet.dst_addr_hi,
-             packet.command, u32(packet.src_sel.Value()), u32(packet.dst_sel.Value()),
-             packet.NumBytes());
+              "Dreams GDS DMA #{} queue={} header={:#010x} control={:#010x} src_lo={:#010x} "
+              "src_hi={:#010x} dst_lo={:#010x} dst_hi={:#010x} command={:#010x} "
+              "src_sel={} dst_sel={} bytes={:#x} cp_sync={}",
+              index, queue_name, packet.header.raw, reinterpret_cast<const u32*>(&packet)[1],
+              packet.src_addr_lo, packet.src_addr_hi, packet.dst_addr_lo, packet.dst_addr_hi,
+              packet.command, u32(packet.src_sel.Value()), u32(packet.dst_sel.Value()),
+              packet.NumBytes(), packet.cp_sync.Value());
+}
+
+static void TraceDreamsCopyData(const PM4CmdCopyData& packet, const char* queue_name) {
+    static std::atomic<u32> trace_count{};
+    if (!DreamsGds902TraceEnabled()) {
+        return;
+    }
+    const u32 index = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (index >= 4096) {
+        return;
+    }
+    LOG_WARNING(Render,
+                "Dreams COPY_DATA #{} queue={} header={:#010x} control={:#010x} "
+                "src_lo={:#010x} src_hi={:#010x} dst_lo={:#010x} dst_hi={:#010x} "
+                "src_sel={} dst_sel={} count_sel={} wr_confirm={} engine_sel={}",
+                index, queue_name, packet.header.raw, packet.control, packet.src_addr_lo,
+                packet.src_addr_hi, packet.dst_addr_lo, packet.dst_addr_hi,
+                u32(packet.src_sel.Value()), u32(packet.dst_sel.Value()), packet.count_sel.Value(),
+                packet.wr_confirm.Value(), u32(packet.engine_sel.Value()));
+}
+
+static void TraceDreamsWriteData(const PM4CmdWriteData& packet, const char* queue_name) {
+    static std::atomic<u32> trace_count{};
+    if (!DreamsGds902TraceEnabled()) {
+        return;
+    }
+    const u32 index = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (index >= 4096) {
+        return;
+    }
+    LOG_WARNING(Render,
+                "Dreams WRITE_DATA #{} queue={} header={:#010x} control={:#010x} "
+                "dst_lo={:#010x} dst_hi={:#010x} dst_sel={} bytes={:#x} first={:#010x}",
+                index, queue_name, packet.header.raw, packet.raw, packet.dst_addr_lo,
+                packet.dst_addr_hi, packet.dst_sel.Value(), packet.Size(),
+                packet.Size() >= sizeof(u32) ? packet.data[0] : 0);
 }
 
 static void TraceDreamsGdsRelease(const PM4CmdReleaseMem& packet, const char* queue_name) {
@@ -284,6 +364,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    const size_t dcb_size = dcb.size_bytes();
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -544,10 +625,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DrawIndirect", cmd_address));
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0);
+                        rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0,
+                                                 draw_indirect->base_vtx_loc.Value(),
+                                                 draw_indirect->start_inst_loc.Value());
                         rasterizer->ScopeMarkerEnd();
                     } else {
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0);
+                        rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0,
+                                                 draw_indirect->base_vtx_loc.Value(),
+                                                 draw_indirect->start_inst_loc.Value());
                     }
                 }
                 break;
@@ -564,12 +649,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DrawIndirectMulti", cmd_address));
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                                 draw_indirect->stride, draw_indirect->count, 0);
+                        rasterizer->DrawIndirect(
+                            false, indirect_args_addr, offset, draw_indirect->stride,
+                            draw_indirect->count, 0, draw_indirect->base_vtx_loc.Value(),
+                            draw_indirect->start_inst_loc.Value());
                         rasterizer->ScopeMarkerEnd();
                     } else {
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                                 draw_indirect->stride, draw_indirect->count, 0);
+                        rasterizer->DrawIndirect(
+                            false, indirect_args_addr, offset, draw_indirect->stride,
+                            draw_indirect->count, 0, draw_indirect->base_vtx_loc.Value(),
+                            draw_indirect->start_inst_loc.Value());
                     }
                 }
                 break;
@@ -587,10 +676,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DrawIndexIndirect", cmd_address));
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0);
+                        rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0,
+                                                 draw_index_indirect->base_vtx_loc.Value(),
+                                                 draw_index_indirect->start_inst_loc.Value());
                         rasterizer->ScopeMarkerEnd();
                     } else {
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0);
+                        rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0,
+                                                 draw_index_indirect->base_vtx_loc.Value(),
+                                                 draw_index_indirect->start_inst_loc.Value());
                     }
                 }
                 break;
@@ -607,14 +700,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DrawIndexIndirectMulti", cmd_address));
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                                 draw_index_indirect->stride,
-                                                 draw_index_indirect->count, 0);
+                        rasterizer->DrawIndirect(
+                            true, indirect_args_addr, offset, draw_index_indirect->stride,
+                            draw_index_indirect->count, 0,
+                            draw_index_indirect->base_vtx_loc.Value(),
+                            draw_index_indirect->start_inst_loc.Value());
                         rasterizer->ScopeMarkerEnd();
                     } else {
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                                 draw_index_indirect->stride,
-                                                 draw_index_indirect->count, 0);
+                        rasterizer->DrawIndirect(
+                            true, indirect_args_addr, offset, draw_index_indirect->stride,
+                            draw_index_indirect->count, 0,
+                            draw_index_indirect->base_vtx_loc.Value(),
+                            draw_index_indirect->start_inst_loc.Value());
                     }
                 }
                 break;
@@ -631,26 +728,76 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DrawIndexIndirectCountMulti", cmd_address));
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                                 draw_index_indirect->stride,
-                                                 draw_index_indirect->count,
-                                                 draw_index_indirect->count_indirect_enable.Value()
-                                                     ? draw_index_indirect->count_addr
-                                                     : 0);
+                        rasterizer->DrawIndirect(
+                            true, indirect_args_addr, offset, draw_index_indirect->stride,
+                            draw_index_indirect->count,
+                            draw_index_indirect->count_indirect_enable.Value()
+                                ? draw_index_indirect->count_addr
+                                : 0,
+                            draw_index_indirect->base_vtx_loc.Value(),
+                            draw_index_indirect->start_inst_loc.Value());
                         rasterizer->ScopeMarkerEnd();
                     } else {
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                                 draw_index_indirect->stride,
-                                                 draw_index_indirect->count,
-                                                 draw_index_indirect->count_indirect_enable.Value()
-                                                     ? draw_index_indirect->count_addr
-                                                     : 0);
+                        rasterizer->DrawIndirect(
+                            true, indirect_args_addr, offset, draw_index_indirect->stride,
+                            draw_index_indirect->count,
+                            draw_index_indirect->count_indirect_enable.Value()
+                                ? draw_index_indirect->count_addr
+                                : 0,
+                            draw_index_indirect->base_vtx_loc.Value(),
+                            draw_index_indirect->start_inst_loc.Value());
                     }
                 }
                 break;
             }
             case PM4ItOpcode::DispatchDirect: {
                 const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+                if (DispatchPatchTraceEnabled()) {
+                    const VAddr payload_address =
+                        reinterpret_cast<VAddr>(&dispatch_direct->dim_x);
+                    const bool payload_mapped =
+                        rasterizer && rasterizer->IsMapped(payload_address, sizeof(u32) * 3);
+                    bool payload_registered = false;
+                    bool payload_cpu_modified = false;
+                    bool payload_gpu_modified = false;
+                    bool payload_gpu_modified_exact = false;
+                    if (payload_mapped) {
+                        auto& buffer_cache = rasterizer->GetBufferCache();
+                        payload_registered =
+                            buffer_cache.IsRegionRegistered(payload_address, sizeof(u32) * 3);
+                        payload_cpu_modified =
+                            buffer_cache.IsRegionCpuModified(payload_address, sizeof(u32) * 3);
+                        payload_gpu_modified =
+                            buffer_cache.IsRegionGpuModified(payload_address, sizeof(u32) * 3);
+                        payload_gpu_modified_exact =
+                            buffer_cache.IsRegionGpuModifiedExact(payload_address, sizeof(u32) * 3);
+                    }
+                    const bool huge = dispatch_direct->dim_x >= (1u << 20) ||
+                                      dispatch_direct->dim_y >= (1u << 20) ||
+                                      dispatch_direct->dim_z >= (1u << 20);
+                    static std::atomic<u64> dispatch_index{};
+                    static std::atomic<u32> trace_count{};
+                    const u64 current_dispatch =
+                        dispatch_index.fetch_add(1, std::memory_order_relaxed);
+                    if (current_dispatch < 16 || payload_gpu_modified_exact || huge) {
+                        const u32 index = trace_count.fetch_add(1, std::memory_order_relaxed);
+                        if (index < 1024) {
+                        LOG_WARNING(
+                            Render,
+                            "Dispatch patch trace direct queue=graphics index={} dispatch={} packet={:#x} "
+                            "payload={:#x} scope={:#x}+{:#x} header={:#010x} predicate={} "
+                            "mapped={} registered={} cpu_page={} gpu_page={} gpu_exact={} huge={} "
+                            "dims={}x{}x{} initiator={:#010x}",
+                            index, current_dispatch, reinterpret_cast<u64>(header),
+                            payload_address, u64(base_addr), u64(dcb_size), header->raw,
+                            static_cast<u32>(header->type3.predicate.Value()),
+                            payload_mapped, payload_registered, payload_cpu_modified,
+                            payload_gpu_modified, payload_gpu_modified_exact, huge,
+                            dispatch_direct->dim_x, dispatch_direct->dim_y,
+                            dispatch_direct->dim_z, dispatch_direct->dispatch_initiator);
+                        }
+                    }
+                }
                 auto& cs_program = GetCsRegs();
                 cs_program.dim_x = dispatch_direct->dim_x;
                 cs_program.dim_y = dispatch_direct->dim_y;
@@ -677,6 +824,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* dispatch_indirect =
                     reinterpret_cast<const PM4CmdDispatchIndirect*>(header);
                 auto& cs_program = GetCsRegs();
+                cs_program.dispatch_initiator = dispatch_indirect->dispatch_initiator;
                 const auto offset = dispatch_indirect->data_offset;
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
                 if (DebugState.DumpingCurrentReg()) {
@@ -804,6 +952,36 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    if (DispatchPatchTraceEnabled() &&
+                        dma_data->NumBytes() ==
+                            sizeof(PM4CmdDispatchIndirect::GroupDimensions)) {
+                        static std::atomic<u32> trace_count{};
+                        const u32 index = trace_count.fetch_add(1, std::memory_order_relaxed);
+                        if (index < 512) {
+                            const VAddr src_addr = dma_data->SrcAddress<VAddr>();
+                            const VAddr dst_addr = dma_data->DstAddress<VAddr>();
+                            const bool target_in_scope =
+                                dst_addr >= base_addr + sizeof(PM4Header) &&
+                                dst_addr + sizeof(PM4CmdDispatchIndirect::GroupDimensions) <=
+                                    base_addr + dcb_size;
+                            const PM4Header* target_header =
+                                target_in_scope
+                                    ? reinterpret_cast<const PM4Header*>(dst_addr -
+                                                                        sizeof(PM4Header))
+                                    : nullptr;
+                            const bool targets_direct =
+                                target_header && target_header->type == 3 &&
+                                target_header->type3.opcode == PM4ItOpcode::DispatchDirect;
+                            LOG_WARNING(
+                                Render,
+                                "Dispatch patch trace dma queue=graphics index={} packet={:#x} "
+                                "src={:#x} dst={:#x} scope={:#x}+{:#x} in_scope={} "
+                                "targets_direct={} target_header={:#010x}",
+                                index, reinterpret_cast<u64>(header), src_addr, dst_addr,
+                                u64(base_addr), u64(dcb_size), target_in_scope, targets_direct,
+                                target_header ? target_header->raw : 0u);
+                        }
+                    }
                     rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
                                            dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
                                            false, false);
@@ -815,6 +993,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WriteData: {
                 const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+                TraceDreamsWriteData(*write_data, "graphics");
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
@@ -827,6 +1006,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::CopyData: {
                 const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
+                TraceDreamsCopyData(*copy_data, "graphics");
                 LOG_WARNING(Render,
                             "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
                             "count_sel = {}, wr_confirm = {}, engine_sel = {}",
@@ -1010,6 +1190,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        const auto packet_start = std::chrono::steady_clock::now();
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1065,8 +1246,34 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (dst_addr >= base_addr && dst_addr < base_addr + acb_size &&
                     num_bytes == sizeof(PM4CmdDispatchIndirect::GroupDimensions) &&
                     header->type == 3 && header->type3.opcode == PM4ItOpcode::DispatchDirect) {
+                    if (DispatchPatchTraceEnabled()) {
+                        static std::atomic<u32> trace_count{};
+                        const u32 index = trace_count.fetch_add(1, std::memory_order_relaxed);
+                        if (index < 512) {
+                            LOG_WARNING(
+                                Render,
+                                "Dispatch patch trace dma queue=compute[{}] index={} "
+                                "packet={:#x} src={:#x} dst={:#x} scope={:#x}+{:#x} "
+                                "targets_direct=true target_header={:#010x}",
+                                vqid, index, reinterpret_cast<u64>(dma_data), src_addr, dst_addr,
+                                u64(base_addr), u64(acb_size), header->raw);
+                        }
+                    }
                     indirect_patches.emplace_back(header, src_addr);
                 } else {
+                    if (DispatchPatchTraceEnabled() &&
+                        num_bytes == sizeof(PM4CmdDispatchIndirect::GroupDimensions)) {
+                        static std::atomic<u32> trace_count{};
+                        const u32 index = trace_count.fetch_add(1, std::memory_order_relaxed);
+                        if (index < 512) {
+                            LOG_WARNING(Render,
+                                        "Dispatch patch trace dma queue=compute[{}] index={} "
+                                        "packet={:#x} src={:#x} dst={:#x} scope={:#x}+{:#x} "
+                                        "targets_direct=false",
+                                        vqid, index, reinterpret_cast<u64>(dma_data), src_addr,
+                                        dst_addr, u64(base_addr), u64(acb_size));
+                        }
+                    }
                     rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
                 }
             } else {
@@ -1118,6 +1325,26 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->DispatchIndirect(it->indirect_addr, 0, size);
                 break;
             }
+            if (DispatchPatchTraceEnabled() &&
+                (dispatch_direct->dim_x >= (1u << 20) ||
+                 dispatch_direct->dim_y >= (1u << 20) ||
+                 dispatch_direct->dim_z >= (1u << 20))) {
+                static std::atomic<u32> trace_count{};
+                const u32 index = trace_count.fetch_add(1, std::memory_order_relaxed);
+                if (index < 256) {
+                    LOG_WARNING(
+                        Render,
+                        "Dispatch patch trace huge queue=compute[{}] index={} packet={:#x} "
+                        "payload={:#x} scope={:#x}+{:#x} header={:#010x} predicate={} "
+                        "dims={}x{}x{} initiator={:#010x}",
+                        vqid, index, reinterpret_cast<u64>(header),
+                        reinterpret_cast<u64>(&dispatch_direct->dim_x), u64(base_addr),
+                        u64(acb_size), header->raw,
+                        static_cast<u32>(header->type3.predicate.Value()),
+                        dispatch_direct->dim_x, dispatch_direct->dim_y, dispatch_direct->dim_z,
+                        dispatch_direct->dispatch_initiator);
+                }
+            }
             auto& cs_program = GetCsRegs();
             cs_program.dim_x = dispatch_direct->dim_x;
             cs_program.dim_y = dispatch_direct->dim_y;
@@ -1144,6 +1371,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* dispatch_indirect =
                 reinterpret_cast<const PM4CmdDispatchIndirectMec*>(header);
             auto& cs_program = GetCsRegs();
+            cs_program.dispatch_initiator = dispatch_indirect->dispatch_initiator;
             const auto ib_address = dispatch_indirect->Address<VAddr>();
             const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
             if (DebugState.DumpingCurrentReg()) {
@@ -1165,6 +1393,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::WriteData: {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+            TraceDreamsWriteData(*write_data, "compute");
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
@@ -1228,6 +1457,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         default:
             UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                             static_cast<u32>(opcode), header->type3.NumWords());
+        }
+
+        if (DreamsComputeStallTraceEnabled()) {
+            const u64 elapsed_us = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - packet_start)
+                    .count());
+            TraceDreamsComputeStall(vqid, opcode, mapped_queues[vqid + 1].cs_state, elapsed_us,
+                                    num_submits.load(std::memory_order_relaxed));
         }
 
         acb = NextPacket(acb, next_dw_off);

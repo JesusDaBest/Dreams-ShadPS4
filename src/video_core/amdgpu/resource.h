@@ -397,6 +397,12 @@ enum class Filter : u64 {
     AnisoLinear = 3,
 };
 
+enum class ZFilter : u64 {
+    None = 0,
+    Point = 1,
+    Linear = 2,
+};
+
 constexpr bool IsAnisoFilter(const Filter filter) {
     return filter == Filter::AnisoPoint || filter == Filter::AnisoLinear;
 }
@@ -442,7 +448,7 @@ struct Sampler {
         BitField<14, 6, u64> lod_bias_sec;
         BitField<20, 2, Filter> xy_mag_filter;
         BitField<22, 2, Filter> xy_min_filter;
-        BitField<24, 2, u64> z_filter;
+        BitField<24, 2, ZFilter> z_filter;
         BitField<26, 2, MipFilter> mip_filter;
         BitField<28, 1, u64> mip_point_preclamp;
         BitField<29, 1, u64> disable_lsb_ceil;

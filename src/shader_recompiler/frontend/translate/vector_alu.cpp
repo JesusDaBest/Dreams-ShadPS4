@@ -237,18 +237,24 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_CMP_F32(ConditionOp::LG, false, inst);
     case Opcode::V_CMP_GE_F32:
         return V_CMP_F32(ConditionOp::GE, false, inst);
+    case Opcode::V_CMP_O_F32:
+        return V_CMP_F32(ConditionOp::O, false, inst);
     case Opcode::V_CMP_U_F32:
         return V_CMP_F32(ConditionOp::U, false, inst);
     case Opcode::V_CMP_NGE_F32:
-        return V_CMP_F32(ConditionOp::LT, false, inst);
+        return V_CMP_F32(ConditionOp::NGE, false, inst);
+    case Opcode::V_CMP_NLG_F32:
+        return V_CMP_F32(ConditionOp::NLG, false, inst);
     case Opcode::V_CMP_NGT_F32:
-        return V_CMP_F32(ConditionOp::LE, false, inst);
+        return V_CMP_F32(ConditionOp::NGT, false, inst);
     case Opcode::V_CMP_NLE_F32:
-        return V_CMP_F32(ConditionOp::GT, false, inst);
+        return V_CMP_F32(ConditionOp::NLE, false, inst);
     case Opcode::V_CMP_NEQ_F32:
-        return V_CMP_F32(ConditionOp::LG, false, inst);
+        return V_CMP_F32(ConditionOp::NEQ, false, inst);
     case Opcode::V_CMP_NLT_F32:
-        return V_CMP_F32(ConditionOp::GE, false, inst);
+        return V_CMP_F32(ConditionOp::NLT, false, inst);
+    case Opcode::V_CMP_TRU_F32:
+        return V_CMP_F32(ConditionOp::TRU, false, inst);
 
         //     V_CMPX_{OP16}_F32
     case Opcode::V_CMPX_F_F32:
@@ -265,18 +271,22 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_CMP_F32(ConditionOp::LG, true, inst);
     case Opcode::V_CMPX_GE_F32:
         return V_CMP_F32(ConditionOp::GE, true, inst);
+    case Opcode::V_CMPX_O_F32:
+        return V_CMP_F32(ConditionOp::O, true, inst);
+    case Opcode::V_CMPX_U_F32:
+        return V_CMP_F32(ConditionOp::U, true, inst);
     case Opcode::V_CMPX_NGE_F32:
-        return V_CMP_F32(ConditionOp::LT, true, inst);
+        return V_CMP_F32(ConditionOp::NGE, true, inst);
     case Opcode::V_CMPX_NLG_F32:
-        return V_CMP_F32(ConditionOp::EQ, true, inst);
+        return V_CMP_F32(ConditionOp::NLG, true, inst);
     case Opcode::V_CMPX_NGT_F32:
-        return V_CMP_F32(ConditionOp::LE, true, inst);
+        return V_CMP_F32(ConditionOp::NGT, true, inst);
     case Opcode::V_CMPX_NLE_F32:
-        return V_CMP_F32(ConditionOp::GT, true, inst);
+        return V_CMP_F32(ConditionOp::NLE, true, inst);
     case Opcode::V_CMPX_NEQ_F32:
-        return V_CMP_F32(ConditionOp::LG, true, inst);
+        return V_CMP_F32(ConditionOp::NEQ, true, inst);
     case Opcode::V_CMPX_NLT_F32:
-        return V_CMP_F32(ConditionOp::GE, true, inst);
+        return V_CMP_F32(ConditionOp::NLT, true, inst);
     case Opcode::V_CMPX_TRU_F32:
         return V_CMP_F32(ConditionOp::TRU, true, inst);
 
@@ -295,18 +305,58 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
         return V_CMP_F64(ConditionOp::LG, false, inst);
     case Opcode::V_CMP_GE_F64:
         return V_CMP_F64(ConditionOp::GE, false, inst);
+    case Opcode::V_CMP_O_F64:
+        return V_CMP_F64(ConditionOp::O, false, inst);
     case Opcode::V_CMP_U_F64:
         return V_CMP_F64(ConditionOp::U, false, inst);
     case Opcode::V_CMP_NGE_F64:
-        return V_CMP_F64(ConditionOp::LT, false, inst);
+        return V_CMP_F64(ConditionOp::NGE, false, inst);
+    case Opcode::V_CMP_NLG_F64:
+        return V_CMP_F64(ConditionOp::NLG, false, inst);
     case Opcode::V_CMP_NGT_F64:
-        return V_CMP_F64(ConditionOp::LE, false, inst);
+        return V_CMP_F64(ConditionOp::NGT, false, inst);
     case Opcode::V_CMP_NLE_F64:
-        return V_CMP_F64(ConditionOp::GT, false, inst);
+        return V_CMP_F64(ConditionOp::NLE, false, inst);
     case Opcode::V_CMP_NEQ_F64:
-        return V_CMP_F64(ConditionOp::LG, false, inst);
+        return V_CMP_F64(ConditionOp::NEQ, false, inst);
     case Opcode::V_CMP_NLT_F64:
-        return V_CMP_F64(ConditionOp::GE, false, inst);
+        return V_CMP_F64(ConditionOp::NLT, false, inst);
+    case Opcode::V_CMP_TRU_F64:
+        return V_CMP_F64(ConditionOp::TRU, false, inst);
+
+        //     V_CMPX_{OP16}_F64
+    case Opcode::V_CMPX_F_F64:
+        return V_CMP_F64(ConditionOp::F, true, inst);
+    case Opcode::V_CMPX_LT_F64:
+        return V_CMP_F64(ConditionOp::LT, true, inst);
+    case Opcode::V_CMPX_EQ_F64:
+        return V_CMP_F64(ConditionOp::EQ, true, inst);
+    case Opcode::V_CMPX_LE_F64:
+        return V_CMP_F64(ConditionOp::LE, true, inst);
+    case Opcode::V_CMPX_GT_F64:
+        return V_CMP_F64(ConditionOp::GT, true, inst);
+    case Opcode::V_CMPX_LG_F64:
+        return V_CMP_F64(ConditionOp::LG, true, inst);
+    case Opcode::V_CMPX_GE_F64:
+        return V_CMP_F64(ConditionOp::GE, true, inst);
+    case Opcode::V_CMPX_O_F64:
+        return V_CMP_F64(ConditionOp::O, true, inst);
+    case Opcode::V_CMPX_U_F64:
+        return V_CMP_F64(ConditionOp::U, true, inst);
+    case Opcode::V_CMPX_NGE_F64:
+        return V_CMP_F64(ConditionOp::NGE, true, inst);
+    case Opcode::V_CMPX_NLG_F64:
+        return V_CMP_F64(ConditionOp::NLG, true, inst);
+    case Opcode::V_CMPX_NGT_F64:
+        return V_CMP_F64(ConditionOp::NGT, true, inst);
+    case Opcode::V_CMPX_NLE_F64:
+        return V_CMP_F64(ConditionOp::NLE, true, inst);
+    case Opcode::V_CMPX_NEQ_F64:
+        return V_CMP_F64(ConditionOp::NEQ, true, inst);
+    case Opcode::V_CMPX_NLT_F64:
+        return V_CMP_F64(ConditionOp::NLT, true, inst);
+    case Opcode::V_CMPX_TRU_F64:
+        return V_CMP_F64(ConditionOp::TRU, true, inst);
 
         //     V_CMP_{OP8}_I32
     case Opcode::V_CMP_LT_I32:
@@ -601,9 +651,12 @@ void Translator::V_CNDMASK_B32(const GcnInst& inst) {
     const IR::U1 flag = inst.src[2].field == OperandField::ScalarGPR
                             ? GetThreadBitScalarReg(flag_reg)
                             : ir.GetVcc();
-    const IR::Value result =
-        ir.Select(flag, GetSrc<IR::F32>(inst.src[1]), GetSrc<IR::F32>(inst.src[0]));
-    SetDst(inst.dst[0], IR::U32F32{result});
+    // V_CNDMASK_B32 is a raw 32-bit mux. Selecting through F32 makes integer bit patterns such as
+    // 4, 8, 16, and 20 into floating-point subnormals, which SPIR-V may flush to zero under the
+    // shader's denormal mode. Keep the operands and selection integer-typed so every bit survives.
+    const IR::U32 result{
+        ir.Select(flag, GetSrc<IR::U32>(inst.src[1]), GetSrc<IR::U32>(inst.src[0]))};
+    SetDst(inst.dst[0], result);
 }
 
 void Translator::V_ADD_F32(const GcnInst& inst) {
@@ -1239,6 +1292,8 @@ void Translator::V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst) {
         switch (op) {
         case ConditionOp::F:
             return ir.Imm1(false);
+        case ConditionOp::TRU:
+            return ir.Imm1(true);
         case ConditionOp::EQ:
             return ir.FPEqual(src0, src1);
         case ConditionOp::LG:
@@ -1251,21 +1306,33 @@ void Translator::V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst) {
             return ir.FPLessThanEqual(src0, src1);
         case ConditionOp::GE:
             return ir.FPGreaterThanEqual(src0, src1);
+        case ConditionOp::O:
+            return ir.FPOrdered(src0, src1);
         case ConditionOp::U:
-            return ir.LogicalOr(ir.FPIsNan(src0), ir.FPIsNan(src1));
+            return ir.FPUnordered(src0, src1);
+        case ConditionOp::NGE:
+            return ir.FPLessThan(src0, src1, false);
+        case ConditionOp::NLG:
+            return ir.FPEqual(src0, src1, false);
+        case ConditionOp::NGT:
+            return ir.FPLessThanEqual(src0, src1, false);
+        case ConditionOp::NLE:
+            return ir.FPGreaterThan(src0, src1, false);
+        case ConditionOp::NEQ:
+            return ir.FPNotEqual(src0, src1, false);
+        case ConditionOp::NLT:
+            return ir.FPGreaterThanEqual(src0, src1, false);
         default:
             UNREACHABLE();
         }
     }();
+    // Every vector compare fully writes its scalar mask destination as EXEC & test. CMPX also
+    // replaces EXEC with that same mask; an ordinary CMP must still clear inactive lane bits.
+    const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
     if (set_exec) {
-        // V_CMPX evaluates on active lanes only; hardware writes exec & result to both EXEC
-        // and the VCC/SDST destination, zeroing inactive lanes' bits.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
         ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
     }
-    SetDst1(inst.dst[1], result);
+    SetDst1(inst.dst[1], masked);
 }
 
 void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
@@ -1275,6 +1342,8 @@ void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
         switch (op) {
         case ConditionOp::F:
             return ir.Imm1(false);
+        case ConditionOp::TRU:
+            return ir.Imm1(true);
         case ConditionOp::EQ:
             return ir.FPEqual(src0, src1);
         case ConditionOp::LG:
@@ -1287,20 +1356,31 @@ void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
             return ir.FPLessThanEqual(src0, src1);
         case ConditionOp::GE:
             return ir.FPGreaterThanEqual(src0, src1);
+        case ConditionOp::O:
+            return ir.FPOrdered(src0, src1);
         case ConditionOp::U:
-            return ir.LogicalOr(ir.FPIsNan(src0), ir.FPIsNan(src1));
+            return ir.FPUnordered(src0, src1);
+        case ConditionOp::NGE:
+            return ir.FPLessThan(src0, src1, false);
+        case ConditionOp::NLG:
+            return ir.FPEqual(src0, src1, false);
+        case ConditionOp::NGT:
+            return ir.FPLessThanEqual(src0, src1, false);
+        case ConditionOp::NLE:
+            return ir.FPGreaterThan(src0, src1, false);
+        case ConditionOp::NEQ:
+            return ir.FPNotEqual(src0, src1, false);
+        case ConditionOp::NLT:
+            return ir.FPGreaterThanEqual(src0, src1, false);
         default:
             UNREACHABLE();
         }
     }();
+    const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
     if (set_exec) {
-        // See the V_CMPX note in V_CMP_F32.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
         ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
     }
-    SetDst1(inst.dst[1], result);
+    SetDst1(inst.dst[1], masked);
 }
 
 void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst) {
@@ -1328,14 +1408,11 @@ void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const 
             UNREACHABLE();
         }
     }();
+    const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
     if (set_exec) {
-        // See the V_CMPX note in V_CMP_F32.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
         ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
     }
-    SetDst1(inst.dst[1], result);
+    SetDst1(inst.dst[1], masked);
 }
 
 void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst) {
@@ -1349,9 +1426,8 @@ void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const 
          (op == ConditionOp::GT && is_zero && inst.src[0].field == OperandField::ScalarGPR));
 
     const auto set_result = [&](IR::U1 result) {
+        result = ir.LogicalAnd(ir.GetExec(), result);
         if (set_exec) {
-            // V_CMPX must not reactivate lanes disabled by the current EXEC mask.
-            result = ir.LogicalAnd(ir.GetExec(), result);
             ir.SetExec(result);
         }
         SetDst1(inst.dst[1], result);
@@ -1446,7 +1522,7 @@ void Translator::V_CMP_CLASS_F32(const GcnInst& inst) {
         // We don't know the type yet, delay its resolution.
         value = ir.FPCmpClass32(src0, src1);
     }
-    SetDst1(inst.dst[1], value);
+    SetDst1(inst.dst[1], ir.LogicalAnd(ir.GetExec(), value));
 }
 
 // VOP3a

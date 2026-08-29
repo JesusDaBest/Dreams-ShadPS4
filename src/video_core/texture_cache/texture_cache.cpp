@@ -3,9 +3,11 @@
 
 #include <xxhash.h>
 
+#include <bit>
 #include <cstdlib>
 #include <fstream>
 #include <string_view>
+#include <unordered_map>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -33,6 +35,119 @@ static bool PreserveDreamsGpuOverlap() {
         return value != nullptr && std::string_view{value} == "1";
     }();
     return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool TraceDreamsVolumeRefreshes() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_VOLUME_TRACE");
+        return value != nullptr && std::string_view{value} != "0";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool UseDreamsBlockTexelAlias() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_BLOCK_TEXEL_ALIAS");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static bool IsDreamsVolumeTraceCandidate(const ImageInfo& info) {
+    const bool is_prt_3d = info.tile_mode == AmdGpu::TileMode::Thin3DThinPrt ||
+                           info.tile_mode == AmdGpu::TileMode::Thick3DThickPrt;
+    const u64 logical_texels = static_cast<u64>(info.size.width) * info.size.height *
+                               info.size.depth * info.resources.layers;
+    const u64 logical_bytes = logical_texels * info.num_bits * info.num_samples / 8;
+    const bool is_large_volume = info.props.is_volume &&
+                                 (logical_texels >= 64_MB || logical_bytes >= 64_MB);
+    return is_prt_3d || is_large_volume;
+}
+
+static bool ShouldLogVolumeTraceCount(const u64 count) {
+    return count <= 4 || std::has_single_bit(count);
+}
+
+struct DreamsVolumeRefreshStats {
+    u64 checks{};
+    u64 clean_skips{};
+    u64 msaa_skips{};
+    u64 maybe_hash_matches{};
+    u64 dirty_refreshes{};
+    u64 no_work{};
+    u64 linear_uploads{};
+    u64 detile_plans{};
+    u64 cpu_invalidations{};
+    u64 maybe_invalidations{};
+    u64 gpu_invalidations{};
+    u64 registrations{};
+    u64 unregistrations{};
+};
+
+struct DreamsVolumeTraceKey {
+    VAddr guest_address{};
+    u32 guest_size{};
+    u32 tile_mode{};
+    u32 width{};
+    u32 height{};
+    u32 depth{};
+    u32 num_bits{};
+
+    bool operator==(const DreamsVolumeTraceKey&) const = default;
+};
+
+struct DreamsVolumeTraceKeyHash {
+    size_t operator()(const DreamsVolumeTraceKey& key) const noexcept {
+        u64 hash = key.guest_address ^ std::rotl(static_cast<u64>(key.guest_size), 11) ^
+                   std::rotl(static_cast<u64>(key.tile_mode), 23) ^
+                   std::rotl(static_cast<u64>(key.width), 31) ^
+                   std::rotl(static_cast<u64>(key.height), 39) ^
+                   std::rotl(static_cast<u64>(key.depth), 47) ^
+                   std::rotl(static_cast<u64>(key.num_bits), 53);
+        hash ^= hash >> 29;
+        hash *= 0x9e3779b97f4a7c15ULL;
+        hash ^= hash >> 32;
+        return static_cast<size_t>(hash);
+    }
+};
+
+static DreamsVolumeRefreshStats& GetDreamsVolumeRefreshStats(const ImageInfo& info) {
+    static std::unordered_map<DreamsVolumeTraceKey, DreamsVolumeRefreshStats,
+                              DreamsVolumeTraceKeyHash>
+        stats;
+    const DreamsVolumeTraceKey key{
+        .guest_address = info.guest_address,
+        .guest_size = info.guest_size,
+        .tile_mode = static_cast<u32>(info.tile_mode),
+        .width = info.size.width,
+        .height = info.size.height,
+        .depth = info.size.depth,
+        .num_bits = info.num_bits,
+    };
+    return stats[key];
+}
+
+static void LogDreamsVolumeCacheEvent(const Image& image, const DreamsVolumeRefreshStats& stats,
+                                      const std::string_view event, const u64 event_count,
+                                      const VAddr source_address = 0,
+                                      const u64 source_size = 0) {
+    if (!ShouldLogVolumeTraceCount(event_count)) {
+        return;
+    }
+    LOG_WARNING(
+        Render_Vulkan,
+        "Dreams volume cache: event={} count={} uid={} guest={:#x}+{:#x} source={:#x}+{:#x} "
+        "tile={} array={} dims={}x{}x{} pitch={} bits={} flags={:#x} checks={} clean={} msaa={} "
+        "hash_matches={} dirty={} no_work={} linear={} detile_plans={} cpu_inv={} maybe_inv={} "
+        "gpu_inv={} registrations={} unregistrations={}",
+        event, event_count, image.image_uid, image.info.guest_address, image.info.guest_size,
+        source_address, source_size, static_cast<u32>(image.info.tile_mode),
+        static_cast<u32>(image.info.array_mode), image.info.size.width, image.info.size.height,
+        image.info.size.depth, image.info.pitch, image.info.num_bits, static_cast<u32>(image.flags),
+        stats.checks, stats.clean_skips, stats.msaa_skips, stats.maybe_hash_matches,
+        stats.dirty_refreshes, stats.no_work, stats.linear_uploads, stats.detile_plans,
+        stats.cpu_invalidations, stats.maybe_invalidations, stats.gpu_invalidations,
+        stats.registrations, stats.unregistrations);
 }
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -211,6 +326,11 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
+    if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
+        auto& stats = GetDreamsVolumeRefreshStats(image.info);
+        const u64 count = ++stats.maybe_invalidations;
+        LogDreamsVolumeCacheEvent(image, stats, "maybe-cpu-invalidate", count);
+    }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
 }
@@ -225,6 +345,11 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
+            if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
+                auto& stats = GetDreamsVolumeRefreshStats(image.info);
+                const u64 count = ++stats.cpu_invalidations;
+                LogDreamsVolumeCacheEvent(image, stats, "cpu-invalidate", count, addr, size);
+            }
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
@@ -255,6 +380,11 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
             return;
         }
         // Ensure image is reuploaded when accessed again.
+        if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
+            auto& stats = GetDreamsVolumeRefreshStats(image.info);
+            const u64 count = ++stats.gpu_invalidations;
+            LogDreamsVolumeCacheEvent(image, stats, "gpu-invalidate", count, address, max_size);
+        }
         image.flags |= ImageFlagBits::GpuDirty;
     });
 }
@@ -417,6 +547,46 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         // Compressed view of uncompressed image with same block size.
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
+
+        // Dreams writes each BC3 block through a 128-bit uint storage view, then samples the
+        // exact same allocation as BC3. A block-compatible Vulkan image exposes one uncompressed
+        // texel for each compressed block, so keep the compressed image as the canonical backing
+        // instead of replacing and re-uploading the 512 MiB allocation on every view switch.
+        const bool dreams_bc3_storage_alias =
+            UseDreamsBlockTexelAlias() && instance.IsBlockTexelViewSupported() &&
+            binding == BindingType::Storage && cache_image.info.props.is_block &&
+            !image_info.props.is_block &&
+            bool(cache_image.backing->image.image_ci.flags &
+                 vk::ImageCreateFlagBits::eBlockTexelViewCompatible) &&
+            bool(cache_image.usage_flags & vk::ImageUsageFlagBits::eStorage) &&
+            cache_image.info.pixel_format == vk::Format::eBc3UnormBlock &&
+            image_info.pixel_format == vk::Format::eR32G32B32A32Uint &&
+            image_info.guest_size == cache_image.info.guest_size &&
+            image_info.type == AmdGpu::ImageType::Color3D &&
+            cache_image.info.type == AmdGpu::ImageType::Color3D &&
+            Common::DivCeil(cache_image.info.size.width, 4u) == image_info.size.width &&
+            Common::DivCeil(cache_image.info.size.height, 4u) == image_info.size.height &&
+            cache_image.info.size.depth == image_info.size.depth &&
+            image_info.resources == cache_image.info.resources &&
+            image_info.tile_mode == cache_image.info.tile_mode &&
+            image_info.array_mode == cache_image.info.array_mode &&
+            image_info.bank_swizzle == cache_image.info.bank_swizzle &&
+            image_info.alt_tile == cache_image.info.alt_tile;
+        if (dreams_bc3_storage_alias) {
+            static u64 reuse_count{};
+            const u64 ordinal = ++reuse_count;
+            if (ShouldLogVolumeTraceCount(ordinal)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams BC3 block-storage alias reuse: count={} id={} uid={} "
+                            "guest={:#x}+{:#x} sampled={}x{}x{} storage={}x{}x{}",
+                            ordinal, cache_image_id.index, cache_image.image_uid,
+                            cache_image.info.guest_address, cache_image.info.guest_size,
+                            cache_image.info.size.width, cache_image.info.size.height,
+                            cache_image.info.size.depth, image_info.size.width,
+                            image_info.size.height, image_info.size.depth);
+            }
+            return {cache_image_id, -1, -1};
         }
 
         if (image_info.guest_size == cache_image.info.guest_size &&
@@ -821,7 +991,23 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
-    if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+    DreamsVolumeRefreshStats* volume_stats{};
+    if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
+        volume_stats = &GetDreamsVolumeRefreshStats(image.info);
+        ++volume_stats->checks;
+    }
+    if (False(image.flags & ImageFlagBits::Dirty)) {
+        if (volume_stats != nullptr) {
+            const u64 count = ++volume_stats->clean_skips;
+            LogDreamsVolumeCacheEvent(image, *volume_stats, "clean-skip", count);
+        }
+        return;
+    }
+    if (image.info.num_samples > 1) {
+        if (volume_stats != nullptr) {
+            const u64 count = ++volume_stats->msaa_skips;
+            LogDreamsVolumeCacheEvent(image, *volume_stats, "msaa-skip", count);
+        }
         return;
     }
 
@@ -842,6 +1028,10 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 size = s_w * s_h * (image.info.num_bits / 8);
         const u64 hash = XXH3_64bits(addr, size);
         if (image.hash == hash) {
+            if (volume_stats != nullptr) {
+                const u64 count = ++volume_stats->maybe_hash_matches;
+                LogDreamsVolumeCacheEvent(image, *volume_stats, "maybe-hash-match", count);
+            }
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
         }
@@ -852,6 +1042,10 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
+    if (volume_stats != nullptr) {
+        const u64 count = ++volume_stats->dirty_refreshes;
+        LogDreamsVolumeCacheEvent(image, *volume_stats, "dirty-refresh", count);
+    }
 
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
@@ -889,6 +1083,10 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     if (image_copies.empty()) {
+        if (volume_stats != nullptr) {
+            const u64 no_work = ++volume_stats->no_work;
+            LogDreamsVolumeCacheEvent(image, *volume_stats, "no-upload-work", no_work);
+        }
         image.flags &= ~ImageFlagBits::Dirty;
         return;
     }
@@ -906,6 +1104,15 @@ void TextureCache::RefreshImage(Image& image) {
         });
     }
 
+    if (volume_stats != nullptr) {
+        if (image.info.props.is_tiled) {
+            const u64 count = ++volume_stats->detile_plans;
+            LogDreamsVolumeCacheEvent(image, *volume_stats, "detile-plan", count);
+        } else {
+            const u64 count = ++volume_stats->linear_uploads;
+            LogDreamsVolumeCacheEvent(image, *volume_stats, "linear-upload", count);
+        }
+    }
     const auto [buffer, offset] =
         tile_manager.DetileImage(in_buffer->Handle(), in_offset, image.info);
     for (auto& copy : image_copies) {
@@ -916,11 +1123,14 @@ void TextureCache::RefreshImage(Image& image) {
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
-                                     AmdGpu::BorderColorBuffer border_color_base) {
-    const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
+                                     AmdGpu::BorderColorBuffer border_color_base, bool is_compare) {
+    const std::array<u64, 3> cache_key{sampler.raw0, sampler.raw1,
+                                       static_cast<u64>(is_compare)};
+    const u64 hash = XXH3_64bits(cache_key.data(), sizeof(cache_key));
 
     std::scoped_lock lock{samplers_mutex};
-    const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base);
+    const auto [it, new_sampler] =
+        samplers.try_emplace(hash, instance, sampler, border_color_base, is_compare);
     if (new_sampler) {
         samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
     } else {
@@ -935,6 +1145,11 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
+        auto& stats = GetDreamsVolumeRefreshStats(image.info);
+        const u64 count = ++stats.registrations;
+        LogDreamsVolumeCacheEvent(image, stats, "register", count);
+    }
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
@@ -945,6 +1160,11 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
+    if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
+        auto& stats = GetDreamsVolumeRefreshStats(image.info);
+        const u64 count = ++stats.unregistrations;
+        LogDreamsVolumeCacheEvent(image, stats, "unregister", count);
+    }
     image.flags &= ~ImageFlagBits::Registered;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);

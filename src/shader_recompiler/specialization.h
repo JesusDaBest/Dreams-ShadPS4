@@ -248,7 +248,8 @@ struct StageSpecialization {
     }
 
     void Serialize(Serialization::Archive& ar) const;
-    bool Deserialize(Serialization::Archive& ar);
+    bool Deserialize(Serialization::Archive& ar,
+                     size_t runtime_info_size = sizeof(RuntimeInfo));
 };
 
 } // namespace Shader

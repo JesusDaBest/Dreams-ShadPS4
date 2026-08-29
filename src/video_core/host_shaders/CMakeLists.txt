@@ -12,6 +12,8 @@ set(SHADER_FILES
     detilers/micro_64bpp.comp
     detilers/micro_8bpp.comp
     color_to_ms_depth.frag
+    dreams_ordered_prefix.comp
+    dreams_post_vs_replay.vert
     ms_image_blit.frag
     fault_buffer_process.comp
     fs_tri.vert

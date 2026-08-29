@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/dreams_compat.h"
+#include "shader_recompiler/ir/attribute.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -91,6 +94,106 @@ Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
 }
 
+static void EmitCe3FleckSampleCapture(EmitContext& ctx, u32 site, Id coords, Id emitted) {
+    namespace Capture = DreamsCompat::Ce3FleckTrace;
+    if (!DreamsCompat::CaptureCe3FleckTrace() ||
+        ctx.info.pgm_hash != DreamsCompat::Ce3ReadConstCaptureShader ||
+        ctx.stage != Stage::Fragment || ctx.l_stage != LogicalStage::Fragment ||
+        site >= Capture::StaticSampleSites) {
+        return;
+    }
+
+    const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                       &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds != ctx.buffers.end(), "ce3 fleck trace has no GDS descriptor");
+    const auto [buffer_id, pointer_type] = gds->Alias(EmitContext::PointerType::U32);
+    const auto pointer = [&](Id index) {
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+    };
+
+    const Id arm =
+        ctx.OpLoad(ctx.U32[1], pointer(ctx.ConstU32(Capture::ArmDword)));
+    const Id armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+    const Id armed_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(armed, armed_label, merge_label);
+
+    ctx.AddLabel(armed_label);
+    const Id candidate = ctx.OpBitcast(
+        ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param1, 0, 0));
+    const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const auto acquire_release = spv::MemorySemanticsMask::AcquireRelease |
+                                 spv::MemorySemanticsMask::UniformMemory;
+    const auto acquire =
+        spv::MemorySemanticsMask::Acquire | spv::MemorySemanticsMask::UniformMemory;
+    const Id acquire_release_semantics =
+        ctx.ConstU32(static_cast<u32>(acquire_release));
+    const Id acquire_semantics = ctx.ConstU32(static_cast<u32>(acquire));
+
+    Id claimed{};
+    if (site == 0) {
+        const Id previous = ctx.OpAtomicCompareExchange(
+            ctx.U32[1], pointer(ctx.ConstU32(Capture::ClaimedParam1Dword)), device_scope,
+            acquire_release_semantics, acquire_semantics, candidate,
+            ctx.ConstU32(Capture::ClaimSentinel));
+        const Id won = ctx.OpIEqual(
+            ctx.U1[1], previous, ctx.ConstU32(Capture::ClaimSentinel));
+        claimed = ctx.OpSelect(ctx.U32[1], won, candidate, previous);
+    } else {
+        claimed = ctx.OpAtomicLoad(
+            ctx.U32[1], pointer(ctx.ConstU32(Capture::ClaimedParam1Dword)), device_scope,
+            acquire_semantics);
+    }
+    const Id id_matches = ctx.OpIEqual(ctx.U1[1], claimed, candidate);
+    const Id match_label = ctx.OpLabel();
+    const Id match_merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(match_merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(id_matches, match_label, match_merge_label);
+
+    ctx.AddLabel(match_label);
+    const Id site_bit = ctx.ConstU32(1U << site);
+    const Id previous_sites = ctx.OpAtomicOr(
+        ctx.U32[1], pointer(ctx.ConstU32(Capture::SeenDword)), device_scope,
+        acquire_release_semantics, site_bit);
+    const Id already_seen =
+        ctx.OpBitwiseAnd(ctx.U32[1], previous_sites, site_bit);
+    const Id won_site = ctx.OpIEqual(ctx.U1[1], already_seen, ctx.u32_zero_value);
+    const Id capture_label = ctx.OpLabel();
+    const Id site_merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(site_merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(won_site, capture_label, site_merge_label);
+
+    ctx.AddLabel(capture_label);
+    const u32 record = Capture::RecordDword(site, 0);
+    const auto store = [&](u32 field, Id value) {
+        ctx.OpStore(pointer(ctx.ConstU32(record + field)), value);
+    };
+    for (u32 component = 0; component < 4; ++component) {
+        const Id frag = EmitGetAttribute(ctx, IR::Attribute::FragCoord, component, 0);
+        const Id param = EmitGetAttribute(ctx, IR::Attribute::Param0, component, 0);
+        store(Capture::FragCoord + component, ctx.OpBitcast(ctx.U32[1], frag));
+        store(Capture::Param0 + component, ctx.OpBitcast(ctx.U32[1], param));
+    }
+    const Id coordinate_bits = ctx.OpBitcast(ctx.U32[3], coords);
+    for (u32 component = 0; component < 3; ++component) {
+        store(Capture::Coordinates + component,
+              ctx.OpCompositeExtract(ctx.U32[1], coordinate_bits, component));
+    }
+    const Id sample_bits = ctx.OpBitcast(ctx.U32[4], emitted);
+    for (u32 component = 0; component < 4; ++component) {
+        store(Capture::Sample + component,
+              ctx.OpCompositeExtract(ctx.U32[1], sample_bits, component));
+    }
+    ctx.OpBranch(site_merge_label);
+
+    ctx.AddLabel(site_merge_label);
+    ctx.OpBranch(match_merge_label);
+    ctx.AddLabel(match_merge_label);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod,
                               const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
@@ -103,7 +206,15 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     operands.AddOffset(ctx, offset, ctx.profile.supports_runtime_image_sample_offsets);
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
-    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
+    const Id emitted = texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
+    if (DreamsCompat::CaptureCe3FleckTrace() &&
+        ctx.info.pgm_hash == DreamsCompat::Ce3ReadConstCaptureShader &&
+        ctx.stage == Stage::Fragment && ctx.l_stage == LogicalStage::Fragment &&
+        (handle & 0xffff) == 0) {
+        const u32 site = ctx.dreams_ce3_fleck_sample_ordinal++;
+        EmitCe3FleckSampleCapture(ctx, site, coords, emitted);
+    }
+    return emitted;
 }
 
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
@@ -140,6 +251,123 @@ Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, 
                                     ctx.f32_zero_value, ctx.f32_zero_value);
 }
 
+void EmitImageGather3DCapture(EmitContext& ctx, u32 site, u32 image_binding, u32 component,
+                              u32 z_filter, Id coords, Id dimensions,
+                              const std::array<Id, 4>& source_coords,
+                              const std::array<Id, 4>& source_texels,
+                              const std::array<Id, 4>& selected_components, Id emitted) {
+    if (!DreamsCompat::CaptureImageGather3D() || ctx.stage != Stage::Compute ||
+        ctx.l_stage != LogicalStage::Compute ||
+        site >= DreamsCompat::ImageGather3DCapture::MaxSites) {
+        return;
+    }
+
+    ASSERT_MSG(Sirit::ValidId(ctx.workgroup_id) && Sirit::ValidId(ctx.local_invocation_id),
+               "3D ImageGather capture has no compute invocation IDs");
+    const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                       &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds != ctx.buffers.end(), "3D ImageGather capture has no GDS descriptor");
+    const auto [buffer_id, pointer_type] = gds->Alias(EmitContext::PointerType::U32);
+    const auto pointer = [&](Id index) {
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+    };
+
+    const Id arm = ctx.OpLoad(
+        ctx.U32[1], pointer(ctx.ConstU32(DreamsCompat::ImageGather3DCapture::ArmDword)));
+    const Id target_hash_lo = ctx.OpLoad(
+        ctx.U32[1],
+        pointer(ctx.ConstU32(DreamsCompat::ImageGather3DCapture::TargetHashLoDword)));
+    const Id target_hash_hi = ctx.OpLoad(
+        ctx.U32[1],
+        pointer(ctx.ConstU32(DreamsCompat::ImageGather3DCapture::TargetHashHiDword)));
+    const Id is_armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+    const Id hash_lo_matches = ctx.OpIEqual(
+        ctx.U1[1], target_hash_lo, ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash)));
+    const Id hash_hi_matches = ctx.OpIEqual(
+        ctx.U1[1], target_hash_hi, ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash >> 32)));
+    const Id should_capture = ctx.OpLogicalAnd(
+        ctx.U1[1], is_armed,
+        ctx.OpLogicalAnd(ctx.U1[1], hash_lo_matches, hash_hi_matches));
+    const Id claim_label = ctx.OpLabel();
+    const Id capture_label = ctx.OpLabel();
+    const Id claim_done_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(should_capture, claim_label, merge_label);
+
+    const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const auto memory_semantics = spv::MemorySemanticsMask::AcquireRelease |
+                                  spv::MemorySemanticsMask::UniformMemory;
+    const Id semantics = ctx.ConstU32(static_cast<u32>(memory_semantics));
+    const Id site_bit = ctx.ConstU32(1U << site);
+    ctx.AddLabel(claim_label);
+    const Id previous_claims = ctx.OpAtomicOr(
+        ctx.U32[1],
+        pointer(ctx.ConstU32(DreamsCompat::ImageGather3DCapture::ClaimDword)), device_scope,
+        semantics, site_bit);
+    const Id already_claimed =
+        ctx.OpBitwiseAnd(ctx.U32[1], previous_claims, site_bit);
+    const Id won_claim =
+        ctx.OpIEqual(ctx.U1[1], already_claimed, ctx.u32_zero_value);
+    ctx.OpSelectionMerge(claim_done_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(won_claim, capture_label, claim_done_label);
+
+    ctx.AddLabel(capture_label);
+    const Id workgroup = ctx.OpLoad(ctx.U32[3], ctx.workgroup_id);
+    const Id local = ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id);
+    const u32 record = DreamsCompat::ImageGather3DCapture::RecordDword(site, 0);
+    const auto store = [&](u32 field, Id value) {
+        ctx.OpStore(pointer(ctx.ConstU32(record + field)), value);
+    };
+    store(DreamsCompat::ImageGather3DCapture::ShaderHashLo,
+          ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash)));
+    store(DreamsCompat::ImageGather3DCapture::ShaderHashHi,
+          ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash >> 32)));
+    store(DreamsCompat::ImageGather3DCapture::Stage,
+          ctx.ConstU32(static_cast<u32>(ctx.stage)));
+    store(DreamsCompat::ImageGather3DCapture::Site, ctx.ConstU32(site));
+    store(DreamsCompat::ImageGather3DCapture::Component, ctx.ConstU32(component));
+    store(DreamsCompat::ImageGather3DCapture::ZFilter, ctx.ConstU32(z_filter));
+    store(DreamsCompat::ImageGather3DCapture::ImageBinding, ctx.ConstU32(image_binding));
+    for (u32 axis = 0; axis < 3; ++axis) {
+        store(DreamsCompat::ImageGather3DCapture::Workgroup + axis,
+              ctx.OpCompositeExtract(ctx.U32[1], workgroup, axis));
+        store(DreamsCompat::ImageGather3DCapture::LocalInvocation + axis,
+              ctx.OpCompositeExtract(ctx.U32[1], local, axis));
+        const Id normalized = ctx.OpCompositeExtract(ctx.F32[1], coords, axis);
+        store(DreamsCompat::ImageGather3DCapture::NormalizedCoordinates + axis,
+              ctx.OpBitcast(ctx.U32[1], normalized));
+        store(DreamsCompat::ImageGather3DCapture::Dimensions + axis,
+              ctx.OpCompositeExtract(ctx.U32[1], dimensions, axis));
+    }
+    for (u32 source = 0; source < source_coords.size(); ++source) {
+        for (u32 axis = 0; axis < 3; ++axis) {
+            const Id source_coord =
+                ctx.OpCompositeExtract(ctx.S32[1], source_coords[source], axis);
+            store(DreamsCompat::ImageGather3DCapture::SourceCoordinates + source * 3 + axis,
+                  ctx.OpBitcast(ctx.U32[1], source_coord));
+        }
+        const Id texel_bits = ctx.OpBitcast(ctx.U32[4], source_texels[source]);
+        for (u32 channel = 0; channel < 4; ++channel) {
+            store(DreamsCompat::ImageGather3DCapture::SourceTexels + source * 4 + channel,
+                  ctx.OpCompositeExtract(ctx.U32[1], texel_bits, channel));
+        }
+        store(DreamsCompat::ImageGather3DCapture::SelectedComponents + source,
+              ctx.OpBitcast(ctx.U32[1], selected_components[source]));
+        const Id emitted_component = ctx.OpCompositeExtract(ctx.F32[1], emitted, source);
+        store(DreamsCompat::ImageGather3DCapture::EmittedComponents + source,
+              ctx.OpBitcast(ctx.U32[1], emitted_component));
+    }
+    ctx.OpAtomicOr(
+        ctx.U32[1],
+        pointer(ctx.ConstU32(DreamsCompat::ImageGather3DCapture::SeenDword)), device_scope,
+        semantics, site_bit);
+    ctx.OpBranch(claim_done_label);
+    ctx.AddLabel(claim_done_label);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
                    const IR::Value& offset) {
     const auto& texture = ctx.images[handle & 0xFFFF];
@@ -165,7 +393,6 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
                     immediate_offset, image_sharp.width + 1, image_sharp.height + 1,
                     image_sharp.depth + 1, sampler_sharp.raw0, sampler_sharp.raw1);
         if (texture.view_type == AmdGpu::ImageType::Color3D && offset.IsEmpty() &&
-            !sampler_sharp.force_unnormalized &&
             sampler_sharp.clamp_x == AmdGpu::ClampMode::Wrap &&
             sampler_sharp.clamp_y == AmdGpu::ClampMode::Wrap &&
             sampler_sharp.clamp_z == AmdGpu::ClampMode::Wrap) {
@@ -199,26 +426,37 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
             const Id z_base = ctx.OpConvertFToS(ctx.S32[1], z_base_f);
             const Id x0 = wrap_coord(x_base, 0);
             const Id y0 = wrap_coord(y_base, 1);
-            const Id z = wrap_coord(z_base, 2);
+            const Id z0 = wrap_coord(z_base, 2);
             const Id x1 = wrap_coord(
                 ctx.OpIAdd(ctx.S32[1], x_base, ctx.ConstS32(1)), 0);
             const Id y1 = wrap_coord(
                 ctx.OpIAdd(ctx.S32[1], y_base, ctx.ConstS32(1)), 1);
 
-            const auto fetch_component = [&](Id x, Id y) {
-                const Id fetch_coords = ctx.OpCompositeConstruct(ctx.S32[3], x, y, z);
-                const Id texel = ctx.OpImageFetch(
-                    result_type, image, fetch_coords, spv::ImageOperandsMask::Lod,
-                    ctx.u32_zero_value);
-                return ctx.OpCompositeExtract(texture.data_types->Get(1), texel, comp);
+            std::array<Id, 4> fetch_coords{};
+            std::array<Id, 4> fetched_texels{};
+            std::array<Id, 4> selected_components{};
+            const auto fetch_component = [&](u32 source, Id x, Id y) {
+                fetch_coords[source] = ctx.OpCompositeConstruct(ctx.S32[3], x, y, z0);
+                fetched_texels[source] =
+                    ctx.OpImageFetch(result_type, image, fetch_coords[source],
+                                     spv::ImageOperandsMask::Lod, ctx.u32_zero_value);
+                selected_components[source] = ctx.OpCompositeExtract(
+                    texture.data_types->Get(1), fetched_texels[source], comp);
+                return selected_components[source];
             };
-            const Id i0j1 = fetch_component(x0, y1);
-            const Id i1j1 = fetch_component(x1, y1);
-            const Id i1j0 = fetch_component(x1, y0);
-            const Id i0j0 = fetch_component(x0, y0);
+            const Id i0j1 = fetch_component(0, x0, y1);
+            const Id i1j1 = fetch_component(1, x1, y1);
+            const Id i1j0 = fetch_component(2, x1, y0);
+            const Id i0j0 = fetch_component(3, x0, y0);
             const Id texels =
                 ctx.OpCompositeConstruct(result_type, i0j1, i1j1, i1j0, i0j0);
-            return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texels) : texels;
+            const Id emitted = texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texels) : texels;
+            const u32 capture_site = ctx.dreams_image_gather_3d_capture_ordinal++;
+            EmitImageGather3DCapture(ctx, capture_site, handle & 0xffff, comp,
+                                     static_cast<u32>(sampler_sharp.z_filter.Value()), coords,
+                                     dimensions, fetch_coords, fetched_texels,
+                                     selected_components, emitted);
+            return emitted;
         }
         const Id sample = ctx.OpImageSampleExplicitLod(
             result_type, sampled_image, coords, spv::ImageOperandsMask::Lod, ctx.ConstF32(0.f));

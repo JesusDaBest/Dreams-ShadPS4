@@ -29,9 +29,15 @@ using namespace Xbyak::util;
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
 
+namespace {
+bool SrtWalkerSignalHandler(void* context, void* fault_address);
+void EnsureSrtWalkerSignalHandlerRegistered();
+} // namespace
+
 namespace Shader {
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    EnsureSrtWalkerSignalHandlerRegistered();
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
@@ -67,7 +73,7 @@ static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t code
     }
 }
 
-static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
+bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     // Only handle if the fault address is within the SRT code range
     const u8* code_start = g_srt_codegen_start;
     const u8* code_end = code_start + g_srt_codegen.getSize();
@@ -112,6 +118,22 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     }
 
     return true;
+}
+
+void EnsureSrtWalkerSignalHandlerRegistered() {
+    static const bool registered = [] {
+        // Cached walkers are copied into this code buffer before fresh shaders are compiled.
+        // Register the recovery range before either path emits its first byte so cached walkers
+        // are covered too. Function-local initialization also makes concurrent callers wait until
+        // registration is complete.
+        g_srt_codegen_start = g_srt_codegen.getCurr();
+        auto* signals = Core::Signals::Instance();
+        // Call after the memory invalidation handler.
+        constexpr u32 priority = 1;
+        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
+        return true;
+    }();
+    (void)registered;
 }
 
 using namespace Shader;
@@ -201,14 +223,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         return;
     }
 
-    // Register the signal handler for SRT walker, if not already registered
-    if (g_srt_codegen_start == nullptr) {
-        g_srt_codegen_start = c.getCurr();
-        auto* signals = Core::Signals::Instance();
-        // Call after the memory invalidation handler
-        constexpr u32 priority = 1;
-        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
-    }
+    EnsureSrtWalkerSignalHandlerRegistered();
 
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;

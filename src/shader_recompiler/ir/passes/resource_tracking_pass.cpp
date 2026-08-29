@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
-#include <cstdlib>
 #include <span>
+#include <unordered_set>
 
+#include "shader_recompiler/dreams_compat.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -286,7 +287,8 @@ public:
         const u32 index{Add(sampler_resources, desc, [this, &desc](const auto& existing) {
             return desc.sharp_idx == existing.sharp_idx &&
                    desc.is_inline_sampler == existing.is_inline_sampler &&
-                   desc.inline_sampler == existing.inline_sampler;
+                   desc.inline_sampler == existing.inline_sampler &&
+                   desc.is_compare == existing.is_compare;
         })};
         return index;
     }
@@ -728,6 +730,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
                 .sharp_idx = std::numeric_limits<u32>::max(),
                 .inline_sampler = inline_sampler,
                 .is_inline_sampler = true,
+                .is_compare = bool(inst_info.is_depth),
             });
         } else if (const auto runtime_ssharp =
                        TryBuildRuntimeSharpFromComposite(info, sampler, 4)) {
@@ -735,6 +738,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
                 .sharp_idx = *runtime_ssharp,
                 .is_inline_sampler = false,
                 .associated_image = image_binding,
+                .is_compare = bool(inst_info.is_depth),
             });
         } else {
             // Normal sampler resource.
@@ -746,6 +750,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
                 .is_inline_sampler = false,
                 .associated_image = image_binding,
                 .disable_aniso = disable_aniso,
+                .is_compare = bool(inst_info.is_depth),
             });
         }
         inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
@@ -769,8 +774,7 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
     // shader can be dispatched with different counter bases.
     if (inst.GetOpcode() == IR::Opcode::DataAppend || inst.GetOpcode() == IR::Opcode::DataConsume) {
         const IR::U32 handle = ir.Imm32(binding);
-        const IR::U32 index =
-            ir.ShiftRightLogical(IR::U32{inst.Arg(0)}, ir.Imm32(2));
+        const IR::U32 index = ir.ShiftRightLogical(IR::U32{inst.Arg(0)}, ir.Imm32(2));
         const bool is_append = inst.GetOpcode() == IR::Opcode::DataAppend;
         IR::BufferInstInfo buffer_info{};
         buffer_info.is_gds_append.Assign(is_append);
@@ -778,27 +782,18 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
                                          : ir.BufferAtomicDec(handle, index, buffer_info);
         inst.ReplaceUsesWithAndRemove(prev);
     } else if (inst.GetOpcode() == IR::Opcode::DataOrderedCount) {
-        const u32 control = inst.Arg(2).U32();
+        const u32 control = inst.Arg(3).U32();
         const u32 offset_bytes = (control >> 8) & 0xff;
         const IR::U32 m0{inst.Arg(0)};
 
-        // For DS_ORDERED_COUNT, M0[31:16] is already the ordered-counter base in
-        // dwords (unlike normal GDS addressing, where it is a byte address). The
-        // low two bits are ignored by the guest hardware. OFFSET0 remains a byte
-        // encoded counter selector, so only that field is divided by four.
-        const IR::U32 base_dwords = ir.BitwiseAnd(
+        // Liverpool stores the ordered-counter base in M0[31:16] in bytes. OFFSET0 is byte
+        // encoded as well, so combine them before converting to the host buffer's dword index.
+        const IR::U32 base_bytes = ir.BitwiseAnd(
             ir.ShiftRightLogical(m0, ir.Imm32(16)), ir.Imm32(0xfffc));
-        const bool reproduce_corrupted_base =
-            std::getenv("SHADPS4_DREAMS_REPRO_CORRUPTED_ORDERED_BASE") != nullptr;
-        // This opt-in path intentionally reproduces the earlier broken lowering that treated the
-        // already-dword M0 base as a byte address. It is kept only as an A/B comparison for the
-        // dark, fragmented, flickering sculpt cubes; never enable it for the corrected path.
-        const IR::U32 index = reproduce_corrupted_base
-                                  ? ir.ShiftRightLogical(
-                                        ir.IAdd(base_dwords, ir.Imm32(offset_bytes)), ir.Imm32(2))
-                                  : ir.IAdd(base_dwords, ir.Imm32(offset_bytes >> 2));
+        const IR::U32 index = ir.ShiftRightLogical(
+            ir.IAdd(base_bytes, ir.Imm32(offset_bytes)), ir.Imm32(2));
         inst.SetArg(0, index);
-        inst.SetArg(2, ir.Imm32(control | (binding << 16)));
+        inst.SetArg(3, ir.Imm32(control | (binding << 16)));
     } else {
         // Convert shared memory opcode to storage buffer atomic to GDS buffer.
         auto& buffer = info.buffers[binding];
@@ -897,6 +892,66 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
             UNREACHABLE();
         }
     }
+}
+
+void InjectDreamsSculptCheckpoint(IR::Block& block, IR::Inst& ordered_count, const Info& info) {
+    if (info.pgm_hash != DreamsCompat::SculptVolumeWriterShader ||
+        ordered_count.GetOpcode() != IR::Opcode::DataOrderedCount) {
+        return;
+    }
+
+    // Checkpoint only phis that are actually consumed after the in-place compaction cut. The DOC
+    // block can gain unrelated loop-carried phis as translator state becomes more precise; counting
+    // every phi before DOC makes this replay path depend on an incidental compiler shape.
+    std::unordered_set<const IR::Inst*> post_doc_insts;
+    bool found_ordered_count{};
+    for (IR::Inst& candidate : block.Instructions()) {
+        if (found_ordered_count) {
+            post_doc_insts.insert(&candidate);
+        } else if (&candidate == &ordered_count) {
+            found_ordered_count = true;
+        }
+    }
+    ASSERT_MSG(found_ordered_count, "Dreams 84aa checkpoint DOC is not in its parent block");
+
+    std::array<IR::Inst*, 8> live_phis{};
+    u32 live_count{};
+    for (IR::Inst& candidate : block.Instructions()) {
+        if (&candidate == &ordered_count) {
+            break;
+        }
+        if (candidate.GetOpcode() != IR::Opcode::Phi) {
+            continue;
+        }
+        bool crosses_cut{};
+        for (const IR::Use& use : candidate.Uses()) {
+            if (use.user->GetParent() != &block || post_doc_insts.contains(use.user)) {
+                crosses_cut = true;
+                break;
+            }
+        }
+        if (!crosses_cut) {
+            continue;
+        }
+        ASSERT_MSG(live_count < live_phis.size(),
+                   "Dreams 84aa DOC cut has more than eight live phis");
+        live_phis[live_count++] = &candidate;
+    }
+    ASSERT_MSG(live_count == live_phis.size(),
+               "Dreams 84aa DOC checkpoint expected eight phis, found {}", live_count);
+    for (u32 index = 0; index < 7; ++index) {
+        ASSERT_MSG(IR::Value{live_phis[index]}.Type() == IR::Type::U32,
+                   "Dreams 84aa checkpoint phi {} is not U32", index);
+    }
+    ASSERT_MSG(IR::Value{live_phis[7]}.Type() == IR::Type::U1,
+               "Dreams 84aa checkpoint exec phi is not U1");
+
+    IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(ordered_count)};
+    const IR::Value state0 = ir.CompositeConstruct(IR::U32{live_phis[0]}, IR::U32{live_phis[1]},
+                                                   IR::U32{live_phis[2]}, IR::U32{live_phis[3]});
+    const IR::Value state1 =
+        ir.CompositeConstruct(IR::U32{live_phis[4]}, IR::U32{live_phis[5]}, IR::U32{live_phis[6]});
+    ir.DreamsSculptCheckpoint(state0, state1, IR::U1{live_phis[7]});
 }
 
 IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const Info& info,
@@ -1363,6 +1418,151 @@ void PatchImageArgs(IR::Block& block, IR::Inst& inst, Info& info, const Profile&
     }
 }
 
+void InjectDreamsQueueProducerCapture(IR::Program& program, Descriptors& descriptors) {
+    if (program.info.pgm_hash != DreamsCompat::QueueProducerShader ||
+        !DreamsCompat::CaptureOrderedChain()) {
+        return;
+    }
+
+    const u32 gds_binding = descriptors.Add(BufferResource{
+        .used_types = IR::Type::U32,
+        .inline_cbuf = AmdGpu::Buffer::Null(),
+        .buffer_type = BufferType::GdsBuffer,
+        .is_written = true,
+    });
+    constexpr std::array<u32, DreamsCompat::QueueProducerCapture::B2Sites> B2Offsets{
+        0x140, 0x150, 0x15c, 0x16c, 0x18c,
+    };
+    constexpr std::array<u32, DreamsCompat::QueueProducerCapture::B2Sites> B2Widths{
+        4, 3, 4, 4, 4,
+    };
+    std::array<bool, DreamsCompat::QueueProducerCapture::B2Sites> captured_b2{};
+    u32 captured_b1{};
+
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (!IsBufferStore(inst) || IsBufferAtomic(inst) ||
+                !inst.Arg(IR::StoreBufferArgs::Handle).IsImmediate()) {
+                continue;
+            }
+            const u32 binding = inst.Arg(IR::StoreBufferArgs::Handle).U32();
+            const bool is_b1 = binding == 1 && inst.GetOpcode() == IR::Opcode::StoreBufferU32x2;
+            u32 b2_site = DreamsCompat::QueueProducerCapture::B2Sites;
+            if (binding == 2) {
+                const u32 offset = inst.Flags<IR::BufferInstInfo>().inst_offset.Value();
+                const auto found = std::ranges::find(B2Offsets, offset);
+                if (found != B2Offsets.end()) {
+                    b2_site = static_cast<u32>(std::distance(B2Offsets.begin(), found));
+                }
+            }
+            if (!is_b1 && b2_site == DreamsCompat::QueueProducerCapture::B2Sites) {
+                continue;
+            }
+
+            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+            const IR::U32 gds_handle = ir.Imm32(gds_binding);
+            const IR::U32 arm{ir.LoadBufferU32(
+                1, gds_handle, ir.Imm32(DreamsCompat::QueueProducerCapture::ArmDword), {})};
+            const IR::U32 local_x =
+                ir.GetAttributeU32(IR::Attribute::LocalInvocationId, 0);
+            // This probe is inserted directly into the block containing the guest store, so only
+            // invocations which reach that store execute it. GetExec is a frontend-only operation
+            // and cannot be emitted to SPIR-V here.
+            IR::U1 eligible = ir.ILessThan(
+                local_x, ir.Imm32(DreamsCompat::QueueProducerCapture::Lanes), false);
+            eligible = ir.LogicalAnd(
+                eligible,
+                ir.IEqual(ir.GetAttributeU32(IR::Attribute::WorkgroupId, 0), ir.Imm32(0U)));
+            eligible = ir.LogicalAnd(
+                eligible,
+                ir.IEqual(ir.GetAttributeU32(IR::Attribute::WorkgroupId, 1), ir.Imm32(0U)));
+            eligible = ir.LogicalAnd(
+                eligible,
+                ir.IEqual(ir.GetAttributeU32(IR::Attribute::WorkgroupId, 2), ir.Imm32(0U)));
+            eligible = ir.LogicalAnd(eligible, ir.IEqual(arm, ir.Imm32(1U)));
+            const IR::U32 safe_lane{ir.Select(eligible, local_x, ir.Imm32(0U))};
+            const auto capture_word = [&](const IR::U32& dword, const IR::U32& value,
+                                          const IR::U1& condition) {
+                const IR::U32 gated{ir.Select(condition, value, ir.Imm32(0U))};
+                [[maybe_unused]] const IR::Value previous =
+                    ir.BufferAtomicOr(gds_handle, dword, gated, {});
+            };
+            const auto capture_absolute = [&](u32 dword, const IR::U32& value,
+                                              const IR::U1& condition) {
+                capture_word(ir.Imm32(dword), value, condition);
+            };
+            const auto capture_lane_word = [&](u32 first_dword, u32 record_dwords, u32 field,
+                                               const IR::U32& value) {
+                const IR::U32 dword = ir.IAdd(
+                    ir.Imm32(first_dword + field),
+                    ir.IMul(safe_lane, ir.Imm32(record_dwords)));
+                capture_word(dword, value, eligible);
+            };
+            const auto capture_header = [&] {
+                namespace Capture = DreamsCompat::QueueProducerCapture;
+                capture_absolute(Capture::MagicDword, ir.Imm32(Capture::Magic), eligible);
+                capture_absolute(Capture::SchemaDword, ir.Imm32(Capture::Schema), eligible);
+                capture_absolute(Capture::LanesDword, ir.Imm32(Capture::Lanes), eligible);
+                capture_absolute(Capture::SitesDword, ir.Imm32(Capture::B2Sites), eligible);
+                const IR::U32 mask_bit = ir.ShiftLeftLogical(
+                    ir.Imm32(1U), ir.BitwiseAnd(safe_lane, ir.Imm32(31U)));
+                capture_absolute(Capture::SeenMask0Dword, mask_bit,
+                                 ir.LogicalAnd(eligible, ir.ILessThan(safe_lane, ir.Imm32(32U), false)));
+                capture_absolute(
+                    Capture::SeenMask1Dword, mask_bit,
+                    ir.LogicalAnd(eligible,
+                                  ir.IGreaterThanEqual(safe_lane, ir.Imm32(32U), false)));
+            };
+            capture_header();
+            const auto capture_b1_word = [&](u32 field, const IR::U32& value) {
+                capture_lane_word(DreamsCompat::QueueProducerCapture::B1RecordBaseDword,
+                                  DreamsCompat::QueueProducerCapture::B1RecordDwords, field,
+                                  value);
+            };
+            const auto capture_b2_word = [&](u32 site, u32 field, const IR::U32& value) {
+                const u32 first_dword = DreamsCompat::QueueProducerCapture::B2RecordDword(
+                    0, site, 0);
+                capture_lane_word(
+                    first_dword,
+                    DreamsCompat::QueueProducerCapture::B2Sites *
+                        DreamsCompat::QueueProducerCapture::B2RecordDwords,
+                    field, value);
+            };
+            const IR::U32 address{inst.Arg(IR::StoreBufferArgs::Address)};
+            const IR::Value data = inst.Arg(IR::StoreBufferArgs::Data);
+
+            if (is_b1) {
+                ++captured_b1;
+                capture_b1_word(DreamsCompat::QueueProducerCapture::B1Address, address);
+                capture_b1_word(DreamsCompat::QueueProducerCapture::B1Data0,
+                                IR::U32{ir.CompositeExtract(data, 0)});
+                capture_b1_word(DreamsCompat::QueueProducerCapture::B1Data1,
+                                IR::U32{ir.CompositeExtract(data, 1)});
+                capture_b1_word(DreamsCompat::QueueProducerCapture::B1Valid, ir.Imm32(1U));
+                continue;
+            }
+
+            const u32 width = B2Widths[b2_site];
+            const IR::Opcode expected_opcode =
+                width == 3 ? IR::Opcode::StoreBufferU32x3 : IR::Opcode::StoreBufferU32x4;
+            ASSERT_MSG(inst.GetOpcode() == expected_opcode,
+                       "Dreams 2bf B2 probe site {} width/opcode changed", b2_site);
+            ASSERT_MSG(!captured_b2[b2_site], "Dreams 2bf B2 probe site {} is duplicated", b2_site);
+            captured_b2[b2_site] = true;
+            capture_b2_word(b2_site, DreamsCompat::QueueProducerCapture::B2Address, address);
+            for (u32 component = 0; component < width; ++component) {
+                capture_b2_word(b2_site, DreamsCompat::QueueProducerCapture::B2Data0 + component,
+                                IR::U32{ir.CompositeExtract(data, component)});
+            }
+            capture_b2_word(b2_site, DreamsCompat::QueueProducerCapture::B2Valid,
+                            ir.Imm32(1U));
+        }
+    }
+    ASSERT_MSG(captured_b1 == 1, "Dreams 2bf probe expected one B1 store, found {}", captured_b1);
+    ASSERT_MSG(std::ranges::all_of(captured_b2, [](bool captured) { return captured; }),
+               "Dreams 2bf probe did not find all five decisive B2 stores");
+}
+
 void ResourceTrackingPass(IR::Program& program, const Profile& profile) {
     // Iterate resource instructions and patch them after finding the sharp.
     auto& info = program.info;
@@ -1388,9 +1588,14 @@ void ResourceTrackingPass(IR::Program& program, const Profile& profile) {
                 PatchImageArgs(*block, inst, info, profile);
             } else if (IsDataRingInstruction(inst)) {
                 PatchGlobalDataShareAccess(*block, inst, info, descriptors, profile);
+                InjectDreamsSculptCheckpoint(*block, inst, info);
             }
         }
     }
+
+    // Capture already-resolved addresses and the exact SSA values consumed by the stores. Insert
+    // after resource patching so the probe cannot accidentally record a pre-addressing operand.
+    InjectDreamsQueueProducerCapture(program, descriptors);
 
     info.RefreshFlatBuf();
 }

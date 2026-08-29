@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstring>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
@@ -40,6 +43,69 @@ static void AppendDreamsCpuRootTrace(const char* buffer, const int length) noexc
         return;
     }
     const HANDLE file = CreateFileW(L"dreams-cpu-root-trace.txt", FILE_APPEND_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(file, buffer, static_cast<DWORD>(length), &written, nullptr);
+        CloseHandle(file);
+    }
+}
+
+static bool DreamsCsgCompletionTraceEnabled() noexcept {
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("SHADPS4_DREAMS_CSG_COMPLETION_TRACE", value,
+                                       sizeof(value)) != 0 &&
+               value[0] == '1';
+    }();
+    return enabled;
+}
+
+static void AppendDreamsCsgCompletionTrace(const char* buffer, const int length) noexcept {
+    if (length <= 0) {
+        return;
+    }
+    // Keep one append-only handle for the run. Opening and closing a file at every breakpoint can
+    // materially perturb the short waits this trace is intended to measure.
+    static const HANDLE file = CreateFileW(
+        L"dreams-csg-completion-trace.txt", FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(file, buffer, static_cast<DWORD>(length), &written, nullptr);
+    }
+}
+
+static u64 DreamsQpcElapsedMicroseconds(const u64 start, const u64 end,
+                                        const u64 frequency) noexcept {
+    if (start == 0 || end < start || frequency == 0) {
+        return 0;
+    }
+    const u64 delta = end - start;
+    return (delta / frequency) * 1'000'000ULL +
+           ((delta % frequency) * 1'000'000ULL) / frequency;
+}
+
+static void AppendDreamsSculptProvenanceTrace(const char* buffer, const int length) noexcept {
+    if (length <= 0) {
+        return;
+    }
+    const HANDLE file = CreateFileW(L"dreams-sculpt-provenance.txt", FILE_APPEND_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(file, buffer, static_cast<DWORD>(length), &written, nullptr);
+        CloseHandle(file);
+    }
+}
+
+static void AppendDreamsVisibleSculptsTrace(const char* buffer, const int length) noexcept {
+    if (length <= 0) {
+        return;
+    }
+    const HANDLE file = CreateFileW(L"dreams-visible-sculpts-trace.txt", FILE_APPEND_DATA,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
                                     FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
@@ -109,6 +175,134 @@ static u16 ReadDreamsU16(const HANDLE process, const u64 address) noexcept {
     return value;
 }
 
+static bool IsDreamsVisibleSculptsWarningSource(const HANDLE process,
+                                                const u64 address) noexcept {
+    if (address == 0) {
+        return false;
+    }
+
+    // The source form may contain Dreams' inline tag bytes around each occurrence of
+    // "sculptures". Match the complete ordered wording while allowing those tag bytes.
+    std::array<char, 512> source{};
+    SIZE_T bytes_read = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(address), source.data(),
+                           source.size() - 1, &bytes_read) ||
+        bytes_read == 0) {
+        return false;
+    }
+    source[std::min(bytes_read, source.size() - 1)] = '\0';
+
+    const char* cursor = source.data();
+    if (std::strncmp(cursor, "Some ", 5) != 0) {
+        return false;
+    }
+    cursor = std::strstr(cursor + 5, "sculptures");
+    if (cursor == nullptr) {
+        return false;
+    }
+    cursor = std::strstr(cursor + std::strlen("sculptures"),
+                         "have stopped drawing, because too many overlapping");
+    if (cursor == nullptr) {
+        return false;
+    }
+    cursor = std::strstr(cursor + std::strlen(
+                                     "have stopped drawing, because too many overlapping"),
+                         "sculptures");
+    if (cursor == nullptr) {
+        return false;
+    }
+    return std::strstr(cursor + std::strlen("sculptures"), "are visible at once.") != nullptr;
+}
+
+static bool HandleDreamsVisibleSculptsTrace(EXCEPTION_POINTERS* exception) noexcept {
+    constexpr std::array<u64, 8> DreamsTranslationLookupOffsets{
+        0x148a3a0, 0x148a530, 0x148a6c0, 0x148a780,
+        0x148a8c0, 0x148ac00, 0x148ad40, 0x148ada0,
+    };
+    constexpr u64 VisibleSculptsWarningKey = 0x583aabbb;
+
+    if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+        exception->ContextRecord == nullptr || MemoryPatcher::g_eboot_address == 0) {
+        return false;
+    }
+
+    const u64 breakpoint_address =
+        reinterpret_cast<u64>(exception->ExceptionRecord->ExceptionAddress);
+    const u64 lookup_offset = breakpoint_address - MemoryPatcher::g_eboot_address;
+    bool is_translation_lookup = false;
+    for (const u64 offset : DreamsTranslationLookupOffsets) {
+        is_translation_lookup |= lookup_offset == offset;
+    }
+    if (!is_translation_lookup) {
+        return false;
+    }
+
+    CONTEXT* context = exception->ContextRecord;
+    const HANDLE process = GetCurrentProcess();
+    u64 raw_key = 0;
+    bool source_match = false;
+    if (lookup_offset == 0x148a6c0) {
+        source_match = IsDreamsVisibleSculptsWarningSource(process, context->Rdi);
+    } else if (lookup_offset == 0x148a8c0) {
+        raw_key = context->Rdi;
+    } else if (lookup_offset == 0x148ad40 || lookup_offset == 0x148ada0) {
+        raw_key = context->Rsi != 0 ? ReadDreamsU64(process, context->Rsi) : 0;
+    } else {
+        raw_key = context->Rdi != 0 ? ReadDreamsU64(process, context->Rdi) : 0;
+    }
+    if (static_cast<u32>(raw_key) == VisibleSculptsWarningKey || source_match) {
+        const u64 caller = ReadDreamsU64(process, context->Rsp);
+        const u64 frame0 = context->Rbp;
+        const u64 frame1 = frame0 != 0 ? ReadDreamsU64(process, frame0) : 0;
+        const u64 return0 = frame0 != 0 ? ReadDreamsU64(process, frame0 + 8) : 0;
+        const u64 return1 = frame1 != 0 ? ReadDreamsU64(process, frame1 + 8) : 0;
+        char buffer[768]{};
+        const int length = _snprintf_s(
+            buffer, sizeof(buffer), _TRUNCATE,
+            "visible_sculpts_warning tick=%llu thread=%lu key=0x%016llx source_match=%u "
+            "lookup_offset=0x%016llx "
+            "caller=0x%016llx caller_offset=0x%016llx frame_return0=0x%016llx "
+            "frame_return1=0x%016llx rdi=0x%016llx rsi=0x%016llx rdx=0x%016llx "
+            "rcx=0x%016llx r8=0x%016llx r9=0x%016llx\r\n",
+            static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+            static_cast<unsigned long long>(raw_key),
+            source_match ? 1u : 0u,
+            static_cast<unsigned long long>(lookup_offset),
+            static_cast<unsigned long long>(caller),
+            caller >= MemoryPatcher::g_eboot_address
+                ? static_cast<unsigned long long>(caller - MemoryPatcher::g_eboot_address)
+                : 0,
+            static_cast<unsigned long long>(return0),
+            static_cast<unsigned long long>(return1),
+            static_cast<unsigned long long>(context->Rdi),
+            static_cast<unsigned long long>(context->Rsi),
+            static_cast<unsigned long long>(context->Rdx),
+            static_cast<unsigned long long>(context->Rcx),
+            static_cast<unsigned long long>(context->R8),
+            static_cast<unsigned long long>(context->R9));
+        AppendDreamsVisibleSculptsTrace(buffer, length);
+
+        // This trace only needs the first request for the warning. Restore every lookup
+        // prologue immediately so later translation lookups run at full speed.
+        constexpr u8 OriginalInstruction = 0x55;
+        for (const u64 offset : DreamsTranslationLookupOffsets) {
+            void* address = reinterpret_cast<void*>(MemoryPatcher::g_eboot_address + offset);
+            SIZE_T restored = 0;
+            WriteProcessMemory(process, address, &OriginalInstruction,
+                               sizeof(OriginalInstruction), &restored);
+            FlushInstructionCache(process, address, sizeof(OriginalInstruction));
+        }
+    }
+
+    // The breakpoint replaces the original one-byte `push rbp` prologue.
+    context->Rsp -= sizeof(u64);
+    SIZE_T bytes_written = 0;
+    WriteProcessMemory(process, reinterpret_cast<void*>(context->Rsp), &context->Rbp,
+                       sizeof(u64), &bytes_written);
+    context->Rip = breakpoint_address + 1;
+    return true;
+}
+
 static bool DreamsPairQueueCaptureEnabled() noexcept {
     return GetFileAttributesW(L"dreams-pair-queue.capture") != INVALID_FILE_ATTRIBUTES;
 }
@@ -137,6 +331,7 @@ static bool HandleDreamsSceneReadyHandoff(EXCEPTION_POINTERS* exception) noexcep
     auto* context = exception->ContextRecord;
     const HANDLE process = GetCurrentProcess();
     const u64 manager = context->Rdi;
+    const u64 source_root = manager != 0 ? ReadDreamsU64(process, manager + 0x8) : 0;
     const u64 root = manager != 0 ? ReadDreamsU64(process, manager + 0x10) : 0;
     const u8 phase = root != 0 ? ReadDreamsU8(process, root + DreamsRootPhaseOffset) : 0xff;
     const u8 ready_before =
@@ -147,8 +342,13 @@ static bool HandleDreamsSceneReadyHandoff(EXCEPTION_POINTERS* exception) noexcep
         root != 0 ? ReadDreamsU8(process, root + DreamsRootFallbackInputOffset) : 0;
     const u8 async_input =
         root != 0 ? ReadDreamsU8(process, root + DreamsRootAsyncInputOffset) : 0;
-    const bool repaired = root != 0 && phase == 3 && ready_before == 0 && ready_input != 0 &&
-                          (async_input == 0 || fallback_input == 0);
+    char repair_value[2]{};
+    const bool repair_enabled =
+        GetEnvironmentVariableA("SHADPS4_DREAMS_SCENE_READY_HANDOFF", repair_value,
+                                sizeof(repair_value)) != 0 &&
+        repair_value[0] == '1';
+    const bool repaired = repair_enabled && root != 0 && phase == 3 && ready_before == 0 &&
+                          ready_input != 0 && (async_input == 0 || fallback_input == 0);
     if (repaired) {
         constexpr u8 Ready = 1;
         SIZE_T bytes_written = 0;
@@ -158,17 +358,33 @@ static bool HandleDreamsSceneReadyHandoff(EXCEPTION_POINTERS* exception) noexcep
 
     static std::atomic<u32> handoff_trace_count{0};
     const u32 ordinal = handoff_trace_count.fetch_add(1, std::memory_order_relaxed);
-    if (ordinal < 512 || repaired) {
-        char buffer[448]{};
+    char trace_value[2]{};
+    const bool trace_enabled =
+        GetEnvironmentVariableA("SHADPS4_DREAMS_SCENE_WAKE_TRACE", trace_value,
+                                sizeof(trace_value)) != 0 &&
+        trace_value[0] == '1';
+    if (ordinal < (trace_enabled ? 4096u : 512u) || repaired) {
+        char buffer[768]{};
         const int length = _snprintf_s(
             buffer, sizeof(buffer), _TRUNCATE,
-            "scene_ready_handoff=%u thread=%lu manager=0x%016llx root=0x%016llx/%u "
-            "phase=%u ready=%u->%u input=%u fallback=%u async=%u repaired=%u\r\n",
-            ordinal, GetCurrentThreadId(), static_cast<unsigned long long>(manager),
+            "scene_ready_handoff=%u tick=%llu thread=%lu manager=0x%016llx "
+            "source=0x%016llx/%u:{phase=%u ready=%u input=%u} "
+            "root=0x%016llx/%u:{phase=%u ready=%u->%u input=%u fallback=%u async=%u} "
+            "args={rdx=%llu r12=%llu} repaired=%u trace=%u\r\n",
+            ordinal, static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+            static_cast<unsigned long long>(manager),
+            static_cast<unsigned long long>(source_root),
+            source_root != 0 ? ReadDreamsRootCount(process, source_root) : 0,
+            source_root != 0 ? ReadDreamsU8(process, source_root + DreamsRootPhaseOffset) : 0xff,
+            source_root != 0 ? ReadDreamsU8(process, source_root + DreamsRootReadyOffset) : 0xff,
+            source_root != 0 ? ReadDreamsU8(process, source_root + DreamsRootReadyInputOffset)
+                             : 0xff,
             static_cast<unsigned long long>(root), root != 0 ? ReadDreamsRootCount(process, root) : 0,
             phase, ready_before,
             root != 0 ? ReadDreamsU8(process, root + DreamsRootReadyOffset) : 0xff, ready_input,
-            fallback_input, async_input, repaired ? 1 : 0);
+            fallback_input, async_input, static_cast<unsigned long long>(context->Rdx),
+            static_cast<unsigned long long>(context->R12), repaired ? 1 : 0,
+            trace_enabled ? 1 : 0);
         AppendDreamsCpuRootTrace(buffer, length);
     }
 
@@ -178,6 +394,61 @@ static bool HandleDreamsSceneReadyHandoff(EXCEPTION_POINTERS* exception) noexcep
     WriteProcessMemory(process, reinterpret_cast<void*>(context->Rsp), &return_address,
                        sizeof(return_address), &bytes_written);
     context->Rip = MemoryPatcher::g_eboot_address + DreamsMainRendererOffset;
+    return true;
+}
+
+static bool HandleDreamsSceneBuilderGateTrace(EXCEPTION_POINTERS* exception) noexcept {
+    constexpr u64 DreamsSceneBuilderGateObservedOffset = 0x987976;
+    constexpr u64 DreamsRootPhaseOffset = 0x27b099;
+    constexpr u64 DreamsRootReadyOffset = 0x27b0a9;
+    constexpr u64 DreamsRootReadyInputOffset = 0x27b0b0;
+    constexpr u64 DreamsRootFallbackInputOffset = 0x27b0ac;
+    constexpr u64 DreamsRootAsyncInputOffset = 0x27b0e4;
+
+    if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+        exception->ContextRecord == nullptr || MemoryPatcher::g_eboot_address == 0) {
+        return false;
+    }
+
+    const u64 breakpoint_address =
+        reinterpret_cast<u64>(exception->ExceptionRecord->ExceptionAddress);
+    if (breakpoint_address - MemoryPatcher::g_eboot_address !=
+        DreamsSceneBuilderGateObservedOffset) {
+        return false;
+    }
+
+    auto* context = exception->ContextRecord;
+    const HANDLE process = GetCurrentProcess();
+    const u64 root = ReadDreamsU64(process, context->Rsp + 0x650);
+    const u64 manager = ReadDreamsU64(process, context->Rsp + 0x658);
+    const u8 stack_gate = ReadDreamsU8(process, context->Rsp + 0x26c);
+    const u8 mode = ReadDreamsU8(process, context->Rsp + 0x288);
+    const bool zero = (context->EFlags & (1u << 6)) != 0;
+
+    static std::atomic<u32> gate_trace_count{0};
+    const u32 ordinal = gate_trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (ordinal < 4096) {
+        char buffer[640]{};
+        const int length = _snprintf_s(
+            buffer, sizeof(buffer), _TRUNCATE,
+            "scene_builder_gate=%u tick=%llu thread=%lu root=0x%016llx/%u "
+            "manager=0x%016llx cmp={value=%u zf=%u} mode=%u "
+            "state={phase=%u ready=%u input=%u fallback=%u async=%u}\r\n",
+            ordinal, static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+            static_cast<unsigned long long>(root),
+            root != 0 ? ReadDreamsRootCount(process, root) : 0,
+            static_cast<unsigned long long>(manager), stack_gate, zero ? 1 : 0, mode,
+            root != 0 ? ReadDreamsU8(process, root + DreamsRootPhaseOffset) : 0xff,
+            root != 0 ? ReadDreamsU8(process, root + DreamsRootReadyOffset) : 0xff,
+            root != 0 ? ReadDreamsU8(process, root + DreamsRootReadyInputOffset) : 0xff,
+            root != 0 ? ReadDreamsU8(process, root + DreamsRootFallbackInputOffset) : 0xff,
+            root != 0 ? ReadDreamsU8(process, root + DreamsRootAsyncInputOffset) : 0xff);
+        AppendDreamsCpuRootTrace(buffer, length);
+    }
+
+    // The replaced instruction is `mov rax, [rsp + 0x650]`.
+    context->Rax = root;
+    context->Rip = breakpoint_address + 8;
     return true;
 }
 
@@ -725,11 +996,11 @@ static bool HandleDreamsModelRecordTrace(EXCEPTION_POINTERS* exception) noexcept
     }
 
     // `mov rcx, qword ptr [r15]` at the common return path. The aligned model-build frame keeps
-    // the target index at rsp+0x9c and the record that would be published at rsp+0x510.
+    // the target index at rsp+0x9c and the candidate publication record at rsp+0xe0.
     static std::atomic<u32> return_count{0};
     const u32 ordinal = return_count.fetch_add(1, std::memory_order_relaxed);
     if (capture && ordinal < 4096) {
-        const u64 source = context->Rsp + 0x510;
+        const u64 source = context->Rsp + 0xe0;
         const u32 index = ReadDreamsU32(process, context->Rsp + 0x9c);
         char buffer[576]{};
         const int length = _snprintf_s(
@@ -846,6 +1117,1230 @@ static void ApplyDreamsIncFlags(CONTEXT* context, const u32 previous, const u32 
         flags |= OverflowFlag;
     }
     context->EFlags = flags;
+}
+
+struct DreamsSculptResourceScan {
+    bool attempted{};
+    bool complete{};
+    bool unresolved{};
+    bool invalid_chain{};
+    u32 steps{};
+    s32 index{-1};
+    u64 object{};
+    u32 id{};
+    u32 header{};
+    u16 primary{0xffff};
+    u16 auxiliary{0xffff};
+    u16 selected{0xffff};
+    u8 selected_kind{0xff};
+    u64 primary_writer{};
+    u64 auxiliary_writer{};
+    u32 type1_objects{};
+    u32 handles{};
+    u32 active_handles{};
+    u32 resolved_payloads{};
+    u32 missing_payloads{};
+    s32 first_missing_payload_index{-1};
+    u64 first_missing_payload_object{};
+    u16 first_missing_payload_slot{0xffff};
+    u8 first_missing_payload_kind{0xff};
+    u8 first_missing_payload_active{};
+    u32 first_missing_payload_value{};
+    u64 first_missing_payload_writer{};
+};
+
+struct DreamsSculptProvenanceState {
+    bool active{};
+    bool tracked{};
+    bool bootstrap_enabled{};
+    bool empty_incremental_exit{};
+    bool cache_committed{};
+    bool first_complete{};
+    bool second_started{};
+    bool exit_seen{};
+    bool hash_preflight_valid{};
+    bool second_preflight_valid{};
+    u64 invocation{};
+    u64 manager{};
+    u64 root{};
+    u64 builder{};
+    u64 output{};
+    u64 root_identity{};
+    u64 cached_identity{};
+    u64 generation{};
+    u64 table0_active{};
+    u64 table1_active{};
+    u64 committed_identity{};
+    u64 first_emit_object{};
+    u32 root_count{};
+    u32 frame{};
+    u32 records_before{};
+    u32 emit_count{};
+    u32 hash_active{};
+    u32 hash_missing{};
+    u32 hash_first_index{0xffffffffu};
+    u32 hash_first_target{};
+    u32 second_count{};
+    u32 second_active{};
+    u32 second_type1{};
+    u32 second_sculpt_family{};
+    u32 second_stroke{};
+    u32 second_group_valid{};
+    u32 second_group_invalid{};
+    u32 second_type1_group_valid{};
+    u32 second_first_type1_index{0xffffffffu};
+    u32 prepare_calls{};
+    u32 prepare_type1{};
+    u32 prepare_returns{};
+    u32 prepare_return_type1{};
+    u32 output_gate_count{};
+    u32 output_gate_null{};
+    u32 type1_dispatch_count{};
+    u32 resource_select_count{};
+    u32 resource_invalid_slots{};
+    u32 resource_active{};
+    u32 resource_missing_payloads{};
+    u32 resource_resolved_payloads{};
+    u32 resource_model_ready{};
+    u32 resource_model_unready{};
+    u32 first_resource_payload{0xffffffffu};
+    u32 first_resource_model_bits{};
+    u32 record_gate_count{};
+    s32 hash_first_work{};
+    s32 second_first_type1_mapped{-1};
+    u64 hash_first_object{};
+    u64 second_first_type1_object{};
+    u64 first_output_gate{};
+    u64 first_resource_object{};
+    u64 first_record_gate_object{};
+    u64 first_record_gate_output{};
+    s32 first_count{-1};
+    u16 second_first_type1_group{0xffff};
+    u16 first_resource_slot{0xffff};
+    u8 phase{0xff};
+    u8 ready{0xff};
+    u8 ready_input{0xff};
+    u8 second_first_type1_group_valid{0xff};
+    u8 first_resource_active{0xff};
+    u8 first_record_gate_guard{0xff};
+    DreamsSculptResourceScan resource_scan{};
+};
+
+static thread_local DreamsSculptProvenanceState dreams_sculpt_provenance{};
+static std::atomic<u64> dreams_sculpt_provenance_invocation{0};
+static std::atomic<u32> dreams_sculpt_hash_preflight_count{0};
+static std::atomic<u32> dreams_sculpt_second_preflight_count{0};
+static std::atomic<u32> dreams_sculpt_resource_scan_count{0};
+static std::atomic<u32> dreams_sculpt_summary_count{0};
+static constexpr u32 DreamsSculptLifecycleTargetObjectId = 0xffff7886u;
+static std::atomic<u32> dreams_sculpt_lifecycle_target_slot{0xffffffffu};
+static std::atomic<u32> dreams_sculpt_resource_write_sequence{0};
+static std::array<std::atomic<u64>, 1024> dreams_sculpt_resource_references{};
+static std::array<std::atomic<u64>, 65536> dreams_sculpt_resource_last_write{};
+
+static void MarkDreamsSculptResourceReference(const u16 slot) noexcept {
+    if (slot == 0xffff) {
+        return;
+    }
+    dreams_sculpt_resource_references[slot >> 6].fetch_or(1ull << (slot & 63),
+                                                          std::memory_order_relaxed);
+}
+
+static bool IsDreamsSculptResourceReferenced(const u64 slot) noexcept {
+    return slot < 65536 &&
+           (dreams_sculpt_resource_references[slot >> 6].load(std::memory_order_relaxed) &
+            (1ull << (slot & 63))) != 0;
+}
+
+static void RecordDreamsSculptResourceWrite(const u64 slot, const u8 kind,
+                                            const u32 value) noexcept {
+    // Provenance tracing discovers the relevant sculpt slot only after the builder has
+    // attempted its preflight walk. Keep the latest write for every valid slot so that the
+    // first unresolved/missing resource can still be tied to the write which preceded that
+    // discovery. This state is diagnostic-only and is populated only while the provenance
+    // breakpoints are enabled.
+    if (slot >= dreams_sculpt_resource_last_write.size()) {
+        return;
+    }
+    const u64 sequence = dreams_sculpt_resource_write_sequence.fetch_add(
+                             1, std::memory_order_relaxed) &
+                         0x0fffffffull;
+    const u64 packed = (sequence << 36) | (static_cast<u64>(kind & 0xf) << 32) | value;
+    dreams_sculpt_resource_last_write[slot].store(packed, std::memory_order_relaxed);
+}
+
+static void ScanDreamsFirstUnresolvedSculptResource(const HANDLE process, const u64 base,
+                                                    DreamsSculptProvenanceState& state) noexcept {
+    constexpr u64 DreamsFirstType1Offset = 0x279484;
+    constexpr u64 DreamsNextType1Offset = 0x19397d0;
+    constexpr u64 DreamsObjectPointersOffset = 0x10958c0;
+    constexpr u64 DreamsSpecialResourceEnableOffset = 0x28ca538;
+    constexpr u64 DreamsSpecialResource0Offset = 0x28ca4d0;
+    constexpr u64 DreamsResourceTableOffset = 0x44d1730;
+
+    auto& scan = state.resource_scan;
+    scan.attempted = true;
+    if (state.root == 0 || state.root_count == 0) {
+        scan.invalid_chain = true;
+        return;
+    }
+
+    s32 encoded = static_cast<s32>(ReadDreamsU32(process, state.root + DreamsFirstType1Offset));
+    for (u32 step = 0; step <= state.root_count; ++step) {
+        scan.steps = step;
+        if (encoded == -1) {
+            scan.complete = true;
+            return;
+        }
+
+        // Dreams stores the object index in the signed low 22 bits of the packed link. Match
+        // the guest's `shl 10; sar 10` sequence rather than shifting the packed value right.
+        const s32 index = static_cast<s32>(static_cast<u32>(encoded) << 10) >> 10;
+        if (index < 0 || static_cast<u32>(index) >= state.root_count) {
+            scan.invalid_chain = true;
+            scan.index = index;
+            return;
+        }
+
+        const u64 object = ReadDreamsU64(
+            process, state.root + DreamsObjectPointersOffset + static_cast<u64>(index) * 8);
+        if (object != 0 && (ReadDreamsU32(process, object + 0xc) & 0x7f) == 1 &&
+            ReadDreamsU32(process, object + 0x170) != 0xffffffffu) {
+            ++scan.type1_objects;
+            const u32 id = ReadDreamsU32(process, object);
+            const u32 header = ReadDreamsU32(process, object + 0xc);
+            const u16 primary = ReadDreamsU16(process, object + 0x40);
+            const u16 auxiliary = ReadDreamsU16(process, object + 0x42);
+            if (id == DreamsSculptLifecycleTargetObjectId && auxiliary != 0xffff) {
+                dreams_sculpt_lifecycle_target_slot.store(auxiliary,
+                                                          std::memory_order_relaxed);
+            }
+            MarkDreamsSculptResourceReference(primary);
+            MarkDreamsSculptResourceReference(auxiliary);
+            u64 selected_address = 0;
+            u8 selected_kind = 0xff;
+
+            if (ReadDreamsU8(process, base + DreamsSpecialResourceEnableOffset) != 0) {
+                for (u8 special = 0; special < 4; ++special) {
+                    const u64 special_address =
+                        base + DreamsSpecialResource0Offset + static_cast<u64>(special) * 0x1c;
+                    if (ReadDreamsU16(process, special_address) != 0xffff &&
+                        (id == ReadDreamsU32(process, special_address - 8) ||
+                         id == ReadDreamsU32(process, special_address - 4))) {
+                        selected_address = special_address;
+                        selected_kind = static_cast<u8>(2 + special);
+                        break;
+                    }
+                }
+            }
+
+            if (selected_address == 0 && auxiliary != 0xffff) {
+                const u64 resource_table = ReadDreamsU64(process, base + DreamsResourceTableOffset);
+                if (resource_table != 0 &&
+                    ReadDreamsU8(process, resource_table + static_cast<u64>(auxiliary) * 0x38 +
+                                              0x1c) != 0) {
+                    selected_address = object + 0x42;
+                    selected_kind = 1;
+                }
+            }
+            if (selected_address == 0) {
+                selected_address = object + 0x40;
+                selected_kind = 0;
+            }
+
+            const u16 selected = ReadDreamsU16(process, selected_address);
+            if (selected == 0xffff) {
+                scan.unresolved = true;
+                scan.index = index;
+                scan.object = object;
+                scan.id = id;
+                scan.header = header;
+                scan.primary = primary;
+                scan.auxiliary = auxiliary;
+                scan.selected = selected;
+                scan.selected_kind = selected_kind;
+                scan.primary_writer =
+                    primary != 0xffff
+                        ? dreams_sculpt_resource_last_write[primary].load(std::memory_order_relaxed)
+                        : 0;
+                scan.auxiliary_writer =
+                    auxiliary != 0xffff
+                        ? dreams_sculpt_resource_last_write[auxiliary].load(
+                              std::memory_order_relaxed)
+                        : 0;
+                return;
+            }
+
+            ++scan.handles;
+            if (selected_kind <= 1) {
+                const u64 resource_table =
+                    ReadDreamsU64(process, base + DreamsResourceTableOffset);
+                if (resource_table != 0) {
+                    const u64 resource = resource_table + static_cast<u64>(selected) * 0x38;
+                    const u8 active = ReadDreamsU8(process, resource + 0x1c);
+                    const u32 payload = ReadDreamsU32(process, resource + 0x20);
+                    scan.active_handles += active != 0 ? 1 : 0;
+                    if (payload == 0xffffffffu) {
+                        ++scan.missing_payloads;
+                        if (scan.first_missing_payload_index < 0) {
+                            scan.first_missing_payload_index = index;
+                            scan.first_missing_payload_object = object;
+                            scan.first_missing_payload_slot = selected;
+                            scan.first_missing_payload_kind = selected_kind;
+                            scan.first_missing_payload_active = active;
+                            scan.first_missing_payload_value = payload;
+                            scan.first_missing_payload_writer =
+                                dreams_sculpt_resource_last_write[selected].load(
+                                    std::memory_order_relaxed);
+                        }
+                    } else {
+                        ++scan.resolved_payloads;
+                    }
+                }
+            }
+        }
+
+        encoded = static_cast<s32>(ReadDreamsU32(
+            process, state.root + DreamsNextType1Offset + static_cast<u64>(index) * 4));
+    }
+    scan.invalid_chain = true;
+}
+
+static void PreflightDreamsSculptHashTable(const HANDLE process, CONTEXT* context,
+                                           DreamsSculptProvenanceState& state) noexcept {
+    constexpr u32 MaxTableEntries = 4096;
+    constexpr u32 MaxRootEntries = 16384;
+    constexpr u64 WorkEntryStride = 0x1c;
+    constexpr u64 TableEntryStride = 0x20;
+    constexpr u64 DreamsObjectPointersOffset = 0x10958c0;
+    static thread_local std::array<u8, MaxTableEntries * TableEntryStride> table_snapshot{};
+    static thread_local std::array<u32, MaxTableEntries> sorted_keys{};
+    static thread_local std::array<u8, MaxRootEntries * WorkEntryStride> work_snapshot{};
+
+    if (state.builder == 0 || state.root == 0 || state.first_count <= 0 ||
+        static_cast<u32>(state.first_count) > MaxRootEntries) {
+        return;
+    }
+
+    const u64 table = ReadDreamsU64(process, state.builder + 0x244000);
+    const u64 capacity = ReadDreamsU64(process, state.builder + 0x244008);
+    if (table == 0 || capacity == 0 || capacity > MaxTableEntries) {
+        return;
+    }
+
+    SIZE_T table_bytes_read = 0;
+    const SIZE_T table_bytes = static_cast<SIZE_T>(capacity * TableEntryStride);
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(table), table_snapshot.data(),
+                           table_bytes, &table_bytes_read) ||
+        table_bytes_read != table_bytes) {
+        return;
+    }
+
+    const SIZE_T work_bytes = static_cast<SIZE_T>(state.first_count) * WorkEntryStride;
+    SIZE_T work_bytes_read = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(context->Rsp + 0x24250),
+                           work_snapshot.data(), work_bytes, &work_bytes_read) ||
+        work_bytes_read != work_bytes) {
+        return;
+    }
+
+    for (u64 slot = 0; slot < capacity; ++slot) {
+        std::memcpy(&sorted_keys[slot], table_snapshot.data() + slot * TableEntryStride,
+                    sizeof(u32));
+    }
+    std::sort(sorted_keys.begin(), sorted_keys.begin() + static_cast<size_t>(capacity));
+
+    state.hash_preflight_valid = true;
+    for (u32 index = 0; index < static_cast<u32>(state.first_count); ++index) {
+        u32 target = 0;
+        s32 work_count = 0;
+        const u8* entry = work_snapshot.data() + static_cast<u64>(index) * WorkEntryStride;
+        std::memcpy(&target, entry, sizeof(target));
+        std::memcpy(&work_count, entry + sizeof(target), sizeof(work_count));
+        if (work_count <= 0) {
+            continue;
+        }
+
+        ++state.hash_active;
+        if (!std::binary_search(sorted_keys.begin(),
+                                sorted_keys.begin() + static_cast<size_t>(capacity), target)) {
+            ++state.hash_missing;
+            if (state.hash_first_index == 0xffffffffu) {
+                state.hash_first_index = index;
+                state.hash_first_target = target;
+                state.hash_first_work = work_count;
+                state.hash_first_object = ReadDreamsU64(
+                    process, state.root + DreamsObjectPointersOffset + static_cast<u64>(index) * 8);
+            }
+        }
+    }
+}
+
+static void PreflightDreamsSculptSecondPass(const HANDLE process, CONTEXT* context,
+                                            DreamsSculptProvenanceState& state) noexcept {
+    constexpr u32 MaxRootEntries = 16384;
+    constexpr u64 DreamsObjectPointersOffset = 0x10958c0;
+    constexpr u64 DreamsObjectGroupsOffset = 0x1ac7554;
+    constexpr u64 DreamsObjectTypesOffset = 0x1acf558;
+    constexpr u64 GroupMappingOffset = 0x2425c;
+    constexpr u64 GroupMappingStride = 0x1c;
+    constexpr u64 BuilderGroupStride = 0x78;
+    constexpr u64 BuilderGroupValidOffset = 0x1cc049;
+    static thread_local std::array<u8, MaxRootEntries> active_snapshot{};
+    static thread_local std::array<u8, MaxRootEntries> type_snapshot{};
+    static thread_local std::array<u16, MaxRootEntries> group_snapshot{};
+
+    const u64 root = ReadDreamsU64(process, context->Rsp + 0xa0);
+    const u32 count = ReadDreamsU32(process, context->Rsp + 0x40);
+    if (root == 0 || root != state.root || state.builder == 0 || count < 2 ||
+        count > MaxRootEntries) {
+        return;
+    }
+
+    SIZE_T bytes_read = 0;
+    if (!ReadProcessMemory(process, reinterpret_cast<const void*>(context->Rsp + 0x20248),
+                           active_snapshot.data(), count, &bytes_read) ||
+        bytes_read != count) {
+        return;
+    }
+    if (!ReadProcessMemory(process,
+                           reinterpret_cast<const void*>(root + DreamsObjectTypesOffset),
+                           type_snapshot.data(), count, &bytes_read) ||
+        bytes_read != count) {
+        return;
+    }
+    const SIZE_T group_bytes = static_cast<SIZE_T>(count) * sizeof(u16);
+    if (!ReadProcessMemory(process,
+                           reinterpret_cast<const void*>(root + DreamsObjectGroupsOffset),
+                           group_snapshot.data(), group_bytes, &bytes_read) ||
+        bytes_read != group_bytes) {
+        return;
+    }
+
+    state.second_preflight_valid = true;
+    state.second_count = count;
+    for (u32 index = 1; index < count; ++index) {
+        if (active_snapshot[index] == 0) {
+            continue;
+        }
+
+        ++state.second_active;
+        const u8 type = type_snapshot[index];
+        const bool exact_type1 = type == 1;
+        if (exact_type1) {
+            ++state.second_type1;
+        }
+        if ((type & 0x7f) == 1) {
+            ++state.second_sculpt_family;
+        }
+        if (type == 0x11) {
+            ++state.second_stroke;
+        }
+
+        const u16 group = group_snapshot[index];
+        s32 mapped = -1;
+        bytes_read = 0;
+        const bool mapping_read =
+            ReadProcessMemory(process,
+                              reinterpret_cast<const void*>(context->Rsp + GroupMappingOffset +
+                                                            static_cast<u64>(group) *
+                                                                GroupMappingStride),
+                              &mapped, sizeof(mapped), &bytes_read) &&
+            bytes_read == sizeof(mapped);
+        u8 group_valid = 0xff;
+        bool validity_read = false;
+        if (mapping_read && mapped >= 0 && static_cast<u32>(mapped) < MaxRootEntries) {
+            bytes_read = 0;
+            validity_read =
+                ReadProcessMemory(process,
+                                  reinterpret_cast<const void*>(
+                                      state.builder + static_cast<u64>(mapped) * BuilderGroupStride +
+                                      BuilderGroupValidOffset),
+                                  &group_valid, sizeof(group_valid), &bytes_read) &&
+                bytes_read == sizeof(group_valid);
+        }
+        const bool valid = validity_read && group_valid != 0;
+        if (valid) {
+            ++state.second_group_valid;
+            if (exact_type1) {
+                ++state.second_type1_group_valid;
+            }
+        } else {
+            ++state.second_group_invalid;
+        }
+
+        if (exact_type1 && state.second_first_type1_index == 0xffffffffu) {
+            state.second_first_type1_index = index;
+            state.second_first_type1_object = ReadDreamsU64(
+                process, root + DreamsObjectPointersOffset + static_cast<u64>(index) * 8);
+            state.second_first_type1_group = group;
+            state.second_first_type1_mapped = mapping_read ? mapped : -1;
+            state.second_first_type1_group_valid = validity_read ? group_valid : 0xff;
+        }
+    }
+}
+
+static void ApplyDreamsCmp32Flags(CONTEXT* context, const u32 lhs, const u32 rhs) noexcept {
+    constexpr u32 CarryFlag = 1u << 0;
+    constexpr u32 ParityFlag = 1u << 2;
+    constexpr u32 AuxiliaryCarryFlag = 1u << 4;
+    constexpr u32 ZeroFlag = 1u << 6;
+    constexpr u32 SignFlag = 1u << 7;
+    constexpr u32 OverflowFlag = 1u << 11;
+    constexpr u32 UpdatedFlags = CarryFlag | ParityFlag | AuxiliaryCarryFlag | ZeroFlag |
+                                 SignFlag | OverflowFlag;
+    const u32 result = lhs - rhs;
+    u32 flags = context->EFlags & ~UpdatedFlags;
+    if (lhs < rhs) {
+        flags |= CarryFlag;
+    }
+    u8 parity = static_cast<u8>(result);
+    parity ^= parity >> 4;
+    parity ^= parity >> 2;
+    parity ^= parity >> 1;
+    if ((parity & 1) == 0) {
+        flags |= ParityFlag;
+    }
+    if ((lhs & 0xf) < (rhs & 0xf)) {
+        flags |= AuxiliaryCarryFlag;
+    }
+    if (result == 0) {
+        flags |= ZeroFlag;
+    }
+    if ((result & 0x80000000u) != 0) {
+        flags |= SignFlag;
+    }
+    if (((lhs ^ rhs) & (lhs ^ result) & 0x80000000u) != 0) {
+        flags |= OverflowFlag;
+    }
+    context->EFlags = flags;
+}
+
+static std::atomic<u32> dreams_sculpt_lifecycle_target_decisions{};
+static std::atomic<u32> dreams_sculpt_lifecycle_watermark_writes{};
+static std::atomic<u32> dreams_sculpt_lifecycle_active_writes{};
+static std::atomic<u32> dreams_sculpt_lifecycle_reset_writes{};
+static std::atomic<bool> dreams_sculpt_lifecycle_target_active{};
+static std::atomic<bool> dreams_sculpt_lifecycle_restored{};
+
+static void RestoreDreamsSculptLifecycleBreakpoints(const HANDLE process, const u64 base) noexcept {
+    if (dreams_sculpt_lifecycle_restored.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    constexpr std::array<std::pair<u64, u8>, 7> Points{{
+        {0x9c47cc, 0x3b},
+        {0x9c47d4, 0x66},
+        {0x9c486a, 0x66},
+        {0x9aaf51, 0x89},
+        {0x71cb3a, 0x43},
+        {0x71e626, 0x41},
+        {0x72a9e9, 0x86},
+    }};
+    for (const auto [offset, byte] : Points) {
+        void* address = reinterpret_cast<void*>(base + offset);
+        SIZE_T written = 0;
+        WriteProcessMemory(process, address, &byte, sizeof(byte), &written);
+        FlushInstructionCache(process, address, sizeof(byte));
+    }
+}
+
+static bool HandleDreamsSculptLifecycleTrace(EXCEPTION_POINTERS* exception) noexcept {
+    constexpr u64 PromotionCompareOffset = 0x9c47cc;
+    constexpr u64 PromotionCommitOffset = 0x9c47d4;
+    constexpr u64 PendingAssignmentOffset = 0x9c486a;
+    constexpr u64 WatermarkWriteOffset = 0x9aaf51;
+    constexpr u64 ActiveWriteOffset = 0x71cb3a;
+    constexpr u64 AlternateActiveWriteOffset = 0x71e626;
+    constexpr u64 ResetWriteOffset = 0x72a9e9;
+    constexpr u64 ResourceTableOffset = 0x44d1730;
+    constexpr u64 ResourceFloorOffset = 0x44d4b40;
+    constexpr u64 ResourceCurrentOffset = 0x44d4b44;
+    constexpr u64 ResourceWatermarkOffset = 0x44d4b48;
+    constexpr u64 ActiveSceneRootHolderOffset = 0x4555e60;
+    constexpr u32 MaxWatermarkLogs = 16;
+    constexpr u32 MaxResetLogs = 64;
+
+    if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+        exception->ContextRecord == nullptr || MemoryPatcher::g_eboot_address == 0) {
+        return false;
+    }
+    const u64 base = MemoryPatcher::g_eboot_address;
+    const u64 address = reinterpret_cast<u64>(exception->ExceptionRecord->ExceptionAddress);
+    const u64 offset = address - base;
+    if (offset != PromotionCompareOffset && offset != PromotionCommitOffset &&
+        offset != PendingAssignmentOffset &&
+        offset != WatermarkWriteOffset && offset != ActiveWriteOffset &&
+        offset != AlternateActiveWriteOffset && offset != ResetWriteOffset) {
+        return false;
+    }
+
+    CONTEXT* context = exception->ContextRecord;
+    const HANDLE process = GetCurrentProcess();
+    const u64 caller = ReadDreamsU64(process, context->Rsp);
+    const u32 floor = ReadDreamsU32(process, base + ResourceFloorOffset);
+    const u32 current = ReadDreamsU32(process, base + ResourceCurrentOffset);
+    const u32 watermark = ReadDreamsU32(process, base + ResourceWatermarkOffset);
+
+    if (offset == PendingAssignmentOffset) {
+        const u64 object = context->R14;
+        const u32 id = object != 0 ? ReadDreamsU32(process, object) : 0;
+        const u16 previous = object != 0 ? ReadDreamsU16(process, object + 0x42) : 0xffff;
+        const u16 slot = static_cast<u16>(context->Rax);
+        if (id == DreamsSculptLifecycleTargetObjectId) {
+            dreams_sculpt_lifecycle_target_slot.store(slot, std::memory_order_relaxed);
+            const u64 root_holder = ReadDreamsU64(process, base + ActiveSceneRootHolderOffset);
+            const u64 root = root_holder != 0 ? ReadDreamsU64(process, root_holder) : 0;
+            char buffer[640]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "sculpt_lifecycle kind=pending tick=%llu thread=%lu root=0x%016llx "
+                "object=0x%016llx id=0x%08x auxiliary=%u->%u resources=%u,%u,%u "
+                "context=0x%016llx,0x%016llx,0x%016llx caller=0x%016llx "
+                "caller_offset=0x%016llx\r\n",
+                static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                static_cast<unsigned long long>(root),
+                static_cast<unsigned long long>(object), id, previous, slot, floor, current,
+                watermark, static_cast<unsigned long long>(context->R13),
+                static_cast<unsigned long long>(context->R14),
+                static_cast<unsigned long long>(context->R15),
+                static_cast<unsigned long long>(caller),
+                caller >= base ? static_cast<unsigned long long>(caller - base) : 0);
+            AppendDreamsSculptProvenanceTrace(buffer, length);
+        }
+        SIZE_T written = 0;
+        WriteProcessMemory(process, reinterpret_cast<void*>(object + 0x42), &slot, sizeof(slot),
+                           &written);
+        context->Rip = address + 5;
+        return true;
+    }
+
+    if (offset == ResetWriteOffset) {
+        const u64 table = context->Rdi;
+        const u64 entry_offset = context->Rax;
+        const u64 target = table + entry_offset + 0x1c;
+        const bool aligned = entry_offset % 0x38 == 0;
+        const u64 slot = aligned ? entry_offset / 0x38 : ~0ull;
+        const u8 replacement = static_cast<u8>(context->Rdx);
+        const u8 previous = static_cast<u8>(InterlockedExchange8(
+            reinterpret_cast<volatile char*>(target), static_cast<char>(replacement)));
+        const u32 ordinal =
+            dreams_sculpt_lifecycle_reset_writes.fetch_add(1, std::memory_order_relaxed);
+        const u32 target_slot =
+            dreams_sculpt_lifecycle_target_slot.load(std::memory_order_relaxed);
+        if (aligned && (ordinal < MaxResetLogs || slot == target_slot)) {
+            char buffer[512]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "sculpt_lifecycle kind=reset ordinal=%u tick=%llu thread=%lu "
+                "table=0x%016llx entry=0x%016llx target=0x%016llx slot=%llu "
+                "value=%u->%u resources=%u,%u,%u caller=0x%016llx "
+                "caller_offset=0x%016llx\r\n",
+                ordinal, static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                static_cast<unsigned long long>(table),
+                static_cast<unsigned long long>(entry_offset),
+                static_cast<unsigned long long>(target), static_cast<unsigned long long>(slot),
+                previous, replacement, floor, current, watermark,
+                static_cast<unsigned long long>(caller),
+                caller >= base ? static_cast<unsigned long long>(caller - base) : 0);
+            AppendDreamsSculptProvenanceTrace(buffer, length);
+        }
+        context->Rdx = (context->Rdx & ~0xffull) | previous;
+        context->Rip = address + 4;
+        if (aligned && slot == target_slot && previous != 0 && replacement == 0 &&
+            dreams_sculpt_lifecycle_target_active.load(std::memory_order_relaxed)) {
+            RestoreDreamsSculptLifecycleBreakpoints(process, base);
+        }
+        return true;
+    }
+
+    if (offset == ActiveWriteOffset || offset == AlternateActiveWriteOffset) {
+        const u64 table = offset == ActiveWriteOffset ? context->R11 : context->R8;
+        const u64 entry_offset = offset == ActiveWriteOffset ? context->R15 : context->Rbx;
+        const u64 target = table + entry_offset + 0x1c;
+        const bool aligned = entry_offset % 0x38 == 0;
+        const u64 slot = aligned ? entry_offset / 0x38 : ~0ull;
+        const u8 replacement = static_cast<u8>(context->Rax);
+        const u8 previous = static_cast<u8>(InterlockedExchange8(
+            reinterpret_cast<volatile char*>(target), static_cast<char>(replacement)));
+        const u32 target_slot =
+            dreams_sculpt_lifecycle_target_slot.load(std::memory_order_relaxed);
+        if (aligned && (slot == target_slot || target_slot == 0xffffffffu)) {
+            const u32 ordinal =
+                dreams_sculpt_lifecycle_active_writes.fetch_add(1, std::memory_order_relaxed);
+            const u64 root_holder = ReadDreamsU64(process, base + ActiveSceneRootHolderOffset);
+            const u64 root = root_holder != 0 ? ReadDreamsU64(process, root_holder) : 0;
+            char buffer[768]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "sculpt_lifecycle kind=active ordinal=%u tick=%llu thread=%lu "
+                "site=0x%08llx root=0x%016llx table=0x%016llx entry=0x%016llx "
+                "target=0x%016llx slot=%llu value=%u->%u resources=%u,%u,%u "
+                "context=0x%016llx,0x%016llx,0x%016llx caller=0x%016llx "
+                "caller_offset=0x%016llx\r\n",
+                ordinal, static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                static_cast<unsigned long long>(offset), static_cast<unsigned long long>(root),
+                static_cast<unsigned long long>(table),
+                static_cast<unsigned long long>(entry_offset),
+                static_cast<unsigned long long>(target), static_cast<unsigned long long>(slot),
+                previous, replacement, floor, current, watermark,
+                static_cast<unsigned long long>(context->R13),
+                static_cast<unsigned long long>(context->R14),
+                static_cast<unsigned long long>(context->R15),
+                static_cast<unsigned long long>(caller),
+                caller >= base ? static_cast<unsigned long long>(caller - base) : 0);
+            AppendDreamsSculptProvenanceTrace(buffer, length);
+            if (slot == target_slot && replacement != 0) {
+                dreams_sculpt_lifecycle_target_active.store(true, std::memory_order_relaxed);
+                // The target can complete tens of seconds after the initial builder attempts.
+                // Re-arm the bounded summaries so the next invocation records whether the
+                // newly active auxiliary handle is selected and the scene cache commits.
+                dreams_sculpt_resource_scan_count.store(0, std::memory_order_relaxed);
+                dreams_sculpt_summary_count.store(0, std::memory_order_relaxed);
+            }
+        }
+
+        context->Rax = (context->Rax & ~0xffull) | previous;
+        context->Rip = address + 5;
+        return true;
+    }
+
+    if (offset == WatermarkWriteOffset) {
+        const u32 value = static_cast<u32>(context->Rax);
+        const u32 ordinal =
+            dreams_sculpt_lifecycle_watermark_writes.fetch_add(1, std::memory_order_relaxed);
+        if (ordinal < MaxWatermarkLogs) {
+            const u64 root_holder = ReadDreamsU64(process, base + ActiveSceneRootHolderOffset);
+            const u64 root = root_holder != 0 ? ReadDreamsU64(process, root_holder) : 0;
+            char buffer[512]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "sculpt_lifecycle kind=watermark ordinal=%u tick=%llu thread=%lu "
+                "root=0x%016llx caller=0x%016llx caller_offset=0x%016llx "
+                "resources=%u,%u,%u value=%u\r\n",
+                ordinal, static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                static_cast<unsigned long long>(root),
+                static_cast<unsigned long long>(caller),
+                caller >= base ? static_cast<unsigned long long>(caller - base) : 0, floor,
+                current, watermark, value);
+            AppendDreamsSculptProvenanceTrace(buffer, length);
+        }
+        SIZE_T written = 0;
+        WriteProcessMemory(process, reinterpret_cast<void*>(base + ResourceWatermarkOffset),
+                           &value, sizeof(value), &written);
+        context->Rip = address + 6;
+        return true;
+    }
+
+    const u64 object = context->R14;
+    const u32 id = object != 0 ? ReadDreamsU32(process, object) : 0;
+    if (offset == PromotionCompareOffset) {
+        const u32 rank = static_cast<u32>(context->Rdx);
+        const u16 primary = object != 0 ? ReadDreamsU16(process, object + 0x40) : 0xffff;
+        const u16 auxiliary = object != 0 ? ReadDreamsU16(process, object + 0x42) : 0xffff;
+        u8 active = 0xff;
+        u32 payload = 0xffffffffu;
+        const u64 table = ReadDreamsU64(process, base + ResourceTableOffset);
+        if (table != 0 && auxiliary != 0xffff) {
+            active = ReadDreamsU8(process, table + static_cast<u64>(auxiliary) * 0x38 + 0x1c);
+            payload = ReadDreamsU32(process,
+                                    table + static_cast<u64>(auxiliary) * 0x38 + 0x20);
+        }
+        if (id == DreamsSculptLifecycleTargetObjectId) {
+            dreams_sculpt_lifecycle_target_slot.store(auxiliary, std::memory_order_relaxed);
+            const u32 ordinal = dreams_sculpt_lifecycle_target_decisions.fetch_add(
+                1, std::memory_order_relaxed);
+            char buffer[640]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "sculpt_lifecycle kind=compare ordinal=%u tick=%llu thread=%lu "
+                "root=0x%016llx object=0x%016llx id=0x%08x slots=%u,%u "
+                "rank=%u active=%u payload=0x%08x resources=%u,%u,%u "
+                "promote=%u caller=0x%016llx caller_offset=0x%016llx\r\n",
+                ordinal, static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                static_cast<unsigned long long>(context->R15),
+                static_cast<unsigned long long>(object), id, primary, auxiliary, rank, active,
+                payload, floor, current, watermark, rank < watermark ? 1u : 0u,
+                static_cast<unsigned long long>(caller),
+                caller >= base ? static_cast<unsigned long long>(caller - base) : 0);
+            AppendDreamsSculptProvenanceTrace(buffer, length);
+        }
+        ApplyDreamsCmp32Flags(context, rank, watermark);
+        context->Rip = address + 6;
+        return true;
+    }
+
+    // Emulate the replaced `mov word ptr [r14 + 0x40], cx`. The following guest instruction
+    // still clears the auxiliary slot normally.
+    const u16 slot = static_cast<u16>(context->Rcx);
+    if (id == DreamsSculptLifecycleTargetObjectId) {
+        char buffer[512]{};
+        const int length = _snprintf_s(
+            buffer, sizeof(buffer), _TRUNCATE,
+            "sculpt_lifecycle kind=promote tick=%llu thread=%lu root=0x%016llx "
+            "object=0x%016llx id=0x%08x slot=%u resources=%u,%u,%u "
+            "caller=0x%016llx caller_offset=0x%016llx\r\n",
+            static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+            static_cast<unsigned long long>(context->R15),
+            static_cast<unsigned long long>(object), id, slot, floor, current, watermark,
+            static_cast<unsigned long long>(caller),
+            caller >= base ? static_cast<unsigned long long>(caller - base) : 0);
+        AppendDreamsSculptProvenanceTrace(buffer, length);
+        RestoreDreamsSculptLifecycleBreakpoints(process, base);
+    }
+    SIZE_T written = 0;
+    WriteProcessMemory(process, reinterpret_cast<void*>(object + 0x40), &slot, sizeof(slot),
+                       &written);
+    context->Rip = address + 5;
+    return true;
+}
+
+static bool HandleDreamsSculptProvenanceTrace(EXCEPTION_POINTERS* exception) noexcept {
+    constexpr u64 DreamsBuilderOffset = 0x8b7380;
+    constexpr u64 DreamsEmptyIncrementalExitOffset = 0x8b7511;
+    constexpr u64 DreamsBuilderExitOffset = 0x8b751b;
+    constexpr u64 DreamsCacheCommitOffset = 0x8b8113;
+    constexpr u64 DreamsFirstCompleteOffset = 0x8b851f;
+    constexpr u64 DreamsSecondStartOffset = 0x8b8860;
+    constexpr u64 DreamsObjectPrepareCallOffset = 0x8b8a22;
+    constexpr u64 DreamsObjectPrepareReturnOffset = 0x8b8a31;
+    constexpr u64 DreamsOutputGateOffset = 0x8b8a67;
+    constexpr u64 DreamsType1DispatchOffset = 0x8b8cd5;
+    constexpr u64 DreamsResourceSelectOffset = 0x8b95df;
+    constexpr u64 DreamsRecordGateOffset = 0x8b9867;
+    constexpr u64 DreamsRecordEmitOffset = 0x8ba0a9;
+    constexpr u64 DreamsPostBuilderOffset = 0x987998;
+    constexpr u64 DreamsResourceAuxAssignOffset = 0x71c622;
+    constexpr u64 DreamsResourcePrimaryAssignOffset = 0x71c8b8;
+    constexpr u64 DreamsResourceAssignOffset = 0x71cd98;
+    constexpr u64 DreamsResourceCreateOffset = 0x72aa3e;
+    constexpr u64 DreamsResourceRetireOffset = 0x729da5;
+    constexpr u64 DreamsBuilderGlobalOffset = 0x4550d98;
+    constexpr u64 DreamsOutputGlobalOffset = 0x6667e68;
+    constexpr u64 DreamsFrameTagOffset = 0x789687c;
+
+    if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+        exception->ContextRecord == nullptr || MemoryPatcher::g_eboot_address == 0) {
+        return false;
+    }
+
+    const u64 breakpoint_address =
+        reinterpret_cast<u64>(exception->ExceptionRecord->ExceptionAddress);
+    const u64 base = MemoryPatcher::g_eboot_address;
+    const u64 guest_offset = breakpoint_address - base;
+    if (guest_offset != DreamsBuilderOffset &&
+        guest_offset != DreamsEmptyIncrementalExitOffset &&
+        guest_offset != DreamsBuilderExitOffset && guest_offset != DreamsCacheCommitOffset &&
+        guest_offset != DreamsFirstCompleteOffset && guest_offset != DreamsSecondStartOffset &&
+        guest_offset != DreamsObjectPrepareCallOffset &&
+        guest_offset != DreamsObjectPrepareReturnOffset && guest_offset != DreamsOutputGateOffset &&
+        guest_offset != DreamsType1DispatchOffset && guest_offset != DreamsResourceSelectOffset &&
+        guest_offset != DreamsRecordGateOffset &&
+        guest_offset != DreamsRecordEmitOffset && guest_offset != DreamsPostBuilderOffset &&
+        guest_offset != DreamsResourceAuxAssignOffset &&
+        guest_offset != DreamsResourcePrimaryAssignOffset &&
+        guest_offset != DreamsResourceAssignOffset && guest_offset != DreamsResourceCreateOffset &&
+        guest_offset != DreamsResourceRetireOffset) {
+        return false;
+    }
+
+    CONTEXT* context = exception->ContextRecord;
+    const HANDLE process = GetCurrentProcess();
+    auto& state = dreams_sculpt_provenance;
+
+    if (guest_offset == DreamsResourceAuxAssignOffset ||
+        guest_offset == DreamsResourcePrimaryAssignOffset ||
+        guest_offset == DreamsResourceAssignOffset || guest_offset == DreamsResourceCreateOffset ||
+        guest_offset == DreamsResourceRetireOffset) {
+        u64 target = 0;
+        u32 value = 0;
+        u64 instruction_size = 0;
+        u8 kind = 0;
+        if (guest_offset == DreamsResourceAuxAssignOffset) {
+            target = context->R13 + 0x1c;
+            value = static_cast<u32>(context->Rax);
+            instruction_size = 4;
+            kind = 1;
+        } else if (guest_offset == DreamsResourcePrimaryAssignOffset) {
+            target = context->R13;
+            value = static_cast<u32>(context->Rax);
+            instruction_size = 4;
+            kind = 2;
+        } else if (guest_offset == DreamsResourceAssignOffset) {
+            target = context->R15 + context->R14 + 0x20;
+            value = static_cast<u32>(context->Rax);
+            instruction_size = 5;
+            kind = 3;
+        } else if (guest_offset == DreamsResourceCreateOffset) {
+            target = context->Rdi + context->Rax + 0x20;
+            value = static_cast<u32>(context->Rdx);
+            instruction_size = 4;
+            kind = 4;
+        } else {
+            target = context->R10;
+            value = 0xffffffffu;
+            instruction_size = 7;
+            kind = 5;
+        }
+
+        const u64 resource_table = ReadDreamsU64(process, base + 0x44d1730);
+        u64 slot = ~0ull;
+        if (resource_table != 0 && target >= resource_table + 0x20 &&
+            (target - resource_table - 0x20) % 0x38 == 0) {
+            slot = (target - resource_table - 0x20) / 0x38;
+        }
+        RecordDreamsSculptResourceWrite(slot, kind, value);
+
+        SIZE_T bytes_written = 0;
+        WriteProcessMemory(process, reinterpret_cast<void*>(target), &value, sizeof(value),
+                           &bytes_written);
+        context->Rip = breakpoint_address + instruction_size;
+        return true;
+    }
+
+    if (guest_offset == DreamsBuilderOffset) {
+        state = {};
+        state.active = true;
+        state.manager = context->Rdi;
+        state.root = context->Rdi != 0 ? ReadDreamsU64(process, context->Rdi + 0x10) : 0;
+        state.root_count = ReadDreamsRootCount(process, state.root);
+        state.tracked = state.root_count >= 4000;
+        if (state.tracked) {
+            state.invocation =
+                dreams_sculpt_provenance_invocation.fetch_add(1, std::memory_order_relaxed);
+            state.builder = ReadDreamsU64(process, base + DreamsBuilderGlobalOffset);
+            state.output = ReadDreamsU64(process, base + DreamsOutputGlobalOffset);
+            state.frame = ReadDreamsU32(process, base + DreamsFrameTagOffset);
+            state.root_identity = ReadDreamsU64(process, state.root + 0x1c2bf90);
+            state.cached_identity = ReadDreamsU64(process, state.builder + 0x1cbfc8);
+            state.generation = ReadDreamsU64(process, state.root + 0x27b0c0);
+            state.table0_active = ReadDreamsU64(process, state.builder + 0x243ff0);
+            state.table1_active = ReadDreamsU64(process, state.builder + 0x244010);
+            state.phase = ReadDreamsU8(process, state.root + 0x27b099);
+            state.ready = ReadDreamsU8(process, state.root + 0x27b0a9);
+            state.ready_input = ReadDreamsU8(process, state.root + 0x27b0b0);
+            state.records_before =
+                state.output != 0 ? ReadDreamsU32(process, state.output + 0x31ff38) : 0;
+            char retry_value[2]{};
+            state.bootstrap_enabled =
+                GetEnvironmentVariableA("SHADPS4_DREAMS_SCENE_READY_HANDOFF", retry_value,
+                                        sizeof(retry_value)) != 0 &&
+                retry_value[0] == '1';
+            if (!state.bootstrap_enabled) {
+                state.bootstrap_enabled =
+                    GetEnvironmentVariableA("SHADPS4_DREAMS_SCENE_CACHE_BOOTSTRAP_ONLY",
+                                            retry_value, sizeof(retry_value)) != 0 &&
+                    retry_value[0] == '1';
+            }
+        }
+
+        context->Rsp -= sizeof(u64);
+        SIZE_T bytes_written = 0;
+        WriteProcessMemory(process, reinterpret_cast<void*>(context->Rsp), &context->Rbp,
+                           sizeof(u64), &bytes_written);
+        context->Rip = breakpoint_address + 1;
+        return true;
+    }
+
+    if (guest_offset == DreamsEmptyIncrementalExitOffset) {
+        if (state.active && state.tracked) {
+            state.empty_incremental_exit = true;
+        }
+        context->Rip = base + DreamsBuilderExitOffset;
+        return true;
+    }
+
+    if (guest_offset == DreamsBuilderExitOffset) {
+        if (state.active && state.tracked) {
+            state.exit_seen = true;
+        }
+        context->Rax = ReadDreamsU64(process, base + 0x1c56cb8);
+        context->Rip = breakpoint_address + 7;
+        return true;
+    }
+
+    if (guest_offset == DreamsCacheCommitOffset) {
+        SIZE_T bytes_written = 0;
+        WriteProcessMemory(process, reinterpret_cast<void*>(context->R15 + 0x1cbfc8),
+                           &context->Rax, sizeof(context->Rax), &bytes_written);
+        if (state.active && state.tracked) {
+            state.cache_committed = true;
+            state.committed_identity = context->Rax;
+        }
+        context->Rip = breakpoint_address + 7;
+        return true;
+    }
+
+    if (guest_offset == DreamsFirstCompleteOffset) {
+        const s32 count = static_cast<s32>(ReadDreamsU32(process, context->Rsp + 0x40));
+        if (state.active && state.tracked) {
+            state.first_complete = true;
+            state.first_count = count;
+            const u32 preflight =
+                dreams_sculpt_hash_preflight_count.fetch_add(1, std::memory_order_relaxed);
+            if (preflight < 4) {
+                PreflightDreamsSculptHashTable(process, context, state);
+            }
+        }
+        context->Rip = base + (count <= 0 ? 0x8b875b : 0x8b852a);
+        return true;
+    }
+
+    if (guest_offset == DreamsSecondStartOffset) {
+        if (state.active && state.tracked) {
+            state.second_started = true;
+            const u32 preflight =
+                dreams_sculpt_second_preflight_count.fetch_add(1, std::memory_order_relaxed);
+            if (preflight < 4) {
+                PreflightDreamsSculptSecondPass(process, context, state);
+            }
+        }
+        context->R12 = 1;
+        context->Rip = breakpoint_address + 6;
+        return true;
+    }
+
+    if (guest_offset == DreamsObjectPrepareCallOffset) {
+        const u8 type = ReadDreamsU8(process, context->Rsp + 0xc0);
+        if (state.active && state.tracked) {
+            ++state.prepare_calls;
+            state.prepare_type1 += type == 1 ? 1 : 0;
+        }
+        context->Rdx = context->R14;
+        context->Rip = breakpoint_address + 3;
+        return true;
+    }
+
+    if (guest_offset == DreamsObjectPrepareReturnOffset) {
+        const u64 root = ReadDreamsU64(process, context->Rsp + 0xa0);
+        const u8 type = ReadDreamsU8(process, context->Rsp + 0xc0);
+        if (state.active && state.tracked) {
+            ++state.prepare_returns;
+            state.prepare_return_type1 += type == 1 ? 1 : 0;
+        }
+        context->Rdi = root;
+        context->Rip = base + (type == 1 ? 0x8b8a47 : 0x8b8870);
+        return true;
+    }
+
+    if (guest_offset == DreamsOutputGateOffset) {
+        const u64 output = ReadDreamsU64(process, base + DreamsOutputGlobalOffset);
+        if (state.active && state.tracked) {
+            if (state.output_gate_count == 0) {
+                state.first_output_gate = output;
+            }
+            ++state.output_gate_count;
+            state.output_gate_null += output == 0 ? 1 : 0;
+        }
+        context->Rip = base + (output == 0 ? 0x8bb997 : 0x8b8a75);
+        return true;
+    }
+
+    if (guest_offset == DreamsType1DispatchOffset) {
+        const u64 object = ReadDreamsU64(
+            process, context->R10 + 0x10958c0 + static_cast<u64>(context->R14) * 8);
+        if (state.active && state.tracked) {
+            ++state.type1_dispatch_count;
+        }
+        context->Rbx = object;
+        context->Rip = breakpoint_address + 8;
+        return true;
+    }
+
+    if (guest_offset == DreamsResourceSelectOffset) {
+        const u16 slot = ReadDreamsU16(process, context->Rax);
+        u8 active = 0xff;
+        u32 payload = 0xffffffffu;
+        u32 model_bits = 0;
+        bool model_value_read = false;
+        if (slot != 0xffff) {
+            MarkDreamsSculptResourceReference(slot);
+            const u64 resource_table = ReadDreamsU64(process, base + 0x44d1730);
+            if (resource_table != 0) {
+                const u64 resource = resource_table + static_cast<u64>(slot) * 0x38;
+                active = ReadDreamsU8(process, resource + 0x1c);
+                payload = ReadDreamsU32(process, resource + 0x20);
+                if (payload != 0xffffffffu) {
+                    const u64 model_table = ReadDreamsU64(process, base + 0x97aafc8);
+                    if (model_table != 0) {
+                        SIZE_T bytes_read = 0;
+                        model_value_read =
+                            ReadProcessMemory(process,
+                                              reinterpret_cast<const void*>(
+                                                  model_table +
+                                                  static_cast<u64>(payload) * 0x120 + 0xc4),
+                                              &model_bits, sizeof(model_bits), &bytes_read) &&
+                            bytes_read == sizeof(model_bits);
+                    }
+                }
+            }
+        }
+        if (state.active && state.tracked) {
+            if (state.resource_select_count == 0) {
+                state.first_resource_object = context->Rbx;
+                state.first_resource_slot = slot;
+                state.first_resource_active = active;
+                state.first_resource_payload = payload;
+                state.first_resource_model_bits = model_bits;
+            }
+            ++state.resource_select_count;
+            state.resource_invalid_slots += slot == 0xffff ? 1 : 0;
+            state.resource_active += active != 0 && active != 0xff ? 1 : 0;
+            state.resource_missing_payloads +=
+                slot != 0xffff && payload == 0xffffffffu ? 1 : 0;
+            state.resource_resolved_payloads +=
+                slot != 0xffff && payload != 0xffffffffu ? 1 : 0;
+            state.resource_model_ready +=
+                model_value_read && (model_bits & 0x7fffffffu) != 0 ? 1 : 0;
+            state.resource_model_unready +=
+                model_value_read && (model_bits & 0x7fffffffu) == 0 ? 1 : 0;
+        }
+        context->R11 = slot;
+        context->Rip = breakpoint_address + 4;
+        return true;
+    }
+
+    if (guest_offset == DreamsRecordGateOffset) {
+        const u64 output = ReadDreamsU64(process, base + DreamsOutputGlobalOffset);
+        const u8 guard = ReadDreamsU8(process, base + 0x6667e70);
+        if (state.active && state.tracked) {
+            if (state.record_gate_count == 0) {
+                state.first_record_gate_object = context->Rbx;
+                state.first_record_gate_output = output;
+                state.first_record_gate_guard = guard;
+            }
+            ++state.record_gate_count;
+        }
+        context->Rax = (context->Rax & ~0xffull) | guard;
+        context->Rip = breakpoint_address + 6;
+        return true;
+    }
+
+    if (guest_offset == DreamsRecordEmitOffset) {
+        const u64 count_address = context->R15 + 0x31ff38;
+        const u32 previous = ReadDreamsU32(process, count_address);
+        const u32 result = previous + 1;
+        SIZE_T bytes_written = 0;
+        WriteProcessMemory(process, reinterpret_cast<void*>(count_address), &result,
+                           sizeof(result), &bytes_written);
+        ApplyDreamsIncFlags(context, previous, result);
+        if (state.active && state.tracked) {
+            if (state.emit_count == 0) {
+                state.first_emit_object = context->Rbx;
+            }
+            ++state.emit_count;
+        }
+        context->Rip = breakpoint_address + 7;
+        return true;
+    }
+
+    const u64 post_root = ReadDreamsU64(process, context->Rsp + 0x650);
+    if (state.active && state.tracked && post_root == state.root) {
+        const u32 resource_scan =
+            dreams_sculpt_resource_scan_count.fetch_add(1, std::memory_order_relaxed);
+        if (resource_scan < 8) {
+            ScanDreamsFirstUnresolvedSculptResource(process, base, state);
+        }
+
+        const u64 cached_after = ReadDreamsU64(process, state.builder + 0x1cbfc8);
+        const u32 records_after =
+            state.output != 0 ? ReadDreamsU32(process, state.output + 0x31ff38) : 0;
+        const u32 summary = dreams_sculpt_summary_count.fetch_add(1, std::memory_order_relaxed);
+        if (summary < 64) {
+            char buffer[2048]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "sculpt_provenance=%llu frame=%u thread=%lu root=0x%016llx/%u "
+                "entry={identity=0x%016llx cached=0x%016llx generation=%llu phase=%u "
+                "ready=%u,%u tables=%llu,%llu retry=%u records=%u} "
+                "path={empty_exit=%u commit=%u/0x%016llx first=%u/%d "
+                "hash=%u/%u/%u first_miss=%u:0x%08x:%d:0x%016llx second=%u "
+                "emits=%u first_emit=0x%016llx exit=%u} "
+                "resource_scan={attempted=%u complete=%u unresolved=%u invalid=%u steps=%u "
+                "index=%d object=0x%016llx id=0x%08x header=0x%08x slots=%u,%u,%u "
+                "kind=%u writers=0x%016llx,0x%016llx "
+                "objects=%u handles=%u active=%u payloads=%u/%u "
+                "first_payload=%d:0x%016llx:%u:%u:%u:0x%08x:0x%016llx} "
+                "post={cached=0x%016llx records=%u}\r\n",
+                static_cast<unsigned long long>(state.invocation), state.frame,
+                GetCurrentThreadId(), static_cast<unsigned long long>(state.root),
+                state.root_count, static_cast<unsigned long long>(state.root_identity),
+                static_cast<unsigned long long>(state.cached_identity),
+                static_cast<unsigned long long>(state.generation), state.phase, state.ready,
+                state.ready_input, static_cast<unsigned long long>(state.table0_active),
+                static_cast<unsigned long long>(state.table1_active),
+                state.bootstrap_enabled ? 1 : 0, state.records_before,
+                state.empty_incremental_exit ? 1 : 0, state.cache_committed ? 1 : 0,
+                static_cast<unsigned long long>(state.committed_identity),
+                state.first_complete ? 1 : 0, state.first_count,
+                state.hash_preflight_valid ? 1 : 0, state.hash_active, state.hash_missing,
+                state.hash_first_index, state.hash_first_target, state.hash_first_work,
+                static_cast<unsigned long long>(state.hash_first_object),
+                state.second_started ? 1 : 0, state.emit_count,
+                static_cast<unsigned long long>(state.first_emit_object),
+                state.exit_seen ? 1 : 0, state.resource_scan.attempted ? 1 : 0,
+                state.resource_scan.complete ? 1 : 0,
+                state.resource_scan.unresolved ? 1 : 0,
+                state.resource_scan.invalid_chain ? 1 : 0, state.resource_scan.steps,
+                state.resource_scan.index,
+                static_cast<unsigned long long>(state.resource_scan.object),
+                state.resource_scan.id, state.resource_scan.header,
+                state.resource_scan.primary, state.resource_scan.auxiliary,
+                state.resource_scan.selected, state.resource_scan.selected_kind,
+                static_cast<unsigned long long>(state.resource_scan.primary_writer),
+                static_cast<unsigned long long>(state.resource_scan.auxiliary_writer),
+                state.resource_scan.type1_objects, state.resource_scan.handles,
+                state.resource_scan.active_handles, state.resource_scan.resolved_payloads,
+                state.resource_scan.missing_payloads,
+                state.resource_scan.first_missing_payload_index,
+                static_cast<unsigned long long>(
+                    state.resource_scan.first_missing_payload_object),
+                state.resource_scan.first_missing_payload_slot,
+                state.resource_scan.first_missing_payload_kind,
+                state.resource_scan.first_missing_payload_active,
+                state.resource_scan.first_missing_payload_value,
+                static_cast<unsigned long long>(
+                    state.resource_scan.first_missing_payload_writer),
+                static_cast<unsigned long long>(cached_after), records_after);
+            AppendDreamsSculptProvenanceTrace(buffer, length);
+
+            char second_buffer[1536]{};
+            const int second_length = _snprintf_s(
+                second_buffer, sizeof(second_buffer), _TRUNCATE,
+                "sculpt_second=%llu frame=%u "
+                "preflight={valid=%u count=%u active=%u type1=%u/%u stroke=%u "
+                "groups=%u/%u type1_valid=%u first=%u:0x%016llx:%u:%d:%u} "
+                "milestones={prepare=%u/%u return=%u/%u output=%u/%u:0x%016llx "
+                "dispatch=%u resource=%u invalid=%u active=%u payload=%u/%u model=%u/%u "
+                "first=0x%016llx:%u:%u:0x%08x:0x%08x gate=%u "
+                "first_gate=0x%016llx:%u:0x%016llx}\r\n",
+                static_cast<unsigned long long>(state.invocation), state.frame,
+                state.second_preflight_valid ? 1 : 0, state.second_count,
+                state.second_active, state.second_type1, state.second_sculpt_family,
+                state.second_stroke, state.second_group_valid, state.second_group_invalid,
+                state.second_type1_group_valid, state.second_first_type1_index,
+                static_cast<unsigned long long>(state.second_first_type1_object),
+                state.second_first_type1_group, state.second_first_type1_mapped,
+                state.second_first_type1_group_valid, state.prepare_calls, state.prepare_type1,
+                state.prepare_returns, state.prepare_return_type1, state.output_gate_count,
+                state.output_gate_null, static_cast<unsigned long long>(state.first_output_gate),
+                state.type1_dispatch_count, state.resource_select_count,
+                state.resource_invalid_slots, state.resource_active,
+                state.resource_resolved_payloads, state.resource_missing_payloads,
+                state.resource_model_ready, state.resource_model_unready,
+                static_cast<unsigned long long>(state.first_resource_object),
+                state.first_resource_slot, state.first_resource_active,
+                state.first_resource_payload, state.first_resource_model_bits,
+                state.record_gate_count,
+                static_cast<unsigned long long>(state.first_record_gate_object),
+                state.first_record_gate_guard,
+                static_cast<unsigned long long>(state.first_record_gate_output));
+            AppendDreamsSculptProvenanceTrace(second_buffer, second_length);
+        }
+    }
+    state.active = false;
+    context->Rax = ReadDreamsU64(process, context->Rsp + 0x650);
+    context->Rip = breakpoint_address + 8;
+    return true;
 }
 
 static bool HandleDreamsSaveQuotaTrace(EXCEPTION_POINTERS* exception) noexcept {
@@ -2591,8 +4086,39 @@ static bool HandleDreamsCpuRootTrace(EXCEPTION_POINTERS* exception) noexcept {
                                sizeof(return_address), &bytes_written);
             context->Rip = MemoryPatcher::g_eboot_address + target_offset;
         };
+        struct DreamsCsgCompletionTimingState {
+            u64 compute_start_qpc{};
+            u64 wait_start_qpc{};
+            u64 event_start_qpc{};
+            u32 sequence{};
+            u32 wait_iteration{};
+        };
+        static thread_local DreamsCsgCompletionTimingState csg_timing{};
+        static const u64 qpc_frequency = [] {
+            LARGE_INTEGER value{};
+            QueryPerformanceFrequency(&value);
+            return static_cast<u64>(value.QuadPart);
+        }();
         const auto trace_pipe = [&](const char* kind, const u64 pipe, const u64 wait_result,
                                     const u32 out_count) noexcept {
+            LARGE_INTEGER qpc_value{};
+            QueryPerformanceCounter(&qpc_value);
+            const u64 qpc = static_cast<u64>(qpc_value.QuadPart);
+            if (guest_offset == 0x12850c1) {
+                ++csg_timing.sequence;
+                csg_timing.compute_start_qpc = qpc;
+                csg_timing.wait_start_qpc = 0;
+                csg_timing.event_start_qpc = 0;
+                csg_timing.wait_iteration = 0;
+            } else if (guest_offset == 0x1287bd0) {
+                csg_timing.wait_start_qpc = qpc;
+                csg_timing.event_start_qpc = 0;
+                csg_timing.wait_iteration = 0;
+            } else if (guest_offset == 0x1287c83) {
+                ++csg_timing.wait_iteration;
+                csg_timing.event_start_qpc = qpc;
+            }
+
             const u64 completion_pointer = pipe != 0 ? ReadDreamsU64(process, pipe + 0xb8) : 0;
             const u64 completion =
                 completion_pointer != 0 ? ReadDreamsU64(process, completion_pointer) : 0;
@@ -2603,7 +4129,52 @@ static bool HandleDreamsCpuRootTrace(EXCEPTION_POINTERS* exception) noexcept {
             const u64 command_end = pipe != 0 ? ReadDreamsU64(process, pipe + 0xf0) : 0;
             static std::atomic<u32> compute_trace_count{0};
             const u32 ordinal = compute_trace_count.fetch_add(1, std::memory_order_relaxed);
-            if (ordinal < 256 || DreamsStampTraceCaptureEnabled()) {
+            if (DreamsCsgCompletionTraceEnabled()) {
+                const u64 since_compute_us = DreamsQpcElapsedMicroseconds(
+                    csg_timing.compute_start_qpc, qpc, qpc_frequency);
+                const u64 since_wait_us = DreamsQpcElapsedMicroseconds(
+                    csg_timing.wait_start_qpc, qpc, qpc_frequency);
+                const u64 event_wait_us = guest_offset == 0x1287c88
+                                              ? DreamsQpcElapsedMicroseconds(
+                                                    csg_timing.event_start_qpc, qpc, qpc_frequency)
+                                              : 0;
+                const u32 observed_target = guest_offset == 0x1287d23
+                                                ? static_cast<u32>(context->R13)
+                                                : target;
+                if (ordinal < 16384) {
+                    char buffer[768]{};
+                    const int length = _snprintf_s(
+                        buffer, sizeof(buffer), _TRUNCATE,
+                        "csg_completion=%u sequence=%u iteration=%u tick=%llu qpc=%llu/%llu "
+                        "thread=%lu kind=%s offset=0x%08llx pipe=0x%016llx "
+                        "completion_ptr=0x%016llx completion=%llu target=%u observed_target=%u "
+                        "equeue=0x%016llx commands=0x%016llx,0x%016llx,0x%016llx "
+                        "wait_result=0x%016llx out=%u since_compute_us=%llu since_wait_us=%llu "
+                        "event_wait_us=%llu rsp=0x%016llx\r\n",
+                        ordinal, csg_timing.sequence, csg_timing.wait_iteration,
+                        static_cast<unsigned long long>(GetTickCount64()),
+                        static_cast<unsigned long long>(qpc),
+                        static_cast<unsigned long long>(qpc_frequency), GetCurrentThreadId(), kind,
+                        static_cast<unsigned long long>(guest_offset),
+                        static_cast<unsigned long long>(pipe),
+                        static_cast<unsigned long long>(completion_pointer),
+                        static_cast<unsigned long long>(completion), target, observed_target,
+                        static_cast<unsigned long long>(equeue),
+                        static_cast<unsigned long long>(command_begin),
+                        static_cast<unsigned long long>(command_cursor),
+                        static_cast<unsigned long long>(command_end),
+                        static_cast<unsigned long long>(wait_result), out_count,
+                        static_cast<unsigned long long>(since_compute_us),
+                        static_cast<unsigned long long>(since_wait_us),
+                        static_cast<unsigned long long>(event_wait_us),
+                        static_cast<unsigned long long>(context->Rsp));
+                    AppendDreamsCsgCompletionTrace(buffer, length);
+                } else if (ordinal == 16384) {
+                    static constexpr char Truncated[] =
+                        "csg_completion_trace_truncated=1 limit=16384\r\n";
+                    AppendDreamsCsgCompletionTrace(Truncated, sizeof(Truncated) - 1);
+                }
+            } else if (ordinal < 256 || DreamsStampTraceCaptureEnabled()) {
                 char buffer[512]{};
                 const int length = _snprintf_s(
                     buffer, sizeof(buffer), _TRUNCATE,
@@ -3192,8 +4763,13 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         }
         break;
     case EXCEPTION_BREAKPOINT:
-        handled = HandleDreamsSceneReadyHandoff(pExp) ||
-                  HandleDreamsSceneCacheBootstrap(pExp) || HandleDreamsModelRecordTrace(pExp) ||
+        handled = HandleDreamsVisibleSculptsTrace(pExp) ||
+                  HandleDreamsSceneReadyHandoff(pExp) ||
+                  HandleDreamsSceneBuilderGateTrace(pExp) ||
+                  HandleDreamsSceneCacheBootstrap(pExp) ||
+                  HandleDreamsSculptLifecycleTrace(pExp) ||
+                  HandleDreamsSculptProvenanceTrace(pExp) ||
+                  HandleDreamsModelRecordTrace(pExp) ||
                   HandleDreamsPairQueueTrace(pExp) ||
                   HandleDreamsOfflineLimitsTrace(pExp) ||
                   HandleDreamsRetirementWatermarkWrite(pExp) ||

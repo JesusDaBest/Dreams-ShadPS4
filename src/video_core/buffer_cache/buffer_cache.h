@@ -146,6 +146,9 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Return true when the exact byte range intersects a GPU-resident write.
+    [[nodiscard]] bool IsRegionGpuModifiedExact(VAddr addr, size_t size) const;
+
     /// Return buffer id for the specified region
     BufferId FindBuffer(VAddr device_addr, u32 size);
 

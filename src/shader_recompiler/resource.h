@@ -125,6 +125,7 @@ struct SamplerResource {
     u32 is_inline_sampler : 1;
     u32 associated_image : 4;
     u32 disable_aniso : 1;
+    u32 is_compare : 1;
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         return is_inline_sampler ? inline_sampler
@@ -149,6 +150,9 @@ struct PushData {
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 UdRegsIndex = 4;
     static constexpr u32 BufOffsetIndex = UdRegsIndex + NUM_USER_DATA_REGS / 4;
+    static constexpr u32 HostDataIndex = BufOffsetIndex + (NUM_BUFFERS + 15) / 16;
+    // Compute dispatches use this host-only push slot to select an ordered-count phase.
+    static constexpr u32 DreamsOrderedPhase = 0;
 
     float xoffset;
     float yoffset;
@@ -156,6 +160,7 @@ struct PushData {
     float yscale;
     std::array<u32, NUM_USER_DATA_REGS> ud_regs;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    std::array<u32, 2> host_data;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
