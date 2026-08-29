@@ -1,5 +1,38 @@
 # Fixes Tried
 
+## August 29 retained checkpoint
+
+### Confirmed and retained
+
+- Added exact GPU collect/prefix/replay for `DS_ORDERED_COUNT` shader `0x4ebeffd2`.
+- Isolated the resulting shader-cache ABI with revision suffix `_doc1`.
+- Preserved the guest final counter value and bounded scratch allocation.
+- Validated a fully covered and fully filled cube at 30 FPS in the recorded edit-mode view.
+- The user confirmed sculpt and tweak-menu jitter was absent.
+- Preserved the exact executable, screenshot, source patches, and hashes in this repository.
+
+### Still incorrect
+
+- The cube surface is a grid of rounded panels rather than the intended fleck surface.
+- The result is therefore a strong checkpoint, not a complete Dreams rendering fix.
+
+### Explicitly rejected after the checkpoint
+
+- Automatic A3 (`0xa3a9e9ef`) BDA prewarming was enabled for one falsification run. The required
+  range was already registered before the prewarm (`registered_before=true`), so the change was
+  reverted.
+- Existing `0x63ddac84 -> 0xa3a9e9ef` captures show coherent table handoff and matching sampled
+  values, so no new ordering patch was applied there.
+- FP64 capability is present on the test GPU; A3 is not passing through the lossy FP32 fallback.
+
+### Current next experiment
+
+Capture `0xce3b8413` sample coordinates, sampled values, atlas bytes, and discard condition for the
+known cube draw. Do not patch the CE3/DCC path until that trace distinguishes sampling,
+wave/discard, and upstream-parameter explanations.
+
+## Historical August 19 and earlier work
+
 ## August 19 correction and current experiments
 
 The previous section called full-screen 3D rendering confirmed. Later repeat tests invalidated that

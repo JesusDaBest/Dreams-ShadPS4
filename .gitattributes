@@ -1,3 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
-patches/*.patch -text
+patches/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/**/*.exe -text
+builds/**/*.png -text

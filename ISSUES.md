@@ -1,57 +1,54 @@
 # Open Issues
 
-## 1. Implement guest-ordered `DS_ORDERED_COUNT`
+## 1. Correct the `0xce3b8413` sculpt atlas raymarch/coverage stage
 
-The current backend keeps the counter address but loses the M0 logical-wave fields and treats the
-operation as a normal atomic. Preserve guest wave identity and implement `wave_release` and
-`wave_done` without a GPU scheduling deadlock.
+The known cube is now a stable, filled volume, but its surface is a regular panel grid. Capture both
+fragment-shader sample sites, exact atlas neighborhoods, and the discard decision for one fixed
+draw. Compare the GPU samples with software interpolation before changing image or shader code.
 
-This is the primary blocker because restoring valid Vulkan dispatch-base behavior changed missing
-geometry into visible but incorrectly positioned geometry.
+## 2. Verify the final DCC decoder and materials
 
-## 2. Make sculpt and paint geometry stable and visible
+The fullscreen `0xdcc325c2` pass consumes the CE3 visibility/depth targets and writes the final
+G-buffer. Investigate it after CE3 coverage is proven, especially for color or material errors.
 
-Validate one fixed creation scene. A sculpt preview, placed sculpt, and paint stroke must remain
-visible and selectable while the camera moves. Do not accept nonzero indirect command counts alone.
+## 3. Expand sculpt, paint, and character regression coverage
 
-## 3. Preserve UI and gadget rendering
+Confirm a sculpt preview, placed sculpt, paint stroke, character, and at least one premade scene.
+They must remain visible and selectable while the camera and LOD change.
 
-Tweak panels can be black and geometry can jitter. Any ordered-count correction must preserve the
-currently working imp, grid, UI, gadget placement, and gadget logic.
+## 4. Preserve the fixed ordered-count path
 
-## 4. Repair intro presentation and audio timing
+Keep the exact `0x4ebeffd2` collect/prefix/replay result stable. Add focused regression coverage for
+guest logical group order, final counter publication, cache revision, and repeated launches.
 
-The decoder produces frames, but some current runs show black video and severely delayed audio.
-Test this separately from the geometry path with diagnostics disabled.
+## 5. Measure performance without capture waits
 
-## 5. Investigate the trigger-zone host exception
+The validated cube view reached 30 FPS, but other scenes have been much slower. Profile only after
+disabling forced readbacks, capture waits, and diagnostic scheduler finishes.
 
-Selecting a trigger zone reproduced host exception `0xe06d7363`. Capture the exception message and
-native stack before assigning it to rendering, save data, or gadget logic.
+## 6. Verify startup, lighting, floors, and save behavior
 
-## 6. Reduce diagnostics and isolate upstream-quality changes
+Repeat clean launches and confirm homespace lighting, edit floors, intro presentation, save loading,
+and the corrected false-full save accounting remain stable.
 
-The snapshot contains thousands of lines of gated tracing and several emulator-wide experiments.
-Separate confirmed corrections from diagnostics before upstream review. Audit all generalized
-changes against games other than Dreams.
+## 7. Investigate remaining crashes independently
 
-## 7. Verify offline ownership and content boundaries
+Capture a native stack and message for tutorial or gadget-selection crashes before assigning them
+to the sculpt renderer.
 
-Local content can load without live Dreams servers, but PSN entitlement/demo behavior and community
-content are not verified. Do not imply that offline stubs restore discontinued online services.
+## 8. Reduce diagnostics and isolate upstream-quality changes
 
-## Regression coverage
+Separate title-specific investigation code, general GPU-emulation corrections, and one-shot capture
+facilities. Audit generalized changes against other shadPS4 games before upstream review.
 
-- false `4 GB used / 1 GB limit` save state;
-- black Continue/EULA/Preferences pages;
-- invisible or severely delayed intro;
-- zero indirect geometry commands;
-- nonzero commands with malformed positions;
-- colored top-edge dot or compressed render strip;
-- black tweak panels;
-- angle-dependent grey lines;
-- camera-relative geometry jitter;
-- missing sculpt previews, placed sculpts, paint/flecks, and characters;
-- gadget placement or logic regression;
-- forced diagnostics reducing execution to roughly 1 FPS;
-- post-EOF and gadget-selection crashes.
+## Regression checklist
+
+- full-covered/full-filled known cube remains stable;
+- no sculpt or tweak-menu jitter;
+- no black cube, missing preview, or disappearing placed sculpt;
+- normal homespace lights and edit floor;
+- no camera-distance chunk loss;
+- paint/fleck and character visibility;
+- UI, imp, grid, gadgets, and tweak panels preserved;
+- no forced diagnostic path in performance runs;
+- no device loss, out-of-memory error, or repeat-launch cache regression.

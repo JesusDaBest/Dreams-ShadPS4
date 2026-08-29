@@ -1,96 +1,72 @@
 # Reproduction Notes
 
-## Setup
+## Exact checkpoint
 
 - Windows
 - Legal `CUSA04301` game and firmware files
-- Release build made from the August 19 experimental source
-- Per-game readback mode used in the latest test: `1`
-- Present mode used in the latest test: `Immediate`
-- Pipeline cache disabled while shader behavior is changing
-- Offline environment used in the latest test: `SHADPS4_DREAMS_FAKE_PSN=offline`
+- Executable: `builds/cusa04301-full-covered-filled-20260829/shadps4.exe`
+- SHA-256: `183D9914A395D8AD804428B418E13474D71172A6146386DD9E7D159F26AE14CC`
+- Dedicated portable `user` directory
+- No diagnostic `SHADPS4_*` environment flags for the baseline run
 
-These settings describe the captured run; they are not all proven requirements.
+Do not point the experimental executable at another shadPS4 installation's user directory without a
+verified save backup.
 
-Use a dedicated build directory with a local portable `user` folder. Do not point this experimental
-build at another shadPS4 installation's saves or caches.
+## Baseline cube test
 
-## Stable-baseline test
+1. Launch the checkpoint executable with the Dreams `eboot.bin` as its sole argument.
+2. Enter DreamShaping and load the fixed scene containing one cube sculpt at `(0, 0, 0)`.
+3. Enter edit mode and use the same three-side camera view shown in the checkpoint screenshot.
+4. Record FPS, lighting, floor, cube coverage, cube fill, and whether sculpt/tweak-menu elements
+   jitter while the camera moves.
+5. Preserve the log and screenshot before another launch replaces them.
 
-1. Launch Dreams without broad diagnostic environment variables.
-2. Pass Continue, consent/EULA, and Preferences if they appear.
-3. Enter DreamShaping, open a fixed saved scene, and enter edit mode.
-4. Record whether the imp, grid, UI, gadgets, tweak panels, sculpt preview, placed sculpt, and paint
-   stroke are visible.
-5. Rotate the camera without editing the scene and check whether geometry changes position.
-6. Preserve the game log immediately; the next launch can replace it.
+Expected checkpoint result:
 
-Expected known result is incomplete: UI/imp/grid/gadgets can render, while sculpts and paint remain
-missing and tweak panels may be black.
+- 30 FPS in the recorded view;
+- normal lighting and edit floor;
+- cube fully covered and fully filled;
+- no observed sculpt or tweak-menu jitter;
+- surface still wrong as a regular grid of rounded panels.
 
-## Dispatch-base candidate test
+## Targeted CE3 surface trace
 
-The August 19 candidate should create ordered-count compute pipelines with the Vulkan dispatch-base
-flag. In the known scene, this changed invisible geometry into oversized grey shapes. Correct output
-must not be assumed merely because more pixels appear.
+Use a fresh empty capture directory and relaunch the exact checkpoint with only:
 
-Reject the candidate if any of these occur:
+```text
+SHADPS4_DREAMS_CE3_FLECK_CAPTURE_DIR=<fresh absolute directory>
+```
 
-- tweak panels turn black;
-- geometry shifts when only the camera moves;
-- a sculpt is audible but invisible or unselectable;
-- paint/fleck strokes are absent;
-- the imp, grid, UI, or gadgets regress;
-- performance is measured while forced-wait diagnostics are active.
+Do not enable the unrelated gather-focus trace.
 
-## Save-space test
+1. Enter edit mode and place the cube/camera in the exact target view.
+2. Create an empty `capture.request` file in the capture directory.
+3. Wait for `complete.txt`; `failed.txt` indicates eight qualifying draws passed without a complete
+   trace.
+4. Preserve `ce3-fleck-trace.tsv/bin`, `atlas-neighborhood.tsv`,
+   `atlas-neighborhood-r8.bin`, and `manifest.tsv`.
+
+Interpret the result as follows:
+
+- GPU sample differs from captured atlas interpolation: image view, sampler, or synchronization;
+- samples match but discard is wrong: wave/EXEC/discard lowering;
+- samples and discard match: VS370 parameters, association, or LOD.
+
+The optional `SHADPS4_DREAMS_CE3_READCONST_CAPTURE=1` trace auto-arms on the first qualifying draw
+after launch. Do not claim it belongs to the manually triggered cube draw unless the cube was that
+first draw.
+
+## Source reproduction
+
+Apply both patches documented in [DEVELOPMENT.md](DEVELOPMENT.md) to upstream shadPS4 commit
+`555c458c9fdd33cb4686492374519c7bb112a891` and its Sirit submodule revision `282083a`.
+
+The cumulative patches are experimental and not upstream-ready.
+
+## Save-space regression
 
 1. Open Dreams' Limits Info page.
 2. Record local usage, maximum blocks, creations, versions, and photos.
-3. Attempt to create and save a small scene.
-4. Confirm that host free disk space is not confused with the game's 1 GiB save quota.
-
-The corrected emulator counts each regular file in rounded 32 KiB PS4 blocks and clamps free blocks
-at zero. It must not report an unsigned-underflow value such as the observed false `4 GB used` state.
-
-## Targeted diagnostics
-
-The source includes environment-gated and trigger-file diagnostics for:
-
-- compute and buffer dependency tracing;
-- ordered counters and GDS state;
-- producer records and input buffers;
-- indirect geometry command scanning;
-- geometry input dumps for shader `0xd25db925`;
-- one-shot GPU draw/dispatch timing;
-- RenderDoc capture support;
-- CPU-write watches and crash context.
-
-Environment-variable names and trigger handling are searchable under
-`src/video_core/renderer_vulkan/vk_rasterizer.cpp`. Enable only one focused diagnostic at a time.
-Many paths call `scheduler.Finish()` and can reduce Dreams to about 1 FPS.
-
-## High-value checks
-
-- traversal shader `0xb535c6c8` M0 value and logical wave ID;
-- all four `DS_ORDERED_COUNT` return values for one guest wave;
-- GDS ordered-counter values before and after release/done;
-- queue producer `0x2bfebd3c` record count;
-- scene-compaction shader `0x3937a849` output;
-- indirect-argument shader `0x90272fc4` command contents, not only nonzero count;
-- geometry draw VS `0xd25db925` and FS `0x3f6e1a00` input ranges;
-- whether camera-only changes alter generated position records;
-- unexpected full GPU waits during a non-diagnostic run.
-
-## Patch
-
-Apply `patches/dreams-focused-20260819-experimental.patch` to upstream commit
-`555c458c9fdd33cb4686492374519c7bb112a891`.
-
-Verify SHA-256:
-
-```text
-A7C1863086220579483BA4D4F9DB3E68F40E9B7BF4780D9B1CCF7F036460AEAF
-```
-
-The patch is cumulative, experimental, and not upstream-ready.
+3. Create and save a small scene.
+4. Confirm the emulator does not reproduce the old unsigned-underflow `4 GB used / 1 GB limit`
+   result.

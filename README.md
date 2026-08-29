@@ -2,63 +2,70 @@
 
 This repository tracks source-level work on `Dreams` (`CUSA04301`) in `shadPS4`.
 
-## Current status - August 19, 2026
+## Current status — August 29, 2026
 
-- **Not playable. There is no complete 3D-rendering fix.**
-- Startup can reach offline menus, tutorial logic, DreamShaping, and creation scenes.
-- UI, the imp, the grid, and gadgets can render. Gadget placement and logic have worked.
-- Sculpt, paint/fleck, and character geometry remains missing or malformed.
-- Tweak panels can be black, 3D positions can jitter with the camera, and the intro can regress to
-  black video with severely delayed audio.
-- The August 17 statement that full-screen 3D was fixed at 30 FPS is withdrawn. Later repeat tests
-  on the same machine contradicted it.
+- **Not yet playable and not a complete visual fix.**
+- Dreams reaches offline menus, DreamShaping, saved scenes, and edit mode.
+- The retained checkpoint renders the test cube fully covered and fully filled at 30 FPS in the
+  validated view.
+- Sculpt and tweak-menu jitter was absent in that run.
+- The remaining sculpt is visually wrong: its surface is a regular grid of rounded panels rather
+  than the intended Dreams flecks.
+- The exact validated executable, screenshot, hashes, and investigation record are included in
+  [`builds/cusa04301-full-covered-filled-20260829`](builds/cusa04301-full-covered-filled-20260829).
 
-## Latest concrete result
+![Validated full-covered/full-filled checkpoint](builds/cusa04301-full-covered-filled-20260829/validated-full-covered-filled.png)
 
-The August 19 candidate restores the Vulkan dispatch-base pipeline flag required by Dreams'
-ordered traversal path. Before this correction, `vkCmdDispatchBase` was used with nonzero base
-groups on an incompatible compute pipeline. After the correction, previously invisible geometry
-appeared, but as oversized grey shapes whose positions jitter between frames.
+## Latest confirmed correction
 
-That result localizes the main failure to ordered sculpt/fleck geometry generation. It is a real
-Vulkan correctness correction, but **not** a visible rendering fix.
+Dreams compute shader `0x4ebeffd2` uses `DS_ORDERED_COUNT` while producing a sculpt seed stream.
+Replacing that guest operation with a normal Vulkan atomic assigns output rows in host workgroup
+arrival order and corrupts the stream.
 
-Dreams compute shader `0xb535c6c8` uses `DS_ORDERED_COUNT`. The current implementation tracks the
-counter address but reduces the operation to ordinary atomics; it does not preserve guest
-wave-creation order or apply the instruction's release/done queue behavior. This is the primary
-known rendering blocker.
+The retained implementation performs a GPU collect pass, an exclusive prefix in guest logical
+order, and a replay pass at the exact ordered offsets before publishing the final guest counter.
+This changed the known cube from incomplete/unstable chunks into a full, stable volume and removed
+the observed jitter. It is an emulator-ordering correction, not replacement geometry.
 
-## Confirmed progress retained
+## Remaining highest-probability defect
 
-- Offline startup/service compatibility reaches local content without recreating Dreams servers.
-- The false `4 GB used / 1 GB limit` state was traced to save-block accounting and unsigned
-  underflow; rounded 32 KiB block accounting removed it in the tested save.
-- The shader recompiler now handles several Dreams paths that previously failed translation,
-  including dynamic control flow, lane/mask operations, mixed descriptors, metadata images,
-  64-bit GDS atomics, and `DS_ORDERED_COUNT` translation.
-- Expensive diagnostic GPU waits were identified as the cause of many 1 FPS tests. They remain
-  opt-in and are not valid performance measurements.
+The current visual chain is:
+
+`ordered sculpt records -> VS 0x3706083c cuboid proxies -> FS 0xce3b8413 atlas raymarch/coverage/depth -> fullscreen VS 0xa33ab236 + FS 0xdcc325c2 decoder -> lighting`
+
+Captured atlas bricks are unique and nontrivial. The regular panel silhouette therefore points
+first to the `0xce3b8413` sampling/raymarch/discard stage. A targeted trace already exists to compare
+its two shader samples with the exact atlas bytes and discard decision before another patch is made.
+
+An A3 dynamic-constant prewarm was tested and rejected: the range reported
+`registered_before=true`, proving it was already resident. That experiment is not part of the
+checkpoint.
 
 ## Repository contents
 
-- [STATUS.md](STATUS.md): exact user-visible and build status
+- [STATUS.md](STATUS.md): exact visible state and build identity
 - [DISCOVERIES.md](DISCOVERIES.md): evidence, shader IDs, and technical conclusions
-- [FIXES_TRIED.md](FIXES_TRIED.md): confirmed changes, experiments, and regressions
+- [FIXES_TRIED.md](FIXES_TRIED.md): retained corrections, experiments, and regressions
 - [ISSUES.md](ISSUES.md): prioritized unresolved work
-- [REPRO.md](REPRO.md): reproduction and diagnostic procedure
-- [DEVELOPMENT.md](DEVELOPMENT.md): how another developer can continue safely
-- `patches/dreams-focused-20260819-experimental.patch`: cumulative experimental source patch
+- [REPRO.md](REPRO.md): clean reproduction and focused capture procedure
+- [DEVELOPMENT.md](DEVELOPMENT.md): exact patch and build continuation workflow
+- [`builds/cusa04301-full-covered-filled-20260829`](builds/cusa04301-full-covered-filled-20260829):
+  validated executable, screenshot, and checkpoint investigation
+- [`patches/dreams-focused-20260829-full-covered-filled.patch`](patches/dreams-focused-20260829-full-covered-filled.patch):
+  cumulative shadPS4 source patch
+- [`patches/sirit-group-nonuniform-shuffle-20260829.patch`](patches/sirit-group-nonuniform-shuffle-20260829.patch):
+  required Sirit submodule addition
 
-## Development snapshot
+## Exact checkpoint identities
 
-The current experimental source is published separately from this documentation branch so another
-developer can build and continue the same investigation state. It includes extensive gated
-diagnostics and emulator-wide changes; it must not be treated as an upstream-ready patch or used as
-a general shadPS4 build.
+- Upstream shadPS4 base: `555c458c9fdd33cb4686492374519c7bb112a891`
+- Main patch SHA-256: `CCD22A4B97E246A62FAFA71DFE40894DDA9C90DD52A6E020F583512AE30B29C4`
+- Sirit patch SHA-256: `0F826E81BB003AD6A797F942CA6B3F51BDBBFB8C189B21B1C4885E6FEDBE2041`
+- Executable SHA-256: `183D9914A395D8AD804428B418E13474D71172A6146386DD9E7D159F26AE14CC`
 
-The cumulative August 19 patch applies to upstream commit
-`555c458c9fdd33cb4686492374519c7bb112a891`. Its SHA-256 is
-`A7C1863086220579483BA4D4F9DB3E68F40E9B7BF4780D9B1CCF7F036460AEAF`.
+The patch pair was reapplied successfully in clean detached worktrees at the stated base revisions.
+The source built successfully, and 69 offline tests ran: 68 passed and one optional real-capture
+test was skipped because no capture path was supplied.
 
 This repository contains no game files, firmware, keys, PSN credentials, user saves, or proprietary
-Dreams content.
+Dreams content. The included executable is an experimental shadPS4 build for this investigation.

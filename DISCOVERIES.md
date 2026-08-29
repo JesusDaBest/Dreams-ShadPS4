@@ -1,5 +1,51 @@
 # Detailed Discoveries
 
+## August 29 result — full volume, remaining panel surface
+
+This section supersedes the August 19 `DS_ORDERED_COUNT` status below while preserving that earlier
+investigation as history.
+
+### Exact ordered replay fixed a real sculpt-stream corruption
+
+Shader `0x4ebeffd2` writes a B1 seed stream with `DS_ORDERED_COUNT`. The previous ordinary atomic
+assigned output rows in host workgroup arrival order. The retained GPU path collects one result per
+guest logical group, computes an exclusive prefix in guest order, replays the writes at the exact
+offsets, and publishes the final GDS counter at dword `0x79`.
+
+In the fixed scene this changed the sculpt from missing/unstable chunks into a fully covered and
+fully filled cube. The user also confirmed that sculpt and tweak-menu jitter was gone. The recorded
+view ran at 30 FPS. This is a guest-ordering correction, but the cube is still visually wrong: its
+surface is a regular grid of rounded panels.
+
+### The remaining defect is later in the sculpt draw path
+
+The current draw map is:
+
+`ordered records -> VS 0x3706083c cuboid proxies -> FS 0xce3b8413 atlas raymarch/coverage/depth -> fullscreen VS 0xa33ab236 + FS 0xdcc325c2 decoder -> lighting`
+
+The VS uses a fixed 14-index cuboid strip per instance. Captured Param1 atlas IDs are unique, and
+all corresponding R8 atlas bricks are nontrivial. The panel silhouette therefore points first to
+CE3 sampling/raymarch/discard rather than missing conventional geometry. DCC remains the later
+material/color target.
+
+### A3 residency and 63dd handoff were challenged
+
+- A one-run A3 BDA prewarm reported `registered_before=true`; missing first-use residency was
+  falsified and the experiment was reverted.
+- Captures show equal producer/consumer count and record tables for the `0x63ddac84 -> 0xa3a9e9ef`
+  handoff, no focus-probe overflow/comparison mismatch, and matching sampled outputs. This lowers
+  the probability of that handoff as the panel source.
+- The AMD device exposes native shader float64, so A3 is not using the lossy FP32 fallback.
+
+### Next falsifier
+
+The CE3 trace records both sample sites, exact atlas neighborhoods, and the discard condition for
+one manually selected cube draw. A sample mismatch targets image/sampler/synchronization; matching
+samples with a wrong discard target wave/EXEC/discard lowering; matching samples and discard move
+the investigation to VS370 parameters, association, or LOD.
+
+## Historical August 19 investigation
+
 ## Correction to the August 17 conclusion
 
 The August 17 snapshot described full-screen 3D rendering at 30 FPS as confirmed. Later repeated

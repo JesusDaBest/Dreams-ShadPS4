@@ -4,66 +4,63 @@
 
 - Title: `Dreams`
 - Serial: `CUSA04301`
-- Status date: August 19, 2026
-- Playability: **not playable**
-- Current source base: `555c458c9fdd33cb4686492374519c7bb112a891`
-- Current installed experimental executable SHA-256:
-  `3C357ED2473B5DFF14A4F2A60A3F7523BAC0FC5050950F7E0AC5E254CB3DFCD1`
-- Earlier stable executable SHA-256:
-  `7CE75CB1F1D6E1BD4657AB81E585B64144A85E8A9D98CF014131A08476F3F5E4`
+- Status date: August 29, 2026
+- Playability: **not playable; major visual defects remain**
+- Source base: `555c458c9fdd33cb4686492374519c7bb112a891`
+- Validated executable SHA-256:
+  `183D9914A395D8AD804428B418E13474D71172A6146386DD9E7D159F26AE14CC`
+- Checkpoint directory:
+  `builds/cusa04301-full-covered-filled-20260829`
 
-The executable hashes identify local test artifacts only; binaries are not distributed here.
+## What is confirmed working in the checkpoint
 
-## What works
+- Offline startup reaches local menus, DreamShaping, saved scenes, and edit mode.
+- UI, imp, edit grid, floor, and normal homespace lighting rendered in the validated run.
+- A single cube sculpt rendered with a full outer volume: all visible sides were covered and filled.
+- Sculpt and tweak-menu jitter was absent.
+- The recorded edit-mode view ran at 30 FPS with broad diagnostics disabled.
+- The exact `0x4ebeffd2` ordered-count collect/prefix/replay path ran without fallback, Vulkan
+  validation, device-loss, or out-of-memory errors.
 
-- The game passes the old startup crash and can reach the Dreams intro and startup pages.
-- Earlier known-good runs displayed Continue, consent/EULA, and Preferences together.
-- Offline startup can enter tutorial logic, DreamShaping, local creations, and premade content.
-- The imp, UI, editing grid, and gadgets can render.
-- Gadgets became placeable in later tests and their logic executed.
-- Controller movement and UI sounds react even when the scene is visually incomplete.
-- Corrected save-block accounting removed the false full-save condition in the tested save, allowing
-  creation of another scene.
+## What remains wrong
 
-## What does not work
+- The sculpt surface is a regular grid of rounded panels instead of the intended Dreams flecks.
+- Correct paint strokes, complex sculpts, characters, tutorials, and premade Dreams are not yet
+  regression-confirmed on this checkpoint.
+- Other scenes and camera distances can still expose culling, LOD, material, or performance issues.
+- The experimental source contains extensive diagnostics and title-specific paths and is not yet an
+  upstream-ready general shadPS4 change.
+- Online community content, historical Dreams servers, and PSN entitlement behavior are not
+  implemented or verified.
 
-- Sculpt geometry and paint/fleck strokes are invisible or malformed.
-- Characters have not been confirmed as visible in the current builds.
-- Sculpt placement can make the stamp sound without producing selectable visible geometry.
-- Tweak-menu panels can render black.
-- Generated geometry can move or jitter relative to the camera.
-- Some scenes show only a colored dot or thin strip at the top edge.
-- The current dispatch-base candidate shows large grey stepped shapes instead of correct geometry.
-- The intro can be invisible while audio plays at a severely delayed rate.
-- A trigger-zone selection produced a host C++ exception (`0xe06d7363`), but the captured exception
-  record is insufficient to identify the root cause.
-- Online community content, historical servers, and PSN entitlement behavior are not implemented or
-  verified.
+## Confirmed rendering conclusion
 
-## Performance observations
+The B1 seed-writer shader `0x4ebeffd2` required guest-logical `DS_ORDERED_COUNT` allocation rather
+than host atomic arrival order. Exact GPU collect/prefix/replay fixed the missing-volume and jitter
+symptoms in the known scene.
 
-- The earlier stable creation-scene baseline was approximately 15-16 FPS with sculpts and paint
-  still invisible.
-- The current malformed-geometry candidate was approximately 12 FPS in the captured scene.
-- A profiler capture measured one indexed-indirect sculpt/fleck geometry draw at approximately
-  46.3 ms.
-- Broad diagnostics can force a GPU wait repeatedly and reduce execution to roughly 1 FPS. Those
-  runs must not be used to rate normal performance.
-- A historical 30 FPS menu observation was not reproducible as a general 3D fix and is no longer
-  treated as the current result.
+The remaining panel pattern is downstream of that progress. Current evidence points first to
+fragment shader `0xce3b8413`, which raymarches the sculpt atlas and decides coverage/depth for the
+fixed cuboid proxy instances. The following fullscreen DCC decoder is a secondary target for color
+or material errors.
 
-## Current rendering conclusion
+## Rejected current hypothesis
 
-Restoring `VK_PIPELINE_CREATE_DISPATCH_BASE_BIT` changed the output from missing geometry to visible
-but malformed geometry. This proves that the traversal path is producing and consuming geometry
-data, but it does not prove that the generated records are correct.
+The A3 (`0xa3a9e9ef`) dynamic ReadConst range was explicitly prewarmed for one falsification run.
+The range was already registered before the prewarm. The experiment was reverted and must not be
+described as part of the visible improvement.
 
-The remaining high-confidence blocker is incomplete `DS_ORDERED_COUNT` behavior. The current
-backend does not preserve guest wave-creation order and does not implement the release/done queue
-semantics encoded by Dreams.
+## Verification record
+
+- Exact executable size: `70,621,696` bytes.
+- Release compilation succeeded with one parallel job.
+- Patch pair reapplied cleanly to fresh worktrees.
+- `git diff --check` passed for the checkpoint source.
+- 69 tests ran: 68 passed and one optional real-capture test skipped.
+- Validation screenshot SHA-256:
+  `327C9E07B595A4E113C69ADF555F8928A804D676B0BFE912B651D822DF09ECB8`.
 
 ## Safety
 
-The source contains no game data, firmware, keys, credentials, or saves. Some changes are
-emulator-wide, so use an isolated portable user directory and do not test other games with this
-snapshot until those changes are audited.
+Use an isolated portable `user` directory and preserve a save backup. The checkpoint includes no
+game content, firmware, keys, credentials, or user saves.
