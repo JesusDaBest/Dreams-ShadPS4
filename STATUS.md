@@ -4,7 +4,7 @@
 
 - Title: `Dreams`
 - Serial/version tested: `CUSA04301` / `01.00`
-- Status date: August 22, 2026
+- Status date: August 30, 2026
 - Playability: **not playable**
 - Cumulative patch base: `555c458c9fdd33cb4686492374519c7bb112a891`
 - Source checkpoint commit: `40c0731d78272e727adc3af2072733395db4e8ad`
@@ -14,6 +14,17 @@
   `2980EDF5FF34C88F08EB334AD800AD2A7CE3C4B7A5DCE025A6D8651097E6D040`
 
 Executable hashes identify local test artifacts only; binaries are not distributed here.
+
+## Current source of truth
+
+See [HANDOFF_20260830.md](HANDOFF_20260830.md). The August 29 checkpoint directly validated one
+ordered B1 collect/prefix/replay path and produced a fully covered and filled sculpt in one run,
+but the intended fleck surface, stable material color, and cross-run reproducibility are not fixed.
+
+The controlled eleven-shape capture localizes the highest-priority fault before producer
+`0x2bfebd3c`: only eight expected records arrive. The next task is to find the first ordered
+count/publication edge where eleven becomes eight. The August 22 sections below are retained as
+historical context and should not override this newer direction.
 
 ## What works
 

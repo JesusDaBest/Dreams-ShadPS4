@@ -2,7 +2,7 @@
 
 This repository tracks source-level work on `Dreams` (`CUSA04301`) in `shadPS4`.
 
-## Current status — August 22, 2026
+## Current status — August 30, 2026
 
 - **Not playable. Sculpt/fleck rendering is not fixed.**
 - Startup can reach offline menus, tutorial logic, DreamShaping, creation scenes, edit mode, and
@@ -13,6 +13,14 @@ This repository tracks source-level work on `Dreams` (`CUSA04301`) in `shadPS4`.
 - The target is Dreams' coherent fleck/surface cube, not an ordinary opaque mesh cube.
 
 ## Latest concrete result
+
+The current highest-priority result is upstream of visible rendering. In a controlled scene with
+eleven stamped primitives, producer `0x2bfebd3c` received only eight records; sphere and both donut
+records were absent before VS, CE3, DCC, and lighting. The next task is to find the first ordered
+count/publication edge where eleven becomes eight and fix that shared emulator semantic. See
+[HANDOFF_20260830.md](HANDOFF_20260830.md).
+
+The August 22 lane-handoff result below remains historical evidence, not the current next step.
 
 The newest A/B localizes a producer-side lane-handoff problem in sculpt-volume writer
 `0x84aa3dc9`. An opt-in subgroup barrier improves tutorial/homespace geometry but makes edit mode
@@ -68,6 +76,8 @@ not distribute executables.
 
 ## Repository contents
 
+- [HANDOFF_20260830.md](HANDOFF_20260830.md): current validated evidence, rejected tests, and next
+  count/publication boundary trace
 - [HANDOFF_20260822.md](HANDOFF_20260822.md): sculpt-volume lane-handoff A/B and next target
 - [HANDOFF_20260821.md](HANDOFF_20260821.md): complete August 21 evidence and continuation order
 - [STATUS.md](STATUS.md): exact user-visible and build status
