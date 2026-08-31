@@ -129,7 +129,16 @@ public:
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0,
                                                        bool force_dependency = false) {
-        if (!force_dependency && dst_acess_mask == access_mask && stage == dst_stage) {
+        // Matching state is not enough to elide a dependency after a write. Consecutive compute
+        // dispatches commonly bind the same storage buffer as read|write, and Vulkan does not make
+        // one dispatch's stores visible to the next dispatch without a memory dependency. Mirror
+        // the image tracker: only identical read-only accesses can safely reuse their state.
+        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                     vk::AccessFlagBits2::eShaderWrite |
+                                     vk::AccessFlagBits2::eMemoryWrite;
+        const bool previous_access_writes = static_cast<bool>(access_mask & write_flags);
+        if (!force_dependency && !previous_access_writes && dst_acess_mask == access_mask &&
+            stage == dst_stage) {
             return {};
         }
 

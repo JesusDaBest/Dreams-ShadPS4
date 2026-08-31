@@ -8,6 +8,7 @@ from ordered_count_semantics import (
     U32_MASK,
     decode_ordered_count_control,
     exclusive_prefix,
+    first_valid_increment,
     flatten_workgroup_id,
     ordered_counter_dword,
     ordered_token,
@@ -48,6 +49,13 @@ class OrderedCountControlTests(unittest.TestCase):
 
 
 class OrderedTicketTests(unittest.TestCase):
+    def test_increment_comes_from_first_valid_lane(self) -> None:
+        values = (91, 7, 13, 21)
+        self.assertEqual(first_valid_increment(values, (False, True, True, False)), 7)
+
+    def test_empty_exec_still_contributes_zero(self) -> None:
+        self.assertEqual(first_valid_increment((91, 7, 13, 21), (False,) * 4), 0)
+
     def test_host_arrival_order_cannot_change_ticket_order(self) -> None:
         payloads = (3, 0, 2, 1, 5, 0, 4)
         expected = exclusive_prefix(payloads, initial=17)
@@ -118,6 +126,18 @@ class WorkgroupOrderTests(unittest.TestCase):
 
 
 class ProductionSourceContractTests(unittest.TestCase):
+    def test_frontend_makes_empty_exec_lane_selection_defined(self) -> None:
+        source = (
+            SOURCE_ROOT / "src/shader_recompiler/frontend/translate/data_share.cpp"
+        ).read_text(encoding="utf-8")
+        compact = re.sub(r"\s+", " ", source)
+        self.assertIn("const IR::U1 has_active_lane = ir.GroupAny(ir.GetExec());", compact)
+        self.assertIn("ir.Select(has_active_lane, ir.GetExec(), ir.Imm1(true))", compact)
+        self.assertIn(
+            "ir.Select(has_active_lane, ir.ReadLane(value, first_active_lane), ir.Imm32(0))",
+            compact,
+        )
+
     def test_host_shader_performs_the_same_exclusive_recurrence(self) -> None:
         source = (
             SOURCE_ROOT / "src/video_core/host_shaders/dreams_ordered_prefix.comp"

@@ -447,10 +447,16 @@ void Translator::DS_CONSUME(const GcnInst& inst) {
 
 void Translator::DS_ORDERED_COUNT(const GcnInst& inst) {
     const IR::U32 value{GetSrc(inst.src[0])};
-    const IR::U32 first_active_lane = ir.BallotFindLsb(ir.Ballot(ir.GetExec()));
+    const IR::U1 has_active_lane = ir.GroupAny(ir.GetExec());
+    // Ordered count is issued once per guest wave even when its EXEC mask is empty. Vulkan's
+    // BallotFindLSB and subgroup shuffle do not provide a usable lane for an empty ballot, so make
+    // lane zero a valid shuffle source and explicitly contribute zero for that guest wave.
+    const IR::U1 safe_ballot_predicate{ir.Select(has_active_lane, ir.GetExec(), ir.Imm1(true))};
+    const IR::U32 first_active_lane = ir.BallotFindLsb(ir.Ballot(safe_ballot_predicate));
     // DS_ORDERED_COUNT consumes the value from the first valid guest lane. Broadcast it so the
     // backend's single host-lane implementation is independent of which guest lanes are active.
-    const IR::U32 first_active_value = ir.ReadLane(value, first_active_lane);
+    const IR::U32 first_active_value{
+        ir.Select(has_active_lane, ir.ReadLane(value, first_active_lane), ir.Imm32(0))};
 
     const IR::U32 m0 = ir.GetM0();
     // Preserve M0's complete low 16 bits separately from the high-half GDS base. The 84aa shader

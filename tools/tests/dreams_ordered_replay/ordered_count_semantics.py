@@ -56,6 +56,19 @@ def ordered_token(logical_index: int, token_bits: int = 11) -> int:
     return logical_index & ((1 << token_bits) - 1)
 
 
+def first_valid_increment(values: Sequence[int], exec_mask: Sequence[bool]) -> int:
+    """Return DS_ORDERED_COUNT's first valid-lane increment, or zero for empty EXEC."""
+
+    if len(values) != len(exec_mask):
+        raise ValueError("values and exec_mask must contain the same number of lanes")
+    for value, active in zip(values, exec_mask, strict=True):
+        if active:
+            if value < 0:
+                raise ValueError("ordered-count increments cannot be negative")
+            return value & U32_MASK
+    return 0
+
+
 def flatten_workgroup_id(
     workgroup_id: tuple[int, int, int], dimensions: tuple[int, int, int]
 ) -> int:
