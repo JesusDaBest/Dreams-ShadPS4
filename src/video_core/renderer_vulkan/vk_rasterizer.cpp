@@ -23531,6 +23531,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
                     sizeof(dreams_model_input_capture.gds_pre));
 
         const u32 queue_count = dreams_model_input_capture.gds_pre[2];
+        if (queue_count == 0) {
+            return;
+        }
         {
             constexpr u32 QueueCapacity = 524288;
             constexpr u32 QueueReadLimit = 4096;
