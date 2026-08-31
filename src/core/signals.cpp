@@ -714,13 +714,11 @@ static bool DreamsModelRecordCaptureEnabled() noexcept {
     return GetFileAttributesW(L"dreams-model-record.capture") != INVALID_FILE_ATTRIBUTES;
 }
 
-static std::atomic<bool> g_dreams_csg_action_trace_active{false};
-
 static bool ActivateDreamsCsgActionTrace(const u32 target) noexcept {
     std::array<wchar_t, 1024> arm_path{};
     const DWORD arm_length = GetEnvironmentVariableW(L"SHADPS4_DREAMS_CSG_TRACE_ARM_FILE",
                                                      arm_path.data(), arm_path.size());
-    if (arm_length == 0 || arm_length >= arm_path.size() || !DeleteFileW(arm_path.data())) {
+    if (arm_length == 0 || arm_length >= arm_path.size()) {
         return false;
     }
 
@@ -728,27 +726,34 @@ static bool ActivateDreamsCsgActionTrace(const u32 target) noexcept {
     const DWORD trigger_length =
         GetEnvironmentVariableW(L"SHADPS4_DREAMS_CSG_TRACE_TRIGGER_FILE", trigger_path.data(),
                                 trigger_path.size());
-    if (trigger_length == 0 || trigger_length >= trigger_path.size()) {
+    std::array<wchar_t, 1024> dependency_trigger_path{};
+    const DWORD dependency_trigger_length = GetEnvironmentVariableW(
+        L"SHADPS4_DREAMS_DEP_TRACE_TRIGGER_FILE", dependency_trigger_path.data(),
+        dependency_trigger_path.size());
+    if (trigger_length == 0 || trigger_length >= trigger_path.size() ||
+        dependency_trigger_length == 0 ||
+        dependency_trigger_length >= dependency_trigger_path.size() ||
+        CompareStringOrdinal(trigger_path.data(), -1, dependency_trigger_path.data(), -1,
+                             FALSE) != CSTR_EQUAL) {
         return false;
     }
 
-    const HANDLE trigger = CreateFileW(trigger_path.data(), GENERIC_WRITE,
-                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                       nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (trigger == INVALID_HANDLE_VALUE) {
+    const DWORD arm_attributes = GetFileAttributesW(arm_path.data());
+    if (arm_attributes == INVALID_FILE_ATTRIBUTES ||
+        (arm_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
         return false;
     }
 
-    char marker[128]{};
-    const int marker_length = _snprintf_s(
-        marker, sizeof(marker), _TRUNCATE, "target=%u tick=%llu\r\n", target,
-        static_cast<unsigned long long>(GetTickCount64()));
-    if (marker_length > 0) {
-        DWORD written = 0;
-        WriteFile(trigger, marker, static_cast<DWORD>(marker_length), &written, nullptr);
+    if (!MoveFileExW(arm_path.data(), trigger_path.data(), 0)) {
+        const DWORD error = GetLastError();
+        char trace[224]{};
+        const int trace_length = _snprintf_s(
+            trace, sizeof(trace), _TRUNCATE,
+            "csg_action_trace=activation_failed tick=%llu target=%u error=%lu\r\n",
+            static_cast<unsigned long long>(GetTickCount64()), target, error);
+        AppendDreamsCpuRootTrace(trace, trace_length);
+        return false;
     }
-    CloseHandle(trigger);
-    g_dreams_csg_action_trace_active.store(true, std::memory_order_release);
 
     char trace[192]{};
     const int trace_length = _snprintf_s(
@@ -756,26 +761,6 @@ static bool ActivateDreamsCsgActionTrace(const u32 target) noexcept {
         static_cast<unsigned long long>(GetTickCount64()), target);
     AppendDreamsCpuRootTrace(trace, trace_length);
     return true;
-}
-
-static void DeactivateDreamsCsgActionTrace(const u32 target) noexcept {
-    if (!g_dreams_csg_action_trace_active.exchange(false, std::memory_order_acq_rel)) {
-        return;
-    }
-
-    std::array<wchar_t, 1024> trigger_path{};
-    const DWORD trigger_length =
-        GetEnvironmentVariableW(L"SHADPS4_DREAMS_CSG_TRACE_TRIGGER_FILE", trigger_path.data(),
-                                trigger_path.size());
-    const bool removed = trigger_length != 0 && trigger_length < trigger_path.size() &&
-                         DeleteFileW(trigger_path.data());
-
-    char trace[224]{};
-    const int trace_length = _snprintf_s(
-        trace, sizeof(trace), _TRUNCATE,
-        "csg_action_trace=end tick=%llu target=%u trigger_removed=%u\r\n",
-        static_cast<unsigned long long>(GetTickCount64()), target, removed ? 1u : 0u);
-    AppendDreamsCpuRootTrace(trace, trace_length);
 }
 
 static bool HandleDreamsModelRecordTrace(EXCEPTION_POINTERS* exception) noexcept {
@@ -1064,7 +1049,6 @@ static bool HandleDreamsModelRecordTrace(EXCEPTION_POINTERS* exception) noexcept
     // the target index at rsp+0x9c and the candidate publication record at rsp+0xe0.
     static std::atomic<u32> return_count{0};
     const u32 ordinal = return_count.fetch_add(1, std::memory_order_relaxed);
-    DeactivateDreamsCsgActionTrace(ReadDreamsU32(process, context->Rsp + 0x9c));
     if (capture && ordinal < 4096) {
         const u64 source = context->Rsp + 0xe0;
         const u32 index = ReadDreamsU32(process, context->Rsp + 0x9c);

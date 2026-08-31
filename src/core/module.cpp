@@ -515,10 +515,10 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             }
 
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
-                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CSG_ACTION_TRACE")) {
-                constexpr std::array<std::pair<u64, u8>, 2> DreamsCsgActionTracePoints{{
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CSG_ACTION_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE")) {
+                constexpr std::array<std::pair<u64, u8>, 1> DreamsCsgActionTracePoints{{
                     {0x720950, 0x55},  // Arm at the start of one model build.
-                    {0x723870, 0x49},  // Disarm at its common return path.
                 }};
                 bool trace_points_match = true;
                 for (const auto [offset, expected] : DreamsCsgActionTracePoints) {
