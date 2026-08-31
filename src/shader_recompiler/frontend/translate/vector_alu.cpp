@@ -73,7 +73,7 @@ void Translator::EmitVectorAlu(const GcnInst& inst) {
     case Opcode::V_MADMK_F32:
         return V_MADMK_F32(inst);
     case Opcode::V_MADAK_F32:
-        return V_FMA_F32(inst);
+        return V_MADAK_F32(inst);
     case Opcode::V_BCNT_U32_B32:
         return V_BCNT_U32_B32(inst);
     case Opcode::V_MBCNT_LO_U32_B32:
@@ -819,6 +819,13 @@ void Translator::V_MADMK_F32(const GcnInst& inst) {
     const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
     const IR::F32 k{GetSrc<IR::F32>(inst.src[2])};
     SetDst(inst.dst[0], ir.FPAdd(ir.FPMul(src0, k), src1));
+}
+
+void Translator::V_MADAK_F32(const GcnInst& inst) {
+    const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
+    const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
+    const IR::F32 k{GetSrc<IR::F32>(inst.src[2])};
+    SetDst(inst.dst[0], ir.FPAdd(ir.FPMul(src0, src1), k));
 }
 
 void Translator::V_BCNT_U32_B32(const GcnInst& inst) {

@@ -118,6 +118,22 @@ TEST_F(GcnTest, add_f32) {
     EXPECT_EQ(*result, 7.5f);
 }
 
+TEST_F(GcnTest, madak_f32_is_not_fused) {
+    auto runner = gcn_test::Runner::instance().value();
+    constexpr u32 literal = 0xbf800000U; // -1.0f
+    const u64 instruction =
+        VOP2(OpcodeVOP2::V_MADAK_F32, VOperand8::V0, SOperand9::V0, VOperand8::V1).Get() |
+        (u64{literal} << 32);
+    const auto spirv = TranslateToSpirv(instruction);
+
+    // (1 + 2^-23) * (1 - 2^-23) rounds to 1.0f before adding -1.0f.
+    // A fused implementation instead produces -2^-46 (0xa8800000).
+    const auto result = runner->run<u32>(spirv, std::array{0x3f800001U, 0x3f7ffffeU});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0x00000000U);
+}
+
 TEST_F(GcnTest, add_i32_carry_feeds_addc_u32) {
     auto runner = gcn_test::Runner::instance().value();
     const std::array<u64, 2> instructions{
