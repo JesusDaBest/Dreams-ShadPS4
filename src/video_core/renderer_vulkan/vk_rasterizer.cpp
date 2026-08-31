@@ -2239,8 +2239,18 @@ static bool TraceDreamsOrderedCounters() {
 
 static bool TraceDreamsBufferDependencies() {
     const char* value = std::getenv("SHADPS4_DREAMS_DEP_TRACE");
-    return value != nullptr && std::string_view{value} == "1" &&
-           Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+    if (value == nullptr || std::string_view{value} != "1" ||
+        Common::ElfInfo::Instance().GameSerial() != "CUSA04301") {
+        return false;
+    }
+
+    const char* trigger = std::getenv("SHADPS4_DREAMS_DEP_TRACE_TRIGGER_FILE");
+    if (trigger == nullptr || *trigger == '\0') {
+        return true;
+    }
+
+    std::error_code error;
+    return std::filesystem::is_regular_file(trigger, error) && !error;
 }
 
 static bool TraceDreamsProducerSources() {
