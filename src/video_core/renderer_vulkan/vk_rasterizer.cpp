@@ -25,6 +25,7 @@
 #include "common/path_util.h"
 #include "common/scm_rev.h"
 #include "core/debug_state.h"
+#include "core/dreams_trace_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/dreams_compat.h"
@@ -2251,6 +2252,148 @@ static bool TraceDreamsBufferDependencies() {
 
     std::error_code error;
     return std::filesystem::is_regular_file(trigger, error) && !error;
+}
+
+struct DreamsModelInputSourceRange {
+    u32 minimum{};
+    u32 maximum{std::numeric_limits<u32>::max()};
+};
+
+static bool TraceDreamsModelInput() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_MODEL_INPUT_TRACE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static const DreamsModelInputSourceRange& GetDreamsModelInputSourceRange() {
+    static const DreamsModelInputSourceRange range = [] {
+        DreamsModelInputSourceRange parsed{};
+        const auto read = [](const char* name, const u32 fallback) {
+            const char* value = std::getenv(name);
+            if (value == nullptr || *value == '\0') {
+                return fallback;
+            }
+            char* end{};
+            const unsigned long result = std::strtoul(value, &end, 0);
+            return end != value && *end == '\0' && result <= std::numeric_limits<u32>::max()
+                       ? static_cast<u32>(result)
+                       : fallback;
+        };
+        parsed.minimum = read("SHADPS4_DREAMS_MODEL_INPUT_SOURCE_MIN", parsed.minimum);
+        parsed.maximum = read("SHADPS4_DREAMS_MODEL_INPUT_SOURCE_MAX", parsed.maximum);
+        return parsed;
+    }();
+    return range;
+}
+
+static bool IsDreamsModelInputSourceSelected(const Core::DreamsTrace::ModelBuildSnapshot& model) {
+    if (!model.valid || model.returned || model.epoch == 0) {
+        return false;
+    }
+    const auto& range = GetDreamsModelInputSourceRange();
+    return range.minimum <= model.model_id && model.model_id <= range.maximum;
+}
+
+static const std::optional<std::filesystem::path>& DreamsModelInputTraceDirectory() {
+    static const std::optional<std::filesystem::path> directory = [] {
+        const char* configured = std::getenv("SHADPS4_DREAMS_MODEL_INPUT_TRACE_DIR");
+        std::filesystem::path path =
+            configured != nullptr && configured[0] != '\0'
+                ? std::filesystem::path{configured}
+                : std::filesystem::path{"dreams-model-input-capture"};
+        std::error_code error;
+        std::filesystem::create_directories(path, error);
+        if (error) {
+            LOG_ERROR(Render_Vulkan, "Failed to create Dreams model-input trace directory {}: {}",
+                      path.string(), error.message());
+            return std::optional<std::filesystem::path>{};
+        }
+        return std::optional<std::filesystem::path>{std::move(path)};
+    }();
+    return directory;
+}
+
+struct DreamsModelInputBoundBuffer {
+    bool valid{};
+    vk::DescriptorBufferInfo descriptor{};
+    u64 logical_base_offset{};
+    u64 size{};
+    u32 stride{};
+};
+
+struct DreamsCsgModelInputRow {
+    u32 queue_index{};
+    u32 a{};
+    u32 b{};
+    u32 ai{};
+    u32 bi{};
+    u32 item_class{};
+    bool valid{};
+    std::array<u32, 6> b2{};
+    std::array<u32, 23> b3{};
+    std::array<u32, 4> b4{};
+    u32 b5{};
+};
+
+struct DreamsCsgModelInputCapture {
+    bool enabled{};
+    bool complete{};
+    u32 ordinal{};
+    Core::DreamsTrace::ModelBuildSnapshot model{};
+    std::filesystem::path directory;
+    std::array<u32, 3> dims{};
+    std::array<u32, 10> gds_pre{};
+    std::array<u32, 10> gds_post{};
+    std::array<DreamsModelInputBoundBuffer, 6> buffers{};
+    std::vector<u32> queue;
+    std::vector<DreamsCsgModelInputRow> rows;
+    u32 invalid_rows{};
+    bool queue_truncated{};
+    bool rows_truncated{};
+};
+
+static bool DreamsModelInputRangeValid(const DreamsModelInputBoundBuffer& buffer,
+                                       const u64 offset, const u64 size) {
+    return buffer.valid && offset <= buffer.size && size <= buffer.size - offset &&
+           offset <= std::numeric_limits<u64>::max() - buffer.logical_base_offset;
+}
+
+static std::span<u8> DreamsModelInputBytes(auto& value) {
+    return {reinterpret_cast<u8*>(&value), sizeof(value)};
+}
+
+static void WriteDreamsCsgModelInputRows(const std::filesystem::path& file,
+                                         std::span<const DreamsCsgModelInputRow> rows) {
+    std::ofstream output{file, std::ios::trunc};
+    output << "row\tq\ta\tb\tai\tbi\tclass\tvalid";
+    for (u32 index = 0; index < 6; ++index) {
+        output << "\tb2_" << index;
+    }
+    for (u32 index = 0; index < 23; ++index) {
+        output << "\tb3_" << index;
+    }
+    for (u32 index = 0; index < 4; ++index) {
+        output << "\tb4_" << index;
+    }
+    output << "\tb5\n";
+    for (u32 index = 0; index < rows.size(); ++index) {
+        const auto& row = rows[index];
+        output << index << '\t' << row.queue_index << '\t' << fmt::format("{:#010x}", row.a)
+               << '\t' << fmt::format("{:#010x}", row.b) << '\t' << row.ai << '\t' << row.bi
+               << '\t' << row.item_class << '\t' << row.valid;
+        for (const u32 value : row.b2) {
+            output << '\t' << fmt::format("{:#010x}", value);
+        }
+        for (const u32 value : row.b3) {
+            output << '\t' << fmt::format("{:#010x}", value);
+        }
+        for (const u32 value : row.b4) {
+            output << '\t' << fmt::format("{:#010x}", value);
+        }
+        output << '\t' << fmt::format("{:#010x}", row.b5) << '\n';
+    }
 }
 
 static bool TraceDreamsProducerSources() {
@@ -23345,6 +23488,237 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
                     flat(30), flat(43), cs.buffers[8].IsSpecial());
     }
     const bool is_dreams_csg_replay = cs.pgm_hash == 0x8b19605c;
+    DreamsCsgModelInputCapture dreams_model_input_capture{};
+    const auto capture_dreams_model_input = [&] {
+      if (TraceDreamsModelInput() && is_dreams_csg_replay) {
+        const auto model = Core::DreamsTrace::ReadModelBuild();
+        static u32 inspected_dispatches{};
+        static u32 captured_dispatches{};
+        if (IsDreamsModelInputSourceSelected(model) && inspected_dispatches++ < 256 &&
+            captured_dispatches < 64) {
+            constexpr u32 StateBaseDword = 576;
+            constexpr u32 QueueCapacity = 524288;
+            constexpr u32 QueueReadLimit = 65536;
+            constexpr u32 SparseRowLimit = 2048;
+            constexpr std::array<u32, 6> ExpectedStrides{8, 8, 4, 92, 16, 4};
+
+            scheduler.Finish();
+            auto* gds = buffer_cache.GetGdsBuffer();
+            const u64 state_offset = static_cast<u64>(StateBaseDword) * sizeof(u32);
+            if (state_offset + sizeof(dreams_model_input_capture.gds_pre) <=
+                gds->mapped_data.size()) {
+                gds->InvalidateMappedRange(state_offset,
+                                           sizeof(dreams_model_input_capture.gds_pre));
+                std::memcpy(dreams_model_input_capture.gds_pre.data(),
+                            gds->mapped_data.data() + state_offset,
+                            sizeof(dreams_model_input_capture.gds_pre));
+            }
+
+            const u32 queue_base = dreams_model_input_capture.gds_pre[1];
+            const u32 queue_count = dreams_model_input_capture.gds_pre[2];
+            if (queue_count != 0) {
+                dreams_model_input_capture.enabled = true;
+                dreams_model_input_capture.ordinal = ++captured_dispatches;
+                dreams_model_input_capture.model = model;
+                if (const auto& root = DreamsModelInputTraceDirectory()) {
+                    dreams_model_input_capture.directory =
+                        *root / fmt::format("capture-{:03}-epoch-{}-model-{}",
+                                            dreams_model_input_capture.ordinal, model.epoch,
+                                            model.model_id);
+                    std::error_code error;
+                    std::filesystem::create_directories(dreams_model_input_capture.directory,
+                                                        error);
+                }
+
+                buffer_cache.ReadMemory(args_address, sizeof(dreams_model_input_capture.dims));
+                if (memory->IsValidMapping(args_address,
+                                           sizeof(dreams_model_input_capture.dims))) {
+                    std::memcpy(dreams_model_input_capture.dims.data(),
+                                std::bit_cast<const void*>(args_address),
+                                sizeof(dreams_model_input_capture.dims));
+                }
+
+                const auto resolve_binding = [&](const u32 binding) {
+                    DreamsModelInputBoundBuffer result{};
+                    if (binding >= cs.buffers.size() || binding >= buffer_infos.size() ||
+                        cs.buffers[binding].IsSpecial()) {
+                        return result;
+                    }
+                    const auto sharp = cs.buffers[binding].GetSharp(cs);
+                    const u64 binding_size = ResolveGuestBufferBindingSize(
+                        memory, cs, binding, cs.buffers[binding], sharp);
+                    const auto& descriptor = buffer_infos[binding];
+                    if (sharp.base_address == 0 || binding_size == 0 ||
+                        descriptor.range == VK_WHOLE_SIZE || descriptor.range < binding_size) {
+                        return result;
+                    }
+                    result.valid = sharp.stride == ExpectedStrides[binding];
+                    result.descriptor = descriptor;
+                    result.logical_base_offset = descriptor.range - binding_size;
+                    result.size = binding_size;
+                    result.stride = sharp.stride;
+                    return result;
+                };
+                for (u32 binding = 0; binding < dreams_model_input_capture.buffers.size();
+                     ++binding) {
+                    dreams_model_input_capture.buffers[binding] = resolve_binding(binding);
+                }
+
+                const bool queue_bounds_valid =
+                    queue_base <= QueueCapacity && queue_count <= QueueCapacity - queue_base;
+                const u32 queue_read_count = std::min(queue_count, QueueReadLimit);
+                dreams_model_input_capture.queue_truncated = queue_read_count != queue_count;
+                dreams_model_input_capture.queue.resize(static_cast<u64>(queue_read_count) * 2);
+                bool queue_read = queue_bounds_valid &&
+                                  DreamsModelInputRangeValid(
+                                      dreams_model_input_capture.buffers[1],
+                                      static_cast<u64>(queue_base) * 2 * sizeof(u32),
+                                      dreams_model_input_capture.queue.size() * sizeof(u32));
+                if (queue_read) {
+                    queue_read = ReadDreamsBoundBufferForCapture(
+                        scheduler, buffer_cache,
+                        dreams_model_input_capture.buffers[1].descriptor,
+                        dreams_model_input_capture.buffers[1].logical_base_offset +
+                            static_cast<u64>(queue_base) * 2 * sizeof(u32),
+                        std::span<u8>{
+                            reinterpret_cast<u8*>(dreams_model_input_capture.queue.data()),
+                            dreams_model_input_capture.queue.size() * sizeof(u32)});
+                }
+
+                const u32 sparse_count = std::min(queue_read_count, SparseRowLimit);
+                dreams_model_input_capture.rows_truncated = sparse_count != queue_count;
+                dreams_model_input_capture.rows.resize(sparse_count);
+                std::vector<DreamsBoundBufferCaptureRegion> regions;
+                regions.reserve(static_cast<u64>(sparse_count) * 4);
+                if (queue_read) {
+                    for (u32 index = 0; index < sparse_count; ++index) {
+                        auto& row = dreams_model_input_capture.rows[index];
+                        row.queue_index = queue_base + index;
+                        row.a = dreams_model_input_capture.queue[index * 2];
+                        row.b = dreams_model_input_capture.queue[index * 2 + 1];
+                        row.ai = row.a & 0x00ffffffU;
+                        row.bi = row.b & 0x00ffffffU;
+                        row.item_class = row.b >> 24;
+
+                        const u64 b2_offset = static_cast<u64>(row.ai) * 6 * sizeof(u32);
+                        const u64 b3_offset = static_cast<u64>(row.bi) * 23 * sizeof(u32);
+                        const u64 b4_offset = static_cast<u64>(row.a) * 4 * sizeof(u32);
+                        const u64 b5_offset = static_cast<u64>(row.a) * sizeof(u32);
+                        row.valid = row.ai < 1048576 && row.bi < 24575 && row.a < 1048576 &&
+                                    DreamsModelInputRangeValid(
+                                        dreams_model_input_capture.buffers[2], b2_offset,
+                                        sizeof(row.b2)) &&
+                                    DreamsModelInputRangeValid(
+                                        dreams_model_input_capture.buffers[3], b3_offset,
+                                        sizeof(row.b3)) &&
+                                    DreamsModelInputRangeValid(
+                                        dreams_model_input_capture.buffers[4], b4_offset,
+                                        sizeof(row.b4)) &&
+                                    DreamsModelInputRangeValid(
+                                        dreams_model_input_capture.buffers[5], b5_offset,
+                                        sizeof(row.b5));
+                        if (!row.valid) {
+                            ++dreams_model_input_capture.invalid_rows;
+                            continue;
+                        }
+                        regions.push_back({
+                            .source = dreams_model_input_capture.buffers[2].descriptor,
+                            .relative_offset =
+                                dreams_model_input_capture.buffers[2].logical_base_offset +
+                                b2_offset,
+                            .destination = DreamsModelInputBytes(row.b2),
+                        });
+                        regions.push_back({
+                            .source = dreams_model_input_capture.buffers[3].descriptor,
+                            .relative_offset =
+                                dreams_model_input_capture.buffers[3].logical_base_offset +
+                                b3_offset,
+                            .destination = DreamsModelInputBytes(row.b3),
+                        });
+                        regions.push_back({
+                            .source = dreams_model_input_capture.buffers[4].descriptor,
+                            .relative_offset =
+                                dreams_model_input_capture.buffers[4].logical_base_offset +
+                                b4_offset,
+                            .destination = DreamsModelInputBytes(row.b4),
+                        });
+                        regions.push_back({
+                            .source = dreams_model_input_capture.buffers[5].descriptor,
+                            .relative_offset =
+                                dreams_model_input_capture.buffers[5].logical_base_offset +
+                                b5_offset,
+                            .destination = DreamsModelInputBytes(row.b5),
+                        });
+                    }
+                }
+                const bool rows_read =
+                    queue_read && ReadDreamsBoundBufferRegionsForCapture(scheduler, buffer_cache,
+                                                                         regions);
+                if (!rows_read) {
+                    for (auto& row : dreams_model_input_capture.rows) {
+                        row.valid = false;
+                    }
+                }
+                dreams_model_input_capture.complete = queue_read && rows_read;
+
+                u64 queue_hash{};
+                bool files_ok = !dreams_model_input_capture.directory.empty();
+                if (files_ok) {
+                    files_ok &= WriteDreamsCaptureWords(
+                        dreams_model_input_capture.directory / "b1-active-queue.bin",
+                        dreams_model_input_capture.queue, queue_hash);
+                    WriteDreamsCsgModelInputRows(
+                        dreams_model_input_capture.directory / "sparse-input-rows.tsv",
+                        dreams_model_input_capture.rows);
+                    std::string metadata = fmt::format(
+                        "ordinal\tepoch\tthread\tmodel_id\tpeer_id\trcx\trdi\trdx\tdim_x\t"
+                        "dim_y\tdim_z\tbase\tcount\ttail\tsetup_invariant\tqueue_hash\t"
+                        "queue_truncated\trows\trows_truncated\tinvalid_rows\tread_complete\n"
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t"
+                        "{:#018x}\t{}\t{}\t{}\t{}\t{}\n",
+                        dreams_model_input_capture.ordinal, model.epoch, model.thread_id,
+                        model.model_id, model.peer_id, model.arg_rcx, model.arg_rdi, model.arg_rdx,
+                        dreams_model_input_capture.dims[0], dreams_model_input_capture.dims[1],
+                        dreams_model_input_capture.dims[2], queue_base, queue_count,
+                        dreams_model_input_capture.gds_pre[4],
+                        static_cast<u64>(queue_base) + queue_count ==
+                            std::min<u32>(QueueCapacity, dreams_model_input_capture.gds_pre[4]),
+                        queue_hash, dreams_model_input_capture.queue_truncated,
+                        dreams_model_input_capture.rows.size(),
+                        dreams_model_input_capture.rows_truncated,
+                        dreams_model_input_capture.invalid_rows,
+                        dreams_model_input_capture.complete);
+                    metadata += "dword\t576\t577\t578\t579\t580\t581\t582\t583\t584\t585\npre";
+                    for (const u32 value : dreams_model_input_capture.gds_pre) {
+                        metadata += fmt::format("\t{}", value);
+                    }
+                    metadata += '\n';
+                    files_ok &= WriteDreamsCaptureText(
+                        dreams_model_input_capture.directory / "metadata.tsv", metadata);
+                    files_ok &= AppendDreamsCaptureText(
+                        *DreamsModelInputTraceDirectory() / "manifest.tsv",
+                        fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{}\t{}\n",
+                                    dreams_model_input_capture.ordinal, model.epoch, model.model_id,
+                                    queue_base, queue_count, dreams_model_input_capture.rows.size(),
+                                    queue_hash, dreams_model_input_capture.complete,
+                                    dreams_model_input_capture.directory.filename().string()));
+                }
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Dreams model-input replay pre #{} epoch={} model={} dims={}x{}x{} "
+                    "base={} count={} tail={} queue_hash={:#x} rows={} invalid={} complete={} "
+                    "files_ok={}",
+                    dreams_model_input_capture.ordinal, model.epoch, model.model_id,
+                    dreams_model_input_capture.dims[0], dreams_model_input_capture.dims[1],
+                    dreams_model_input_capture.dims[2], queue_base, queue_count,
+                    dreams_model_input_capture.gds_pre[4], queue_hash,
+                    dreams_model_input_capture.rows.size(),
+                    dreams_model_input_capture.invalid_rows, dreams_model_input_capture.complete,
+                    files_ok);
+            }
+        }
+      }
+    };
     static u32 dreams_csg_replay_trace_count{};
     const bool trace_dreams_csg_replay =
         TraceDreamsCsgReplay() && is_dreams_csg_replay && dreams_csg_replay_trace_count++ < 4;
@@ -23894,6 +24268,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         }
         RefreshBufferResources(pipeline);
     }
+    // Capture after descriptor stabilization so every byte comes from the exact VkBuffer and
+    // offset that the guest replay below will consume.
+    capture_dreams_model_input();
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(args_address, size, false);
     if (profile_dreams) {
@@ -24887,6 +25264,93 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
                 }
             }
         }
+    }
+    if (dreams_model_input_capture.enabled) {
+        constexpr u32 B0Capacity = 262144;
+        constexpr u32 B1Capacity = 524288;
+        constexpr u32 OutputReadLimit = 65536;
+        constexpr u32 StateBaseDword = 576;
+        scheduler.Finish();
+        auto* model_gds = buffer_cache.GetGdsBuffer();
+        const u64 state_offset = static_cast<u64>(StateBaseDword) * sizeof(u32);
+        if (state_offset + sizeof(dreams_model_input_capture.gds_post) <=
+            model_gds->mapped_data.size()) {
+            model_gds->InvalidateMappedRange(state_offset,
+                                              sizeof(dreams_model_input_capture.gds_post));
+            std::memcpy(dreams_model_input_capture.gds_post.data(),
+                        model_gds->mapped_data.data() + state_offset,
+                        sizeof(dreams_model_input_capture.gds_post));
+        }
+
+        const u32 b0_begin = dreams_model_input_capture.gds_pre[5];
+        const u32 b0_end = dreams_model_input_capture.gds_post[5];
+        const u32 b1_begin = dreams_model_input_capture.gds_pre[4];
+        const u32 b1_end = dreams_model_input_capture.gds_post[4];
+        const bool b0_valid = b0_begin <= b0_end && b0_end <= B0Capacity;
+        const bool b1_valid = b1_begin <= b1_end && b1_end <= B1Capacity;
+        const u32 b0_count = b0_valid ? std::min(b0_end - b0_begin, OutputReadLimit) : 0;
+        const u32 b1_count = b1_valid ? std::min(b1_end - b1_begin, OutputReadLimit) : 0;
+        std::vector<u32> b0_records(static_cast<u64>(b0_count) * 2);
+        std::vector<u32> b1_records(static_cast<u64>(b1_count) * 2);
+        std::vector<DreamsBoundBufferCaptureRegion> output_regions;
+        output_regions.reserve(2);
+        const auto append_output = [&](const u32 binding, const u32 first,
+                                       std::vector<u32>& records) {
+            const u64 byte_offset = static_cast<u64>(first) * 2 * sizeof(u32);
+            const u64 byte_size = records.size() * sizeof(u32);
+            if (records.empty()) {
+                return true;
+            }
+            const auto& buffer = dreams_model_input_capture.buffers[binding];
+            if (!DreamsModelInputRangeValid(buffer, byte_offset, byte_size)) {
+                return false;
+            }
+            output_regions.push_back({
+                .source = buffer.descriptor,
+                .relative_offset = buffer.logical_base_offset + byte_offset,
+                .destination = std::span<u8>{reinterpret_cast<u8*>(records.data()), byte_size},
+            });
+            return true;
+        };
+        bool outputs_read = b0_valid && b1_valid && append_output(0, b0_begin, b0_records) &&
+                            append_output(1, b1_begin, b1_records);
+        if (outputs_read) {
+            outputs_read = ReadDreamsBoundBufferRegionsForCapture(scheduler, buffer_cache,
+                                                                   output_regions);
+        }
+
+        u64 b0_hash{};
+        u64 b1_hash{};
+        bool files_ok = !dreams_model_input_capture.directory.empty();
+        if (files_ok) {
+            files_ok &= WriteDreamsCaptureWords(
+                dreams_model_input_capture.directory / "b0-final-output.bin", b0_records, b0_hash);
+            files_ok &= WriteDreamsCaptureWords(
+                dreams_model_input_capture.directory / "b1-generated-queue.bin", b1_records,
+                b1_hash);
+            std::string post = "post";
+            for (const u32 value : dreams_model_input_capture.gds_post) {
+                post += fmt::format("\t{}", value);
+            }
+            post += fmt::format(
+                "\noutput\tb0_begin\tb0_end\tb0_captured\tb0_hash\tb1_begin\tb1_end\t"
+                "b1_captured\tb1_hash\toutputs_read\noutput\t{}\t{}\t{}\t{:#018x}\t{}\t{}\t"
+                "{}\t{:#018x}\t{}\n",
+                b0_begin, b0_end, b0_count, b0_hash, b1_begin, b1_end, b1_count, b1_hash,
+                outputs_read);
+            files_ok &= AppendDreamsCaptureText(
+                dreams_model_input_capture.directory / "metadata.tsv", post);
+        }
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams model-input replay post #{} epoch={} model={} b0={}->{} captured={} "
+            "hash={:#x} b1={}->{} captured={} hash={:#x} classes={},{},{},{} "
+            "outputs_read={} files_ok={}",
+            dreams_model_input_capture.ordinal, dreams_model_input_capture.model.epoch,
+            dreams_model_input_capture.model.model_id, b0_begin, b0_end, b0_count, b0_hash,
+            b1_begin, b1_end, b1_count, b1_hash, dreams_model_input_capture.gds_post[6],
+            dreams_model_input_capture.gds_post[7], dreams_model_input_capture.gds_post[8],
+            dreams_model_input_capture.gds_post[9], outputs_read, files_ok);
     }
     if (profile) {
         scheduler.Finish();

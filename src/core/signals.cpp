@@ -11,6 +11,7 @@
 #include "common/memory_patcher.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
+#include "core/dreams_trace_state.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/signals.h"
 #include "emulator.h"
@@ -714,6 +715,36 @@ static bool DreamsModelRecordCaptureEnabled() noexcept {
     return GetFileAttributesW(L"dreams-model-record.capture") != INVALID_FILE_ATTRIBUTES;
 }
 
+static bool DreamsModelInputTraceEnabled() noexcept {
+    static const bool enabled = [] {
+        char value[2]{};
+        return GetEnvironmentVariableA("SHADPS4_DREAMS_MODEL_INPUT_TRACE", value,
+                                       sizeof(value)) != 0 &&
+               value[0] == '1';
+    }();
+    return enabled;
+}
+
+static void AppendDreamsModelInputTrace(const char* buffer, const int length) noexcept {
+    if (length <= 0) {
+        return;
+    }
+    static std::atomic<u32> line_count{};
+    const u32 line = line_count.fetch_add(1, std::memory_order_relaxed);
+    if (line >= 512) {
+        return;
+    }
+    const HANDLE file = CreateFileW(L"dreams-model-input-trace.txt", FILE_APPEND_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                    line == 0 ? CREATE_ALWAYS : OPEN_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(file, buffer, static_cast<DWORD>(length), &written, nullptr);
+        CloseHandle(file);
+    }
+}
+
 static bool ActivateDreamsCsgActionTrace(const u32 target) noexcept {
     std::array<wchar_t, 1024> arm_path{};
     const DWORD arm_length = GetEnvironmentVariableW(L"SHADPS4_DREAMS_CSG_TRACE_ARM_FILE",
@@ -808,6 +839,7 @@ static bool HandleDreamsModelRecordTrace(EXCEPTION_POINTERS* exception) noexcept
     const u64 base = MemoryPatcher::g_eboot_address;
     const bool capture = DreamsModelRecordCaptureEnabled();
     const u64 table = ReadDreamsU64(process, base + DreamsModelTablePointerOffset);
+    static thread_local u32 model_input_epoch{};
 
     const auto trace_result = [&](const char* kind, const u32 ordinal, const u64 result,
                                   const u32 context_index, const u32 extra) {
@@ -853,6 +885,23 @@ static bool HandleDreamsModelRecordTrace(EXCEPTION_POINTERS* exception) noexcept
     if (guest_offset == DreamsModelBuildOffset) {
         static std::atomic<u32> build_count{0};
         const u32 ordinal = build_count.fetch_add(1, std::memory_order_relaxed);
+        if (DreamsModelInputTraceEnabled()) {
+            model_input_epoch = DreamsTrace::BeginModelBuild(
+                GetCurrentThreadId(), static_cast<u32>(context->Rcx),
+                static_cast<u32>(context->Rdi), static_cast<u32>(context->Rdx),
+                static_cast<u32>(context->R8), static_cast<u32>(context->R9));
+            const auto model = DreamsTrace::ReadModelBuild();
+            char trace[320]{};
+            const int trace_length = _snprintf_s(
+                trace, sizeof(trace), _TRUNCATE,
+                "model_input_begin epoch=%u tick=%llu thread=%lu rcx=%u rdi=%u rdx=%u "
+                "model_id=%u peer_id=%u scratch=0x%016llx caller=0x%016llx\r\n",
+                model.epoch, static_cast<unsigned long long>(GetTickCount64()),
+                GetCurrentThreadId(), model.arg_rcx, model.arg_rdi, model.arg_rdx, model.model_id,
+                model.peer_id, static_cast<unsigned long long>(context->Rsi),
+                static_cast<unsigned long long>(ReadDreamsU64(process, context->Rsp)));
+            AppendDreamsModelInputTrace(trace, trace_length);
+        }
         ActivateDreamsCsgActionTrace(static_cast<u32>(context->Rcx));
         if (capture && ordinal < 4096) {
             char buffer[512]{};
@@ -1049,6 +1098,21 @@ static bool HandleDreamsModelRecordTrace(EXCEPTION_POINTERS* exception) noexcept
     // the target index at rsp+0x9c and the candidate publication record at rsp+0xe0.
     static std::atomic<u32> return_count{0};
     const u32 ordinal = return_count.fetch_add(1, std::memory_order_relaxed);
+    if (DreamsModelInputTraceEnabled()) {
+        const bool matched = DreamsTrace::CompleteModelBuild(
+            model_input_epoch, GetCurrentThreadId(), static_cast<u32>(context->Rax));
+        const auto model = DreamsTrace::ReadModelBuild();
+        char trace[256]{};
+        const int trace_length = _snprintf_s(
+            trace, sizeof(trace), _TRUNCATE,
+            "model_input_return epoch=%u tick=%llu thread=%lu matched=%u rcx=%u "
+            "frame_target=%u model_id=%u status=%u\r\n",
+            model.epoch, static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+            matched, model.arg_rcx, ReadDreamsU32(process, context->Rsp + 0x9c), model.model_id,
+            model.status);
+        AppendDreamsModelInputTrace(trace, trace_length);
+        model_input_epoch = 0;
+    }
     if (capture && ordinal < 4096) {
         const u64 source = context->Rsp + 0xe0;
         const u32 index = ReadDreamsU32(process, context->Rsp + 0x9c);
