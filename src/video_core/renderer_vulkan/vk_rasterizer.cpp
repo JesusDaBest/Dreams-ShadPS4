@@ -6972,8 +6972,23 @@ static void RecordDreamsSelectorConsumer(VAddr base, u64 size) {
 
 static bool TraceDreamsCsgReplay() {
     const char* value = std::getenv("SHADPS4_DREAMS_CSG_TRACE");
-    return value != nullptr && std::string_view{value} == "1" &&
-           Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+    if (value == nullptr || std::string_view{value} != "1" ||
+        Common::ElfInfo::Instance().GameSerial() != "CUSA04301") {
+        return false;
+    }
+
+    // CSG replay tracing synchronizes and scans guest buffers, so enabling it for an entire
+    // Dreams session both perturbs performance and consumes the bounded trace counters before a
+    // user can reproduce a late sculpt operation. When a trigger path is supplied, keep the
+    // instrumentation completely dormant until the file exists. Omitting the path preserves the
+    // original launch-time behavior for existing diagnostic scripts.
+    const char* trigger = std::getenv("SHADPS4_DREAMS_CSG_TRACE_TRIGGER_FILE");
+    if (trigger == nullptr || *trigger == '\0') {
+        return true;
+    }
+
+    std::error_code error;
+    return std::filesystem::is_regular_file(trigger, error) && !error;
 }
 
 static bool TraceDreamsReplayResult() {
