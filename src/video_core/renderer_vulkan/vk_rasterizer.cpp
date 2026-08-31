@@ -2296,6 +2296,15 @@ static bool IsDreamsModelInputSourceSelected(const Core::DreamsTrace::ModelBuild
     return range.minimum <= model.model_id && model.model_id <= range.maximum;
 }
 
+static bool DreamsModelInputTraceTriggerExists() {
+    const char* trigger = std::getenv("SHADPS4_DREAMS_MODEL_INPUT_TRACE_TRIGGER_FILE");
+    if (trigger == nullptr || *trigger == '\0') {
+        return false;
+    }
+    std::error_code error;
+    return std::filesystem::is_regular_file(trigger, error) && !error;
+}
+
 static const std::optional<std::filesystem::path>& DreamsModelInputTraceDirectory() {
     static const std::optional<std::filesystem::path> directory = [] {
         const char* configured = std::getenv("SHADPS4_DREAMS_MODEL_INPUT_TRACE_DIR");
@@ -2341,6 +2350,7 @@ struct DreamsCsgModelInputCapture {
     bool enabled{};
     bool complete{};
     u32 ordinal{};
+    u64 dispatch_sequence{};
     Core::DreamsTrace::ModelBuildSnapshot model{};
     std::filesystem::path directory;
     std::array<u32, 10> gds_pre{};
@@ -23494,14 +23504,17 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
     const bool is_dreams_csg_replay = cs.pgm_hash == 0x8b19605c;
     DreamsCsgModelInputCapture dreams_model_input_capture{};
     const auto capture_dreams_model_input = [&] {
-        if (!TraceDreamsModelInput() || !is_dreams_csg_replay ||
-            !IsDreamsModelInputSourceSelected(submitted_model)) {
+        if (!TraceDreamsModelInput() || !is_dreams_csg_replay) {
             return;
         }
-        const auto& model = submitted_model;
+        const bool tagged = IsDreamsModelInputSourceSelected(submitted_model);
+        if (!tagged && !DreamsModelInputTraceTriggerExists()) {
+            return;
+        }
+        const auto model = tagged ? submitted_model : Core::DreamsTrace::ModelBuildSnapshot{};
         static u32 captured_dispatches{};
         static std::unordered_map<u32, u32> captures_per_epoch;
-        if (captured_dispatches >= 128 || captures_per_epoch[model.epoch] >= 4) {
+        if (captured_dispatches >= 128 || (tagged && captures_per_epoch[model.epoch] >= 4)) {
             return;
         }
         constexpr u32 StateBaseDword = 576;
@@ -23520,15 +23533,18 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
         const u32 queue_count = dreams_model_input_capture.gds_pre[2];
         {
             constexpr u32 QueueCapacity = 524288;
-            constexpr u32 QueueReadLimit = 65536;
-            constexpr u32 SparseRowLimit = 2048;
+            constexpr u32 QueueReadLimit = 4096;
+            constexpr u32 SparseRowLimit = 256;
             constexpr std::array<u32, 6> ExpectedStrides{8, 8, 4, 92, 16, 4};
 
             const u32 queue_base = dreams_model_input_capture.gds_pre[1];
             {
                 dreams_model_input_capture.enabled = true;
-                ++captures_per_epoch[model.epoch];
+                if (tagged) {
+                    ++captures_per_epoch[model.epoch];
+                }
                 dreams_model_input_capture.ordinal = ++captured_dispatches;
+                dreams_model_input_capture.dispatch_sequence = g_compute_dispatch_sequence;
                 dreams_model_input_capture.model = model;
                 if (const auto& root = DreamsModelInputTraceDirectory()) {
                     dreams_model_input_capture.directory =
@@ -23675,12 +23691,13 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
                         dreams_model_input_capture.directory / "sparse-input-rows.tsv",
                         dreams_model_input_capture.rows);
                     std::string metadata = fmt::format(
-                        "ordinal\tepoch\tthread\tmodel_id\tpeer_id\trcx\trdi\trdx\t"
+                        "ordinal\tdispatch_sequence\tepoch\tthread\tmodel_id\tpeer_id\trcx\trdi\trdx\t"
                         "base\tcount\ttail\tsetup_invariant\tqueue_hash\t"
                         "queue_truncated\trows\trows_truncated\tinvalid_rows\tread_complete\n"
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t"
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t"
                         "{}\t{}\t{}\t{}\t{}\n",
-                        dreams_model_input_capture.ordinal, model.epoch, model.thread_id,
+                        dreams_model_input_capture.ordinal,
+                        dreams_model_input_capture.dispatch_sequence, model.epoch, model.thread_id,
                         model.model_id, model.peer_id, model.arg_rcx, model.arg_rdi, model.arg_rdx,
                         queue_base, queue_count, dreams_model_input_capture.gds_pre[4],
                         static_cast<u64>(queue_base) + queue_count ==
@@ -23699,17 +23716,20 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
                         dreams_model_input_capture.directory / "metadata.tsv", metadata);
                     files_ok &= AppendDreamsCaptureText(
                         *DreamsModelInputTraceDirectory() / "manifest.tsv",
-                        fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{}\t{}\n",
-                                    dreams_model_input_capture.ordinal, model.epoch, model.model_id,
-                                    queue_base, queue_count, dreams_model_input_capture.rows.size(),
-                                    queue_hash, dreams_model_input_capture.complete,
+                        fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{}\t{}\n",
+                                    dreams_model_input_capture.ordinal,
+                                    dreams_model_input_capture.dispatch_sequence, model.epoch,
+                                    model.model_id, queue_base, queue_count,
+                                    dreams_model_input_capture.rows.size(), queue_hash,
+                                    dreams_model_input_capture.complete,
                                     dreams_model_input_capture.directory.filename().string()));
                 }
                 LOG_WARNING(
                     Render_Vulkan,
-                    "Dreams model-input replay pre #{} epoch={} model={} base={} count={} tail={} "
-                    "queue_hash={:#x} rows={} invalid={} complete={} files_ok={}",
-                    dreams_model_input_capture.ordinal, model.epoch, model.model_id,
+                    "Dreams model-input replay pre #{} sequence={} epoch={} model={} base={} "
+                    "count={} tail={} queue_hash={:#x} rows={} invalid={} complete={} files_ok={}",
+                    dreams_model_input_capture.ordinal,
+                    dreams_model_input_capture.dispatch_sequence, model.epoch, model.model_id,
                     queue_base, queue_count, dreams_model_input_capture.gds_pre[4], queue_hash,
                     dreams_model_input_capture.rows.size(),
                     dreams_model_input_capture.invalid_rows, dreams_model_input_capture.complete,
