@@ -40,10 +40,10 @@ def decode_ordered_count_control(offset0: int, offset1: int) -> OrderedCountCont
     return OrderedCountControl(packed, operation, wave_release, wave_done, offset0)
 
 
-def ordered_counter_dword(m0_base_dwords: int, packed_control: int) -> int:
-    """Resolve the dword counter selected by M0 and DS OFFSET0."""
+def ordered_counter_dword(m0_base_bytes: int, packed_control: int) -> int:
+    """Resolve the dword counter selected by byte-addressed M0 and DS OFFSET0."""
 
-    return (m0_base_dwords & 0xFFFC) + (((packed_control >> 8) & 0xFF) >> 2)
+    return ((m0_base_bytes & 0xFFFC) + ((packed_control >> 8) & 0xFF)) >> 2
 
 
 def ordered_token(logical_index: int, token_bits: int = 11) -> int:

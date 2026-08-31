@@ -35,7 +35,7 @@ class OrderedCountControlTests(unittest.TestCase):
 
     def test_dreams_traversal_controls_select_the_captured_counters(self) -> None:
         controls = (0x0804, 0x1804, 0x0C04, 0x100C)
-        expected = (0x502, 0x506, 0x503, 0x504)
+        expected = (0x142, 0x146, 0x143, 0x144)
         self.assertEqual(
             tuple(ordered_counter_dword(0x500, control) for control in controls), expected
         )
@@ -45,7 +45,7 @@ class OrderedCountControlTests(unittest.TestCase):
     def test_byte_offset_is_converted_to_dwords_after_aligning_m0_base(self) -> None:
         decoded = decode_ordered_count_control(0x18, 0x01)
         self.assertEqual(decoded.packed, 0x1804)
-        self.assertEqual(ordered_counter_dword(0x503, decoded.packed), 0x506)
+        self.assertEqual(ordered_counter_dword(0x503, decoded.packed), 0x146)
 
 
 class OrderedTicketTests(unittest.TestCase):
