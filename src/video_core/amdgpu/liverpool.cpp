@@ -346,7 +346,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(
+    std::span<const u32> dcb, std::span<const u32> ccb,
+    Core::DreamsTrace::ModelBuildSnapshot model) {
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
@@ -836,10 +838,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DispatchIndirect", cmd_address));
-                        rasterizer->DispatchIndirect(indirect_args_addr, offset, size);
+                        rasterizer->DispatchIndirect(indirect_args_addr, offset, size, model);
                         rasterizer->ScopeMarkerEnd();
                     } else {
-                        rasterizer->DispatchIndirect(indirect_args_addr, offset, size);
+                        rasterizer->DispatchIndirect(indirect_args_addr, offset, size, model);
                     }
                 }
                 break;
@@ -1062,7 +1064,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {}, model);
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
@@ -1134,7 +1136,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 }
 
 template <bool is_indirect>
-Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
+                                          Core::DreamsTrace::ModelBuildSnapshot model) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -1201,7 +1204,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid, model);
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
@@ -1322,7 +1325,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-                rasterizer->DispatchIndirect(it->indirect_addr, 0, size);
+                rasterizer->DispatchIndirect(it->indirect_addr, 0, size, model);
                 break;
             }
             if (DispatchPatchTraceEnabled() &&
@@ -1383,10 +1386,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (host_markers_enabled) {
                     rasterizer->ScopeMarkerBegin(
                         fmt::format("asc[{}]:{}:DispatchIndirect", vqid, cmd_address));
-                    rasterizer->DispatchIndirect(ib_address, 0, size);
+                    rasterizer->DispatchIndirect(ib_address, 0, size, model);
                     rasterizer->ScopeMarkerEnd();
                 } else {
-                    rasterizer->DispatchIndirect(ib_address, 0, size);
+                    rasterizer->DispatchIndirect(ib_address, 0, size, model);
                 }
             }
             break;
@@ -1519,7 +1522,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
-    auto task = ProcessGraphics(dcb, ccb);
+    auto task = ProcessGraphics(dcb, ccb, Core::DreamsTrace::ReadActiveModelBuild());
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
@@ -1535,7 +1538,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
-    const auto& task = ProcessCompute(acb, vqid);
+    const auto& task = ProcessCompute(acb, vqid, Core::DreamsTrace::ReadActiveModelBuild());
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

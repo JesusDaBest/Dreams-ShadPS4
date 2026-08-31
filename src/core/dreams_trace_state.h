@@ -24,10 +24,10 @@ struct ModelBuildSnapshot {
     u32 status{PendingModelStatus};
 };
 
-// The CPU model builder and GPU command processor run on different host threads. This tiny
-// seqlock tags diagnostic GPU dispatches with the guest model build that submitted them without
-// adding locks to either normal execution path. It is written only when the opt-in model-input
-// trace has installed its two guest breakpoints.
+// The CPU model builder and GPU command processor run on different host threads. The seqlock
+// preserves the latest diagnostic state for logging, while the thread-local snapshot is copied
+// into GPU submissions made by the same guest thread. It is written only when the opt-in
+// model-input trace has installed its two guest breakpoints.
 inline std::atomic<u32> model_sequence{};
 inline std::atomic_flag model_writer = ATOMIC_FLAG_INIT;
 inline std::atomic<u32> model_epoch{};
@@ -40,6 +40,7 @@ inline std::atomic<u32> model_peer_id{};
 inline std::atomic<u32> model_status{PendingModelStatus};
 inline std::atomic<bool> model_valid{};
 inline std::atomic<bool> model_returned{};
+inline thread_local ModelBuildSnapshot active_model_build{};
 
 inline void LockModelWriter() noexcept {
     while (model_writer.test_and_set(std::memory_order_acquire)) {
@@ -66,6 +67,18 @@ inline u32 BeginModelBuild(const u32 thread_id, const u32 arg_rcx, const u32 arg
     model_valid.store(true, std::memory_order_relaxed);
     model_sequence.fetch_add(1, std::memory_order_release);
     UnlockModelWriter();
+    active_model_build = {
+        .valid = true,
+        .returned = false,
+        .epoch = epoch,
+        .thread_id = thread_id,
+        .arg_rcx = arg_rcx,
+        .arg_rdi = arg_rdi,
+        .arg_rdx = arg_rdx,
+        .model_id = arg_r8,
+        .peer_id = arg_r9,
+        .status = PendingModelStatus,
+    };
     return epoch;
 }
 
@@ -82,7 +95,14 @@ inline bool CompleteModelBuild(const u32 epoch, const u32 thread_id, const u32 s
     model_returned.store(true, std::memory_order_relaxed);
     model_sequence.fetch_add(1, std::memory_order_release);
     UnlockModelWriter();
+    if (active_model_build.epoch == epoch && active_model_build.thread_id == thread_id) {
+        active_model_build = {};
+    }
     return true;
+}
+
+inline ModelBuildSnapshot ReadActiveModelBuild() noexcept {
+    return active_model_build;
 }
 
 inline ModelBuildSnapshot ReadModelBuild() noexcept {

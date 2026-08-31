@@ -2343,7 +2343,6 @@ struct DreamsCsgModelInputCapture {
     u32 ordinal{};
     Core::DreamsTrace::ModelBuildSnapshot model{};
     std::filesystem::path directory;
-    std::array<u32, 3> dims{};
     std::array<u32, 10> gds_pre{};
     std::array<u32, 10> gds_post{};
     std::array<DreamsModelInputBoundBuffer, 6> buffers{};
@@ -2364,9 +2363,12 @@ static std::span<u8> DreamsModelInputBytes(auto& value) {
     return {reinterpret_cast<u8*>(&value), sizeof(value)};
 }
 
-static void WriteDreamsCsgModelInputRows(const std::filesystem::path& file,
+static bool WriteDreamsCsgModelInputRows(const std::filesystem::path& file,
                                          std::span<const DreamsCsgModelInputRow> rows) {
     std::ofstream output{file, std::ios::trunc};
+    if (!output) {
+        return false;
+    }
     output << "row\tq\ta\tb\tai\tbi\tclass\tvalid";
     for (u32 index = 0; index < 6; ++index) {
         output << "\tb2_" << index;
@@ -2394,6 +2396,7 @@ static void WriteDreamsCsgModelInputRows(const std::filesystem::path& file,
         }
         output << '\t' << fmt::format("{:#010x}", row.b5) << '\n';
     }
+    return output.good();
 }
 
 static bool TraceDreamsProducerSources() {
@@ -21996,7 +21999,8 @@ void Rasterizer::DispatchDirect() {
     ResetBindings();
 }
 
-void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
+                                  const Core::DreamsTrace::ModelBuildSnapshot& submitted_model) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -23490,34 +23494,40 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const bool is_dreams_csg_replay = cs.pgm_hash == 0x8b19605c;
     DreamsCsgModelInputCapture dreams_model_input_capture{};
     const auto capture_dreams_model_input = [&] {
-      if (TraceDreamsModelInput() && is_dreams_csg_replay) {
-        const auto model = Core::DreamsTrace::ReadModelBuild();
-        static u32 inspected_dispatches{};
+        if (!TraceDreamsModelInput() || !is_dreams_csg_replay ||
+            !IsDreamsModelInputSourceSelected(submitted_model)) {
+            return;
+        }
+        const auto& model = submitted_model;
         static u32 captured_dispatches{};
-        if (IsDreamsModelInputSourceSelected(model) && inspected_dispatches++ < 256 &&
-            captured_dispatches < 64) {
-            constexpr u32 StateBaseDword = 576;
+        static std::unordered_map<u32, u32> captures_per_epoch;
+        if (captured_dispatches >= 128 || captures_per_epoch[model.epoch] >= 4) {
+            return;
+        }
+        constexpr u32 StateBaseDword = 576;
+        scheduler.Finish();
+        auto* gds = buffer_cache.GetGdsBuffer();
+        const u64 state_offset = static_cast<u64>(StateBaseDword) * sizeof(u32);
+        if (state_offset + sizeof(dreams_model_input_capture.gds_pre) >
+            gds->mapped_data.size()) {
+            return;
+        }
+        gds->InvalidateMappedRange(state_offset, sizeof(dreams_model_input_capture.gds_pre));
+        std::memcpy(dreams_model_input_capture.gds_pre.data(),
+                    gds->mapped_data.data() + state_offset,
+                    sizeof(dreams_model_input_capture.gds_pre));
+
+        const u32 queue_count = dreams_model_input_capture.gds_pre[2];
+        {
             constexpr u32 QueueCapacity = 524288;
             constexpr u32 QueueReadLimit = 65536;
             constexpr u32 SparseRowLimit = 2048;
             constexpr std::array<u32, 6> ExpectedStrides{8, 8, 4, 92, 16, 4};
 
-            scheduler.Finish();
-            auto* gds = buffer_cache.GetGdsBuffer();
-            const u64 state_offset = static_cast<u64>(StateBaseDword) * sizeof(u32);
-            if (state_offset + sizeof(dreams_model_input_capture.gds_pre) <=
-                gds->mapped_data.size()) {
-                gds->InvalidateMappedRange(state_offset,
-                                           sizeof(dreams_model_input_capture.gds_pre));
-                std::memcpy(dreams_model_input_capture.gds_pre.data(),
-                            gds->mapped_data.data() + state_offset,
-                            sizeof(dreams_model_input_capture.gds_pre));
-            }
-
             const u32 queue_base = dreams_model_input_capture.gds_pre[1];
-            const u32 queue_count = dreams_model_input_capture.gds_pre[2];
-            if (queue_count != 0) {
+            {
                 dreams_model_input_capture.enabled = true;
+                ++captures_per_epoch[model.epoch];
                 dreams_model_input_capture.ordinal = ++captured_dispatches;
                 dreams_model_input_capture.model = model;
                 if (const auto& root = DreamsModelInputTraceDirectory()) {
@@ -23528,14 +23538,6 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
                     std::error_code error;
                     std::filesystem::create_directories(dreams_model_input_capture.directory,
                                                         error);
-                }
-
-                buffer_cache.ReadMemory(args_address, sizeof(dreams_model_input_capture.dims));
-                if (memory->IsValidMapping(args_address,
-                                           sizeof(dreams_model_input_capture.dims))) {
-                    std::memcpy(dreams_model_input_capture.dims.data(),
-                                std::bit_cast<const void*>(args_address),
-                                sizeof(dreams_model_input_capture.dims));
                 }
 
                 const auto resolve_binding = [&](const u32 binding) {
@@ -23659,7 +23661,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
                         row.valid = false;
                     }
                 }
-                dreams_model_input_capture.complete = queue_read && rows_read;
+                dreams_model_input_capture.complete =
+                    queue_read && rows_read && !dreams_model_input_capture.queue_truncated &&
+                    !dreams_model_input_capture.rows_truncated;
 
                 u64 queue_hash{};
                 bool files_ok = !dreams_model_input_capture.directory.empty();
@@ -23667,20 +23671,18 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
                     files_ok &= WriteDreamsCaptureWords(
                         dreams_model_input_capture.directory / "b1-active-queue.bin",
                         dreams_model_input_capture.queue, queue_hash);
-                    WriteDreamsCsgModelInputRows(
+                    files_ok &= WriteDreamsCsgModelInputRows(
                         dreams_model_input_capture.directory / "sparse-input-rows.tsv",
                         dreams_model_input_capture.rows);
                     std::string metadata = fmt::format(
-                        "ordinal\tepoch\tthread\tmodel_id\tpeer_id\trcx\trdi\trdx\tdim_x\t"
-                        "dim_y\tdim_z\tbase\tcount\ttail\tsetup_invariant\tqueue_hash\t"
+                        "ordinal\tepoch\tthread\tmodel_id\tpeer_id\trcx\trdi\trdx\t"
+                        "base\tcount\ttail\tsetup_invariant\tqueue_hash\t"
                         "queue_truncated\trows\trows_truncated\tinvalid_rows\tread_complete\n"
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t"
-                        "{:#018x}\t{}\t{}\t{}\t{}\t{}\n",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t"
+                        "{}\t{}\t{}\t{}\t{}\n",
                         dreams_model_input_capture.ordinal, model.epoch, model.thread_id,
                         model.model_id, model.peer_id, model.arg_rcx, model.arg_rdi, model.arg_rdx,
-                        dreams_model_input_capture.dims[0], dreams_model_input_capture.dims[1],
-                        dreams_model_input_capture.dims[2], queue_base, queue_count,
-                        dreams_model_input_capture.gds_pre[4],
+                        queue_base, queue_count, dreams_model_input_capture.gds_pre[4],
                         static_cast<u64>(queue_base) + queue_count ==
                             std::min<u32>(QueueCapacity, dreams_model_input_capture.gds_pre[4]),
                         queue_hash, dreams_model_input_capture.queue_truncated,
@@ -23705,19 +23707,15 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
                 }
                 LOG_WARNING(
                     Render_Vulkan,
-                    "Dreams model-input replay pre #{} epoch={} model={} dims={}x{}x{} "
-                    "base={} count={} tail={} queue_hash={:#x} rows={} invalid={} complete={} "
-                    "files_ok={}",
+                    "Dreams model-input replay pre #{} epoch={} model={} base={} count={} tail={} "
+                    "queue_hash={:#x} rows={} invalid={} complete={} files_ok={}",
                     dreams_model_input_capture.ordinal, model.epoch, model.model_id,
-                    dreams_model_input_capture.dims[0], dreams_model_input_capture.dims[1],
-                    dreams_model_input_capture.dims[2], queue_base, queue_count,
-                    dreams_model_input_capture.gds_pre[4], queue_hash,
+                    queue_base, queue_count, dreams_model_input_capture.gds_pre[4], queue_hash,
                     dreams_model_input_capture.rows.size(),
                     dreams_model_input_capture.invalid_rows, dreams_model_input_capture.complete,
                     files_ok);
             }
         }
-      }
     };
     static u32 dreams_csg_replay_trace_count{};
     const bool trace_dreams_csg_replay =

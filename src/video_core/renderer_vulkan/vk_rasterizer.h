@@ -21,6 +21,10 @@ namespace Core {
 class MemoryManager;
 }
 
+namespace Core::DreamsTrace {
+struct ModelBuildSnapshot;
+}
+
 namespace Vulkan {
 
 class Scheduler;
@@ -51,7 +55,8 @@ public:
                       VAddr count_address, u32 base_vertex_location, u32 start_instance_location);
 
     void DispatchDirect();
-    void DispatchIndirect(VAddr address, u32 offset, u32 size);
+    void DispatchIndirect(VAddr address, u32 offset, u32 size,
+                          const Core::DreamsTrace::ModelBuildSnapshot& model);
 
     void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
     void ScopeMarkerEnd(bool from_guest = false);
