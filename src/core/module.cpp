@@ -515,6 +515,32 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             }
 
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CSG_ACTION_TRACE")) {
+                constexpr std::array<std::pair<u64, u8>, 2> DreamsCsgActionTracePoints{{
+                    {0x720950, 0x55},  // Arm at the start of one model build.
+                    {0x723870, 0x49},  // Disarm at its common return path.
+                }};
+                bool trace_points_match = true;
+                for (const auto [offset, expected] : DreamsCsgActionTracePoints) {
+                    if (offset >= base_size ||
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) != expected) {
+                        trace_points_match = false;
+                        break;
+                    }
+                }
+                if (trace_points_match) {
+                    for (const auto [offset, expected] : DreamsCsgActionTracePoints) {
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) = 0xcc;
+                    }
+                    LOG_WARNING(Core_Linker, "Applied action-synchronized Dreams CSG trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams action-synchronized CSG trace did not match this "
+                                "executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
                 IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE")) {
                 constexpr std::array<std::pair<u64, u8>, 11> DreamsModelRecordTracePoints{{
                     {0x7200b0, 0x55},   // Reset allocated model records.
