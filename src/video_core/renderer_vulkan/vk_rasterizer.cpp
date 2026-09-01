@@ -15,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -2652,6 +2653,46 @@ struct DreamsVs370ListSliceProducerSnapshot {
     std::array<u32, 3> start{};
     std::array<u32, 3> threads{};
     std::array<u32, 4> raw_output_descriptor{};
+    // Bindings 1 and 2 are the candidate-selector and source-lookup inputs for 7aa925e9.
+    // Retain their exact descriptors without reading or fencing them at dispatch time. Their
+    // contents are not immutable, so a later consumer-side capture must not claim these
+    // descriptors alone prove the bytes which the producer consumed.
+    std::array<bool, 2> upstream_descriptor_valid{};
+    std::array<VAddr, 2> upstream_base{};
+    std::array<u64, 2> upstream_size{};
+    std::array<u32, 2> upstream_stride{};
+    std::array<std::array<u32, 4>, 2> raw_upstream_descriptors{};
+};
+
+struct DreamsVs370ListSlicePendingDraw {
+    bool ready{};
+    u64 vertex_shader{};
+    u64 fragment_shader{};
+    VAddr command_address{};
+    VAddr count_address{};
+    u32 indirect_count{};
+    VkDrawIndexedIndirectCommand command{};
+    u32 shader_instance_base{};
+    u64 first_record{};
+    u64 end_record{};
+    u64 compute_sequence_at_draw{};
+    AmdGpu::Buffer b0{};
+    AmdGpu::Buffer b3{};
+    DreamsVs370ListSliceProducerSnapshot producer{};
+    VAddr slice_address{};
+    u64 slice_offset{};
+    u64 slice_bytes{};
+    bool gpu_modified_before_read{};
+    u64 guest_words_before_hash{};
+    std::vector<u32> guest_words_before;
+    u64 bound_source_offset{};
+    u64 bound_source_range{};
+    u64 bound_logical_base_offset{};
+    u64 bound_slice_relative_offset{};
+    u64 b0_bound_source_offset{};
+    u64 b0_bound_source_range{};
+    u64 b0_bound_logical_base_offset{};
+    std::vector<u8> b0_rows_0_through_10;
 };
 
 struct DreamsVs370ListSliceCaptureState {
@@ -2705,6 +2746,8 @@ static bool PollDreamsVs370ListSliceCaptureRequest() {
     std::filesystem::remove(*directory / "complete.txt", error);
     error.clear();
     std::filesystem::remove(*directory / "failed.txt", error);
+    error.clear();
+    std::filesystem::remove(*directory / "complete.txt.tmp", error);
     capture = {};
     capture.armed = true;
     capture.directory = *directory;
@@ -2976,6 +3019,52 @@ static bool WriteDreamsCaptureText(const std::filesystem::path& file, std::strin
     return true;
 }
 
+static bool VerifyDreamsCaptureBytes(const std::filesystem::path& file,
+                                     std::span<const u8> expected, u64 expected_hash) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(file, error) || error ||
+        std::filesystem::file_size(file, error) != expected.size() || error) {
+        LOG_ERROR(Render_Vulkan, "Dreams capture verification could not stat {}", file.string());
+        return false;
+    }
+    std::vector<u8> actual(expected.size());
+    std::ifstream input(file, std::ios::binary);
+    if (!input) {
+        LOG_ERROR(Render_Vulkan, "Dreams capture verification could not open {}", file.string());
+        return false;
+    }
+    input.read(reinterpret_cast<char*>(actual.data()), static_cast<std::streamsize>(actual.size()));
+    if (!input || HashDreamsTraceBytes(actual) != expected_hash ||
+        !std::ranges::equal(actual, expected)) {
+        LOG_ERROR(Render_Vulkan, "Dreams capture verification failed for {}", file.string());
+        return false;
+    }
+    return true;
+}
+
+static bool WriteDreamsCaptureCompletionMarker(const std::filesystem::path& directory) {
+    static constexpr std::string_view CompleteText = "complete\n";
+    const auto temporary = directory / "complete.txt.tmp";
+    const auto complete = directory / "complete.txt";
+    std::error_code error;
+    std::filesystem::remove(temporary, error);
+    if (!WriteDreamsCaptureText(temporary, CompleteText)) {
+        return false;
+    }
+    error.clear();
+    std::filesystem::remove(complete, error);
+    error.clear();
+    std::filesystem::rename(temporary, complete, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Dreams completion marker rename failed for {}: {}",
+                  complete.string(), error.message());
+        return false;
+    }
+    const std::span<const u8> expected{
+        reinterpret_cast<const u8*>(CompleteText.data()), CompleteText.size()};
+    return VerifyDreamsCaptureBytes(complete, expected, HashDreamsTraceBytes(expected));
+}
+
 static void FailDreamsVs370ListSliceCapture(std::string_view reason) {
     auto& capture = g_dreams_vs370_list_slice_capture;
     capture.armed = false;
@@ -2985,6 +3074,331 @@ static void FailDreamsVs370ListSliceCapture(std::string_view reason) {
     if (!capture.directory.empty()) {
         WriteDreamsCaptureText(capture.directory / "failed.txt", fmt::format("{}\n", reason));
     }
+}
+
+static void CompleteDreamsVs370ListSliceCapture(
+    const DreamsVs370ListSlicePendingDraw& pending, std::span<const u32> settled_words) {
+    auto& capture = g_dreams_vs370_list_slice_capture;
+    const auto fail = [&](std::string_view reason) {
+        FailDreamsVs370ListSliceCapture(reason);
+    };
+    const u64 expected_words = u64{pending.command.instanceCount} * 2;
+    if (!pending.ready || settled_words.size() != expected_words || expected_words == 0) {
+        fail("exact bound visibility-list read returned the wrong length");
+        return;
+    }
+
+    struct Word1Group {
+        std::vector<u32> word0_draw_order;
+        std::map<u32, u32> word0_multiplicities;
+        std::map<u32, u32> low24_multiplicities;
+    };
+    struct Low24Group {
+        std::vector<u32> draw_order_pairs;
+        std::map<u32, u32> full_word0_multiplicities;
+        std::map<u32, u32> word1_multiplicities;
+    };
+    std::map<u32, Word1Group> word1_groups;
+    std::map<u32, Low24Group> low24_groups;
+    std::string records =
+        "draw_index\tproducer_record\tword0\tword0_low24\tword0_high8\tword1\t"
+        "word1_low16\tword1_high16\n";
+    for (u32 record = 0; record < pending.command.instanceCount; ++record) {
+        const u32 word0 = settled_words[record * 2];
+        const u32 word1 = settled_words[record * 2 + 1];
+        const u32 low24 = word0 & 0x00ffffff;
+        records += fmt::format("{}\t{}\t{:#010x}\t{:#08x}\t{:#04x}\t{:#010x}\t{:#06x}\t"
+                               "{:#06x}\n",
+                               record, pending.first_record + record, word0, low24, word0 >> 24,
+                               word1, word1 & 0xffff, word1 >> 16);
+        auto& word1_group = word1_groups[word1];
+        word1_group.word0_draw_order.push_back(word0);
+        ++word1_group.word0_multiplicities[word0];
+        ++word1_group.low24_multiplicities[low24];
+        auto& low24_group = low24_groups[low24];
+        low24_group.draw_order_pairs.push_back(word0);
+        low24_group.draw_order_pairs.push_back(word1);
+        ++low24_group.full_word0_multiplicities[word0];
+        ++low24_group.word1_multiplicities[word1];
+    }
+
+    const auto format_multiplicities = [](const std::map<u32, u32>& values) {
+        std::string text;
+        for (const auto& [value, count] : values) {
+            if (!text.empty()) {
+                text += ';';
+            }
+            text += fmt::format("{:#010x}:{}", value, count);
+        }
+        return text;
+    };
+    const auto multiplicity_hash = [](const std::map<u32, u32>& values) {
+        std::vector<u32> words;
+        words.reserve(values.size() * 2);
+        for (const auto& [value, count] : values) {
+            words.push_back(value);
+            words.push_back(count);
+        }
+        return HashDreamsTraceWords(words);
+    };
+
+    u64 grouped_word1_records{};
+    std::string word1_inventory =
+        "word1\tword1_low16\tword1_high16\trecords\tunique_word0\tunique_word0_low24\t"
+        "draw_order_word0_hash\tword0_multiplicity_hash\tword0_low24_multiplicity_hash\t"
+        "word0_multiplicities\tword0_low24_multiplicities\n";
+    for (const auto& [word1, group] : word1_groups) {
+        grouped_word1_records += group.word0_draw_order.size();
+        word1_inventory += fmt::format(
+            "{:#010x}\t{:#06x}\t{:#06x}\t{}\t{}\t{}\t{:#018x}\t{:#018x}\t{:#018x}\t"
+            "{}\t{}\n",
+            word1, word1 & 0xffff, word1 >> 16, group.word0_draw_order.size(),
+            group.word0_multiplicities.size(), group.low24_multiplicities.size(),
+            HashDreamsTraceWords(group.word0_draw_order),
+            multiplicity_hash(group.word0_multiplicities),
+            multiplicity_hash(group.low24_multiplicities),
+            format_multiplicities(group.word0_multiplicities),
+            format_multiplicities(group.low24_multiplicities));
+    }
+
+    u64 grouped_low24_records{};
+    std::string low24_inventory =
+        "word0_low24\trecords\tunique_full_word0\tunique_word1\tdraw_order_pair_hash\t"
+        "full_word0_multiplicity_hash\tword1_multiplicity_hash\t"
+        "full_word0_multiplicities\tword1_multiplicities\n";
+    for (const auto& [low24, group] : low24_groups) {
+        const u64 records_in_group = group.draw_order_pairs.size() / 2;
+        grouped_low24_records += records_in_group;
+        low24_inventory += fmt::format(
+            "{:#08x}\t{}\t{}\t{}\t{:#018x}\t{:#018x}\t{:#018x}\t{}\t{}\n", low24,
+            records_in_group, group.full_word0_multiplicities.size(),
+            group.word1_multiplicities.size(), HashDreamsTraceWords(group.draw_order_pairs),
+            multiplicity_hash(group.full_word0_multiplicities),
+            multiplicity_hash(group.word1_multiplicities),
+            format_multiplicities(group.full_word0_multiplicities),
+            format_multiplicities(group.word1_multiplicities));
+    }
+    if (grouped_word1_records != pending.command.instanceCount ||
+        grouped_low24_records != pending.command.instanceCount) {
+        fail("visibility-list fixture grouping did not conserve the draw record count");
+        return;
+    }
+
+    u32 changed_from_guest_backing{};
+    if (pending.guest_words_before.size() == settled_words.size()) {
+        for (u32 word = 0; word < settled_words.size(); ++word) {
+            changed_from_guest_backing +=
+                settled_words[word] != pending.guest_words_before[word];
+        }
+    } else {
+        fail("guest-backing comparison has the wrong length");
+        return;
+    }
+
+    constexpr u32 B0RowsCaptured = 11;
+    const u64 expected_b0_bytes = u64{B0RowsCaptured} * pending.b0.stride;
+    if (pending.b0.stride != 432 ||
+        pending.b0_rows_0_through_10.size() != expected_b0_bytes) {
+        fail("exact bound B0 object-row fixture has the wrong size");
+        return;
+    }
+    std::set<u32> observed_low16_labels;
+    for (u32 record = 0; record < pending.command.instanceCount; ++record) {
+        observed_low16_labels.insert(settled_words[record * 2 + 1] & 0xffff);
+    }
+    std::vector<u32> unique_b0_row_representatives;
+    std::string b0_inventory =
+        "label\tobserved_in_b3\trow_offset\trow_bytes\trow_byte_hash\tall_zero\t"
+        "duplicate_of\n";
+    for (u32 label = 0; label < B0RowsCaptured; ++label) {
+        const std::span<const u8> row_bytes{
+            pending.b0_rows_0_through_10.data() + u64{label} * pending.b0.stride,
+            pending.b0.stride};
+        s32 duplicate_of = -1;
+        for (const u32 representative : unique_b0_row_representatives) {
+            const std::span<const u8> representative_bytes{
+                pending.b0_rows_0_through_10.data() +
+                    u64{representative} * pending.b0.stride,
+                pending.b0.stride};
+            if (std::ranges::equal(row_bytes, representative_bytes)) {
+                duplicate_of = static_cast<s32>(representative);
+                break;
+            }
+        }
+        if (duplicate_of < 0) {
+            unique_b0_row_representatives.push_back(label);
+        }
+        const bool all_zero = std::ranges::all_of(row_bytes, [](u8 byte) { return byte == 0; });
+        b0_inventory += fmt::format("{}\t{}\t{:#x}\t{}\t{:#018x}\t{}\t{}\n", label,
+                                    observed_low16_labels.contains(label),
+                                    u64{label} * pending.b0.stride, pending.b0.stride,
+                                    HashDreamsTraceBytes(row_bytes), all_zero,
+                                    duplicate_of < 0 ? "none" : fmt::format("{}", duplicate_of));
+    }
+    const std::span<const u8> b0_rows_bytes{pending.b0_rows_0_through_10};
+    const u64 b0_rows_byte_hash = HashDreamsTraceBytes(b0_rows_bytes);
+
+    const u64 settled_word_hash = HashDreamsTraceWords(settled_words);
+    const std::span<const u8> settled_bytes{
+        reinterpret_cast<const u8*>(settled_words.data()), settled_words.size_bytes()};
+    const u64 settled_byte_hash = HashDreamsTraceBytes(settled_bytes);
+    std::array<u32, sizeof(VkDrawIndexedIndirectCommand) / sizeof(u32)> command_words{};
+    static_assert(sizeof(pending.command) == sizeof(command_words));
+    std::memcpy(command_words.data(), &pending.command, sizeof(pending.command));
+    const std::span<const u8> command_bytes{
+        reinterpret_cast<const u8*>(command_words.data()), command_words.size_bytes()};
+    const u64 command_byte_hash = HashDreamsTraceBytes(command_bytes);
+
+    std::string manifest = "key\tvalue\n";
+    const auto row = [&](std::string_view key, const auto& value) {
+        manifest += fmt::format("{}\t{}\n", key, value);
+    };
+    row("capture", "vs370-list-slice-host-only");
+    row("fixture_validation", "passed");
+    row("vertex_shader", fmt::format("{:#x}", pending.vertex_shader));
+    row("fragment_shader", fmt::format("{:#x}", pending.fragment_shader));
+    row("command_address", fmt::format("{:#x}", pending.command_address));
+    row("count_address", fmt::format("{:#x}", pending.count_address));
+    row("indirect_count", pending.indirect_count);
+    row("index_count", pending.command.indexCount);
+    row("instance_count", pending.command.instanceCount);
+    row("capture_record_limit", 4096);
+    row("first_index", pending.command.firstIndex);
+    row("vertex_offset", pending.command.vertexOffset);
+    row("first_instance", pending.command.firstInstance);
+    row("shader_instance_base", pending.shader_instance_base);
+    row("first_record", pending.first_record);
+    row("end_record", pending.end_record);
+    row("producer_sequence", pending.producer.dispatch_sequence);
+    row("producer_shader", fmt::format("{:#x}", pending.producer.shader_hash));
+    row("producer_args_address", fmt::format("{:#x}", pending.producer.args_address));
+    row("producer_output_base", fmt::format("{:#x}", pending.producer.output_base));
+    row("producer_output_size", fmt::format("{:#x}", pending.producer.output_size));
+    row("producer_output_stride", pending.producer.output_stride);
+    row("producer_output_capacity_records", pending.producer.output_capacity_records);
+    row("producer_dispatch_initiator",
+        fmt::format("{:#x}", pending.producer.dispatch_initiator));
+    row("producer_start", fmt::format("{},{},{}", pending.producer.start[0],
+                                      pending.producer.start[1], pending.producer.start[2]));
+    row("producer_threads", fmt::format("{},{},{}", pending.producer.threads[0],
+                                        pending.producer.threads[1], pending.producer.threads[2]));
+    row("producer_raw_descriptor",
+        fmt::format("{:#010x},{:#010x},{:#010x},{:#010x}",
+                    pending.producer.raw_output_descriptor[0],
+                    pending.producer.raw_output_descriptor[1],
+                    pending.producer.raw_output_descriptor[2],
+                    pending.producer.raw_output_descriptor[3]));
+    for (u32 upstream = 0; upstream < 2; ++upstream) {
+        const u32 binding = upstream + 1;
+        row(fmt::format("producer_b{}_descriptor_valid", binding),
+            pending.producer.upstream_descriptor_valid[upstream]);
+        row(fmt::format("producer_b{}_base", binding),
+            fmt::format("{:#x}", pending.producer.upstream_base[upstream]));
+        row(fmt::format("producer_b{}_size", binding),
+            fmt::format("{:#x}", pending.producer.upstream_size[upstream]));
+        row(fmt::format("producer_b{}_stride", binding),
+            pending.producer.upstream_stride[upstream]);
+        row(fmt::format("producer_b{}_raw_descriptor", binding),
+            fmt::format("{:#010x},{:#010x},{:#010x},{:#010x}",
+                        pending.producer.raw_upstream_descriptors[upstream][0],
+                        pending.producer.raw_upstream_descriptors[upstream][1],
+                        pending.producer.raw_upstream_descriptors[upstream][2],
+                        pending.producer.raw_upstream_descriptors[upstream][3]));
+    }
+    row("b3_base", fmt::format("{:#x}", pending.b3.base_address));
+    row("b3_size", fmt::format("{:#x}", pending.b3.GetSize()));
+    row("b3_stride", pending.b3.stride);
+    row("b3_capacity_records", pending.b3.GetSize() / pending.b3.stride);
+    row("b0_base", fmt::format("{:#x}", pending.b0.base_address));
+    row("b0_size", fmt::format("{:#x}", pending.b0.GetSize()));
+    row("b0_stride", pending.b0.stride);
+    row("b0_rows_captured", "0..10");
+    row("b0_rows_unique", unique_b0_row_representatives.size());
+    row("b0_rows_byte_hash", fmt::format("{:#018x}", b0_rows_byte_hash));
+    row("b0_bound_source_offset", fmt::format("{:#x}", pending.b0_bound_source_offset));
+    row("b0_bound_source_range", fmt::format("{:#x}", pending.b0_bound_source_range));
+    row("b0_bound_logical_base_offset",
+        fmt::format("{:#x}", pending.b0_bound_logical_base_offset));
+    row("bound_source_offset", fmt::format("{:#x}", pending.bound_source_offset));
+    row("bound_source_range", fmt::format("{:#x}", pending.bound_source_range));
+    row("bound_logical_base_offset",
+        fmt::format("{:#x}", pending.bound_logical_base_offset));
+    row("bound_slice_relative_offset",
+        fmt::format("{:#x}", pending.bound_slice_relative_offset));
+    row("producer_snapshot_matches_b3", 1);
+    row("producer_snapshot_covers_draw", 1);
+    row("compute_sequence_at_draw", pending.compute_sequence_at_draw);
+    row("producer_to_draw_dispatch_delta",
+        pending.compute_sequence_at_draw - pending.producer.dispatch_sequence);
+    row("gpu_modified_before_read", pending.gpu_modified_before_read);
+    row("changed_from_guest_backing_words", changed_from_guest_backing);
+    row("guest_words_before_hash", fmt::format("{:#018x}", pending.guest_words_before_hash));
+    row("settled_slice_word_hash", fmt::format("{:#018x}", settled_word_hash));
+    row("settled_slice_byte_hash", fmt::format("{:#018x}", settled_byte_hash));
+    row("word1_groups", word1_groups.size());
+    row("word0_low24_groups", low24_groups.size());
+    row("readback", "exact settled Vulkan bindings 0 and 3 copied to download buffers");
+    row("synchronization",
+        "draw-side producer settle, then an exact bound-buffer transfer and finish before draw");
+    row("remaining_caveat",
+        "producer identity is a descriptor/sequence handoff; reuse of the same base has no "
+        "immutable guest generation ID");
+    row("producer_input_caveat",
+        "bindings 1 and 2 are descriptor-only; exact producer-time contents require a separate "
+        "dispatch-side capture");
+
+    const auto write_verified_text = [](const std::filesystem::path& file,
+                                        std::string_view text) {
+        const std::span<const u8> bytes{reinterpret_cast<const u8*>(text.data()), text.size()};
+        return WriteDreamsCaptureText(file, text) &&
+               VerifyDreamsCaptureBytes(file, bytes, HashDreamsTraceBytes(bytes));
+    };
+    u64 slice_file_hash{};
+    bool files_ok = WriteDreamsCaptureWords(capture.directory / "b3-list-slice.bin",
+                                             settled_words, slice_file_hash);
+    files_ok &= slice_file_hash == settled_byte_hash;
+    files_ok &= VerifyDreamsCaptureBytes(capture.directory / "b3-list-slice.bin", settled_bytes,
+                                         settled_byte_hash);
+    u64 command_file_hash{};
+    files_ok &= WriteDreamsCaptureWords(capture.directory / "draw-command.bin", command_words,
+                                        command_file_hash);
+    files_ok &= command_file_hash == command_byte_hash;
+    files_ok &= VerifyDreamsCaptureBytes(capture.directory / "draw-command.bin", command_bytes,
+                                         command_byte_hash);
+    u64 b0_rows_file_hash{};
+    files_ok &= WriteDreamsCaptureBytes(capture.directory / "b0-object-rows-0-10.bin",
+                                        b0_rows_bytes, b0_rows_file_hash);
+    files_ok &= b0_rows_file_hash == b0_rows_byte_hash;
+    files_ok &= VerifyDreamsCaptureBytes(capture.directory / "b0-object-rows-0-10.bin",
+                                         b0_rows_bytes, b0_rows_byte_hash);
+    files_ok &= write_verified_text(capture.directory / "records.tsv", records);
+    files_ok &= write_verified_text(capture.directory / "b0-object-rows-0-10.tsv",
+                                    b0_inventory);
+    files_ok &= write_verified_text(capture.directory / "word1-groups.tsv", word1_inventory);
+    files_ok &= write_verified_text(capture.directory / "word0-low24-groups.tsv",
+                                    low24_inventory);
+    files_ok &= write_verified_text(capture.directory / "manifest.tsv", manifest);
+    if (!files_ok) {
+        fail("one or more list-slice output files failed write-back verification");
+        return;
+    }
+
+    std::error_code error;
+    std::filesystem::remove(capture.directory / "failed.txt", error);
+    if (!WriteDreamsCaptureCompletionMarker(capture.directory)) {
+        fail("the verified list-slice outputs were written but the completion marker failed");
+        return;
+    }
+    capture.armed = false;
+    capture.complete = true;
+    capture.failed = false;
+    LOG_WARNING(Render_Vulkan,
+                "Dreams VS370 list-slice capture complete instances={} first_record={} "
+                "word1_groups={} low24_groups={} word_hash={:#x} byte_hash={:#x} "
+                "changed_from_guest={} directory={}",
+                pending.command.instanceCount, pending.first_record, word1_groups.size(),
+                low24_groups.size(), settled_word_hash, settled_byte_hash,
+                changed_from_guest_backing, capture.directory.string());
 }
 
 static std::optional<std::filesystem::path> ConsumeDreams7baProvenanceRequest() {
@@ -7973,6 +8387,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const auto& sculpt_count_vertex = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& sculpt_count_fragment = pipeline->GetStage(Shader::LogicalStage::Fragment);
+    DreamsVs370ListSlicePendingDraw dreams_vs370_list_slice_pending{};
     const bool dreams_vs370_list_slice_target =
         g_dreams_vs370_list_slice_capture.armed && is_indexed && max_count == 1 &&
         stride == sizeof(VkDrawIndexedIndirectCommand) &&
@@ -7985,17 +8400,23 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         };
 
         if (sculpt_count_vertex.buffers.size() <= 3 ||
+            sculpt_count_vertex.buffers[0].IsSpecial() ||
             sculpt_count_vertex.buffers[3].IsSpecial()) {
-            fail("target VS binding 3 is absent or special");
+            fail("target VS binding 0 or 3 is absent or special");
         } else {
+            const auto b0 = sculpt_count_vertex.buffers[0].GetSharp(sculpt_count_vertex);
             const auto b3 = sculpt_count_vertex.buffers[3].GetSharp(sculpt_count_vertex);
-            if (b3.base_address == 0 || b3.stride != 2 * sizeof(u32)) {
+            if (b0.base_address == 0 || b0.stride != 432) {
+                fail(fmt::format("target VS binding 0 is not a 432-byte object table "
+                                 "(base={:#x}, stride={})",
+                                 b0.base_address, b0.stride));
+            } else if (b3.base_address == 0 || b3.stride != 2 * sizeof(u32)) {
                 fail(fmt::format("target VS binding 3 is not an 8-byte visibility list "
                                  "(base={:#x}, stride={})",
                                  b3.base_address, b3.stride));
             } else {
-                // This is the diagnostic's only GPU fence. It settles the indirect command and
-                // b3 producer writes together; no per-record synchronization is performed.
+                // Settle the producer and indirect packet. The exact bound B0/B3 transfers are
+                // submitted only after BindResources resolves the buffers this draw consumes.
                 scheduler.Finish();
 
                 VkDrawIndexedIndirectCommand command{};
@@ -8076,14 +8497,17 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                         fail(fmt::format("binding 3 does not cover records {}..{} (capacity={})",
                                          first_record, end_record, b3_capacity));
                     } else {
-                        constexpr u64 MaxCaptureBytes = 64_MB;
+                        // The live edit-mode fixture currently contains about 794 records. A
+                        // 4096-record ceiling leaves deliberate headroom without reviving the
+                        // old 512-record rejection or permitting an accidental multi-megabyte
+                        // diagnostic allocation.
+                        constexpr u32 MaxCaptureRecords = 4096;
                         const u64 slice_bytes = u64{command.instanceCount} * 2 * sizeof(u32);
                         const u64 slice_offset = first_record * b3.stride;
                         const VAddr slice_address = b3.base_address + slice_offset;
-                        if (slice_bytes > MaxCaptureBytes) {
-                            fail(fmt::format("visibility-list slice is too large ({:#x} bytes, "
-                                             "limit={:#x})",
-                                             slice_bytes, MaxCaptureBytes));
+                        if (command.instanceCount > MaxCaptureRecords) {
+                            fail(fmt::format("visibility-list draw has {} records (limit={})",
+                                             command.instanceCount, MaxCaptureRecords));
                         } else if (slice_address < b3.base_address ||
                                    !memory->IsValidMapping(slice_address, slice_bytes)) {
                             fail("settled visibility-list slice is not mapped");
@@ -8096,6 +8520,34 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                             const bool gpu_modified_before_read =
                                 buffer_cache.IsRegionGpuModified(slice_address, slice_bytes);
 
+                            dreams_vs370_list_slice_pending = {
+                                .ready = true,
+                                .vertex_shader = sculpt_count_vertex.pgm_hash,
+                                .fragment_shader = sculpt_count_fragment.pgm_hash,
+                                .command_address = command_address,
+                                .count_address = count_address,
+                                .indirect_count = indirect_count,
+                                .command = command,
+                                .shader_instance_base = raw_instance_base,
+                                .first_record = first_record,
+                                .end_record = end_record,
+                                .compute_sequence_at_draw = g_compute_dispatch_sequence,
+                                .b0 = b0,
+                                .b3 = b3,
+                                .producer = *producer,
+                                .slice_address = slice_address,
+                                .slice_offset = slice_offset,
+                                .slice_bytes = slice_bytes,
+                                .gpu_modified_before_read = gpu_modified_before_read,
+                                .guest_words_before_hash = guest_hash_before,
+                                .guest_words_before = std::move(guest_words_before),
+                            };
+
+                            // Output generation is deferred until BindResources has resolved the
+                            // exact Vulkan buffer object consumed by this draw. Keep the previous
+                            // guest-backing writer compiled as a defensive fallback, but never use
+                            // it for an armed, valid pending capture.
+                            if (!dreams_vs370_list_slice_pending.ready) {
                             buffer_cache.ReadMemory(slice_address, slice_bytes);
                             std::vector<u32> settled_words(command.instanceCount * 2ULL);
                             std::memcpy(settled_words.data(),
@@ -8146,6 +8598,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
                             u64 slice_hash{};
                             const u64 settled_hash = HashDreamsTraceWords(settled_words);
+                            const std::span<const u8> settled_bytes{
+                                reinterpret_cast<const u8*>(settled_words.data()),
+                                settled_words.size_bytes()};
+                            const u64 settled_byte_hash = HashDreamsTraceBytes(settled_bytes);
                             std::array<u32, sizeof(command) / sizeof(u32)> command_words{};
                             static_assert(sizeof(command) == sizeof(command_words));
                             std::memcpy(command_words.data(), &command, sizeof(command));
@@ -8197,7 +8653,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
                             bool files_ok = WriteDreamsCaptureWords(
                                 capture.directory / "b3-list-slice.bin", settled_words, slice_hash);
-                            files_ok &= slice_hash == settled_hash;
+                            files_ok &= slice_hash == settled_byte_hash;
                             u64 command_hash{};
                             files_ok &= WriteDreamsCaptureWords(
                                 capture.directory / "draw-command.bin", command_words,
@@ -8209,8 +8665,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                             files_ok &= WriteDreamsCaptureText(capture.directory / "manifest.tsv",
                                                                manifest);
                             if (files_ok) {
-                                files_ok &= WriteDreamsCaptureText(capture.directory / "complete.txt",
-                                                                   "complete\n");
+                                files_ok &= WriteDreamsCaptureCompletionMarker(capture.directory);
                             }
                             if (!files_ok) {
                                 fail("one or more list-slice output files could not be written");
@@ -8231,6 +8686,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                 }
             }
         }
+    }
     }
     constexpr u64 Ce3ReadConstCaptureOffset =
         static_cast<u64>(Shader::DreamsCompat::Ce3ReadConstCaptureBaseDword) * sizeof(u32);
@@ -8896,6 +9352,96 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ApplyDreamsCe3BdaPrewarm(pipeline, memory, buffer_cache);
     if (!BindResources(pipeline)) {
         return;
+    }
+    if (dreams_vs370_list_slice_pending.ready) {
+        auto& pending = dreams_vs370_list_slice_pending;
+        const auto fail = [&](std::string_view reason) {
+            FailDreamsVs370ListSliceCapture(reason);
+        };
+        u32 vertex_buffer_info_base{};
+        bool vertex_buffer_info_found{};
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage == nullptr) {
+                continue;
+            }
+            if (stage == &sculpt_count_vertex) {
+                vertex_buffer_info_found = true;
+                break;
+            }
+            vertex_buffer_info_base += stage->buffers.size();
+        }
+        if (!vertex_buffer_info_found || sculpt_count_vertex.buffers.size() <= 3 ||
+            vertex_buffer_info_base + 3 >= buffer_infos.size()) {
+            fail("target VS binding 3 is absent from the settled Vulkan descriptors");
+        } else {
+            const auto& source = buffer_infos[vertex_buffer_info_base + 3];
+            const u64 binding_size = ResolveGuestBufferBindingSize(
+                memory, sculpt_count_vertex, 3, sculpt_count_vertex.buffers[3], pending.b3);
+            if (source.range == VK_WHOLE_SIZE || source.range < binding_size) {
+                fail("settled Vulkan binding 3 has an invalid logical range");
+            } else {
+                const u64 logical_base_offset = source.range - binding_size;
+                if (logical_base_offset > std::numeric_limits<u64>::max() - pending.slice_offset) {
+                    fail("settled Vulkan binding 3 offset overflowed");
+                } else {
+                    const u64 relative_offset = logical_base_offset + pending.slice_offset;
+                    if (relative_offset > source.range ||
+                        pending.slice_bytes > source.range - relative_offset) {
+                        fail("settled Vulkan binding 3 does not cover the requested draw slice");
+                    } else {
+                        std::vector<u32> settled_words(pending.command.instanceCount * 2ULL);
+                        std::span<u8> destination{
+                            reinterpret_cast<u8*>(settled_words.data()),
+                            settled_words.size() * sizeof(u32)};
+                        pending.bound_source_offset = source.offset;
+                        pending.bound_source_range = source.range;
+                        pending.bound_logical_base_offset = logical_base_offset;
+                        pending.bound_slice_relative_offset = relative_offset;
+                        if (!ReadDreamsBoundBufferForCapture(scheduler, buffer_cache, source,
+                                                             relative_offset, destination)) {
+                            fail("exact settled Vulkan binding 3 read failed");
+                        } else {
+                            constexpr u32 B0RowsToCapture = 11;
+                            const u64 b0_capture_bytes = u64{B0RowsToCapture} * pending.b0.stride;
+                            const auto& b0_source = buffer_infos[vertex_buffer_info_base];
+                            const u64 b0_binding_size = ResolveGuestBufferBindingSize(
+                                memory, sculpt_count_vertex, 0, sculpt_count_vertex.buffers[0],
+                                pending.b0);
+                            if (pending.b0.GetSize() < b0_capture_bytes ||
+                                b0_source.range == VK_WHOLE_SIZE ||
+                                b0_source.range < b0_binding_size) {
+                                fail("settled Vulkan binding 0 does not cover object rows 0..10");
+                            } else {
+                                const u64 b0_logical_base_offset =
+                                    b0_source.range - b0_binding_size;
+                                if (b0_logical_base_offset > b0_source.range ||
+                                    b0_capture_bytes >
+                                        b0_source.range - b0_logical_base_offset) {
+                                    fail("settled Vulkan binding 0 range excludes object rows "
+                                         "0..10");
+                                } else {
+                                    pending.b0_rows_0_through_10.resize(b0_capture_bytes);
+                                    pending.b0_bound_source_offset = b0_source.offset;
+                                    pending.b0_bound_source_range = b0_source.range;
+                                    pending.b0_bound_logical_base_offset =
+                                        b0_logical_base_offset;
+                                    if (!ReadDreamsBoundBufferForCapture(
+                                            scheduler, buffer_cache, b0_source,
+                                            b0_logical_base_offset,
+                                            pending.b0_rows_0_through_10)) {
+                                        fail("exact settled Vulkan binding 0 rows 0..10 read "
+                                             "failed");
+                                    } else {
+                                        CompleteDreamsVs370ListSliceCapture(pending,
+                                                                            settled_words);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     // Validate the packet destinations for diagnostics. The graphics-pipeline lookup has already
     // specialized the logical vertex shader on the matching physical-stage SGPRs.
@@ -24622,6 +25168,19 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
                     : 0;
             static_assert(sizeof(AmdGpu::Buffer) == sizeof(producer.raw_output_descriptor));
             std::memcpy(producer.raw_output_descriptor.data(), &output, sizeof(output));
+        }
+        for (u32 upstream = 0; upstream < producer.upstream_descriptor_valid.size(); ++upstream) {
+            const u32 binding = upstream + 1;
+            if (binding >= cs.buffers.size() || cs.buffers[binding].IsSpecial()) {
+                continue;
+            }
+            const auto descriptor = cs.buffers[binding].GetSharp(cs);
+            producer.upstream_descriptor_valid[upstream] = descriptor.base_address != 0;
+            producer.upstream_base[upstream] = descriptor.base_address;
+            producer.upstream_size[upstream] = descriptor.GetSize();
+            producer.upstream_stride[upstream] = descriptor.stride;
+            std::memcpy(producer.raw_upstream_descriptors[upstream].data(), &descriptor,
+                        sizeof(descriptor));
         }
         // Several visibility-list producers may be submitted before the graphics consumer. Keep
         // enough descriptor handoffs to identify the newest producer whose output is binding 3,
