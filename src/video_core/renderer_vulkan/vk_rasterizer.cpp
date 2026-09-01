@@ -2756,6 +2756,105 @@ static bool PollDreamsVs370ListSliceCaptureRequest() {
     return true;
 }
 
+// Proof-grade one-shot lineage for the current sculpt visibility chain.  B535 contributes only
+// its existing fixed-slot membership trace; d8 and 7aa payloads are read from the exact Vulkan
+// buffers bound to those dispatches.  It intentionally stops at 7aa and therefore does not turn
+// on the old VS370 interface capture or its 512-instance GDS envelope.
+struct DreamsUpstreamB535Record {
+    u32 pass{};
+    u32 workgroup{};
+    u32 lane{};
+    u32 identity{};
+    u32 record{};
+    u32 output_role{};
+    u32 output_index{};
+    u32 flags{};
+};
+
+struct DreamsUpstreamSourceRow {
+    u32 index{};
+    std::array<u32, 2> words{};
+};
+
+struct DreamsUpstreamOutputRecord {
+    u32 partition{};
+    u32 position{};
+    std::array<u32, 2> words{};
+};
+
+struct DreamsUpstreamLineageCaptureState {
+    enum class Phase : u32 {
+        WaitingForB535,
+        CapturingB535,
+        WaitingForD8,
+        CapturingD8,
+        WaitingFor7aa,
+        Capturing7aa,
+        Complete,
+        Failed,
+    };
+
+    Phase phase{Phase::WaitingForB535};
+    std::filesystem::path directory;
+    u64 b535_first_sequence{};
+    u64 b535_final_sequence{};
+    std::vector<DreamsUpstreamB535Record> b535_records;
+    VAddr d8_args_address{};
+    u32 d8_next_pass{};
+    u32 active_count{};
+    std::array<u64, Shader::DreamsCompat::VisibilityCandidateOrderedPassCount> d8_sequences{};
+    VAddr d8_input_base{};
+    u64 d8_input_size{};
+    u32 d8_input_stride{};
+    std::vector<u32> d8_input;
+    VAddr d8_output_base{};
+    u64 d8_output_size{};
+    u32 d8_output_stride{};
+    std::vector<u32> d8_output;
+    u64 d8_input_bound_offset{};
+    u64 d8_input_bound_range{};
+    u64 d8_input_logical_offset{};
+    u64 d8_output_bound_offset{};
+    u64 d8_output_bound_range{};
+    u64 d8_output_logical_offset{};
+    u64 list_sequence{};
+    VAddr list_output_base{};
+    u64 list_output_size{};
+    u32 list_output_stride{};
+    std::array<u32, 2> list_initial_counters{};
+    std::array<u32, 2> list_final_counters{};
+    std::vector<u32> list_input;
+    std::vector<DreamsUpstreamSourceRow> source_rows;
+    std::vector<DreamsUpstreamOutputRecord> list_output;
+    u64 list_input_bound_offset{};
+    u64 list_input_bound_range{};
+    u64 list_input_logical_offset{};
+    u64 list_source_bound_offset{};
+    u64 list_source_bound_range{};
+    u64 list_source_logical_offset{};
+    u64 list_output_bound_offset{};
+    u64 list_output_bound_range{};
+    u64 list_output_logical_offset{};
+};
+
+static DreamsUpstreamLineageCaptureState g_dreams_upstream_lineage_capture{};
+
+static std::optional<std::filesystem::path> DreamsUpstreamLineageCaptureDirectory() {
+    const char* value = std::getenv("SHADPS4_DREAMS_UPSTREAM_CHAIN_CAPTURE_DIR");
+    if (value == nullptr || value[0] == '\0') {
+        return std::nullopt;
+    }
+    return std::filesystem::path{value};
+}
+
+static bool DreamsUpstreamLineageCaptureLive() {
+    const auto phase = g_dreams_upstream_lineage_capture.phase;
+    return DreamsUpstreamLineageCaptureDirectory().has_value() &&
+           Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+           phase != DreamsUpstreamLineageCaptureState::Phase::Complete &&
+           phase != DreamsUpstreamLineageCaptureState::Phase::Failed;
+}
+
 // One exact producer/draw pair is sufficient for the isolated one-cube discriminator. Keeping
 // this capture single-shot avoids seven additional GPU fences and duplicate fixture replays.
 constexpr u32 DreamsVs370InterfaceCaptureOccurrences = 1;
@@ -2802,6 +2901,8 @@ static std::optional<std::filesystem::path> DreamsB535MembershipCaptureDirectory
                    std::getenv("SHADPS4_DREAMS_ORDERED_CHAIN_CAPTURE_DIR");
                ordered_chain != nullptr && ordered_chain[0] != '\0') {
         output = std::filesystem::path{ordered_chain} / "b535-membership";
+    } else if (const auto upstream = DreamsUpstreamLineageCaptureDirectory()) {
+        output = *upstream / "b535-membership";
     } else {
         return std::nullopt;
     }
@@ -2837,7 +2938,16 @@ static bool PollDreamsB535MembershipCaptureTrigger() {
                                              error) &&
             !error;
     }
-    if ((!explicitly_triggered && !ordered_chain_triggered) ||
+    bool upstream_triggered{};
+    if (const auto upstream = DreamsUpstreamLineageCaptureDirectory()) {
+        const auto request = *upstream / "capture.request";
+        error.clear();
+        if (std::filesystem::is_regular_file(request, error) && !error) {
+            error.clear();
+            upstream_triggered = std::filesystem::remove(request, error) && !error;
+        }
+    }
+    if ((!explicitly_triggered && !ordered_chain_triggered && !upstream_triggered) ||
         (capture.complete && ordered_chain_triggered && !explicitly_triggered)) {
         return false;
     }
@@ -2853,6 +2963,34 @@ static bool PollDreamsB535MembershipCaptureTrigger() {
     std::filesystem::remove(*directory / "failed.txt", error);
     capture = {};
     capture.active = true;
+    if (upstream_triggered) {
+        const auto upstream = DreamsUpstreamLineageCaptureDirectory();
+        if (!upstream) {
+            capture.active = false;
+            capture.failed = true;
+            return false;
+        }
+        std::filesystem::create_directories(*upstream, error);
+        if (error) {
+            capture.active = false;
+            capture.failed = true;
+            LOG_ERROR(Render_Vulkan, "Dreams upstream lineage directory cannot be created: {}",
+                      error.message());
+            return false;
+        }
+        error.clear();
+        std::filesystem::remove(*upstream / "complete.txt", error);
+        error.clear();
+        std::filesystem::remove(*upstream / "complete.txt.tmp", error);
+        error.clear();
+        std::filesystem::remove(*upstream / "failed.txt", error);
+        auto& lineage = g_dreams_upstream_lineage_capture;
+        lineage = {};
+        lineage.phase = DreamsUpstreamLineageCaptureState::Phase::CapturingB535;
+        lineage.directory = *upstream;
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams upstream lineage capture armed at the next nonzero B535 chain");
+    }
     LOG_WARNING(Render_Vulkan,
                 "Dreams B535 membership capture armed for one nonzero traversal chain");
     return true;
@@ -3069,6 +3207,266 @@ static bool WriteDreamsCaptureCompletionMarker(const std::filesystem::path& dire
         std::filesystem::remove(complete, error);
     }
     return verified;
+}
+
+static void FailDreamsUpstreamLineageCapture(std::string_view reason) {
+    auto& capture = g_dreams_upstream_lineage_capture;
+    if (capture.phase == DreamsUpstreamLineageCaptureState::Phase::Complete ||
+        capture.phase == DreamsUpstreamLineageCaptureState::Phase::Failed) {
+        return;
+    }
+    capture.phase = DreamsUpstreamLineageCaptureState::Phase::Failed;
+    LOG_ERROR(Render_Vulkan, "Dreams upstream lineage capture failed: {}", reason);
+    if (!capture.directory.empty()) {
+        std::error_code error;
+        std::filesystem::remove(capture.directory / "complete.txt", error);
+        WriteDreamsCaptureText(capture.directory / "failed.txt", fmt::format("{}\n", reason));
+    }
+}
+
+static void CompleteDreamsUpstreamLineageCapture() {
+    auto& capture = g_dreams_upstream_lineage_capture;
+    using Phase = DreamsUpstreamLineageCaptureState::Phase;
+    if (capture.phase != Phase::Capturing7aa || capture.directory.empty()) {
+        FailDreamsUpstreamLineageCapture("7aa completion arrived in the wrong capture phase");
+        return;
+    }
+    if (capture.b535_records.empty() || capture.b535_records.size() > 4096 ||
+        capture.active_count == 0 || capture.active_count > 4096 ||
+        capture.d8_input.size() != capture.active_count ||
+        capture.d8_output.size() != capture.active_count ||
+        capture.list_input != capture.d8_output || capture.source_rows.empty()) {
+        FailDreamsUpstreamLineageCapture("upstream payload lengths or the d8-to-7aa handoff differ");
+        return;
+    }
+
+    std::map<u32, u32> d8_input_multiplicity;
+    std::map<u32, u32> d8_output_multiplicity;
+    for (const u32 selector : capture.d8_input) {
+        ++d8_input_multiplicity[selector];
+    }
+    for (const u32 selector : capture.d8_output) {
+        ++d8_output_multiplicity[selector];
+    }
+    if (d8_input_multiplicity != d8_output_multiplicity) {
+        FailDreamsUpstreamLineageCapture("d8 output is not an exact permutation of its input");
+        return;
+    }
+
+    std::map<u32, std::array<u32, 2>> source_by_index;
+    for (const auto& source : capture.source_rows) {
+        if (!source_by_index.emplace(source.index, source.words).second) {
+            FailDreamsUpstreamLineageCapture("7aa source-row inventory contains duplicate indices");
+            return;
+        }
+    }
+    for (const u32 selector : capture.list_input) {
+        if (!source_by_index.contains(selector >> 10)) {
+            FailDreamsUpstreamLineageCapture("7aa source-row inventory is incomplete");
+            return;
+        }
+    }
+
+    struct LabelCounts {
+        u32 b535_input{};
+        u32 b535_terminal_b3{};
+        u32 b535_linked_d8_input{};
+        u32 d8_input{};
+        u32 d8_output{};
+        u32 list_output{};
+    };
+    std::map<u32, LabelCounts> label_counts;
+    std::map<std::array<u32, 2>, u32> list_output_multiplicity;
+    for (const auto& output : capture.list_output) {
+        ++label_counts[output.words[1] & 0xffff].list_output;
+        ++list_output_multiplicity[output.words];
+    }
+    for (const u32 selector : capture.d8_input) {
+        const auto& source = source_by_index.at(selector >> 10);
+        ++label_counts[source[1] & 0xffff].d8_input;
+    }
+    for (const u32 selector : capture.d8_output) {
+        const auto& source = source_by_index.at(selector >> 10);
+        ++label_counts[source[1] & 0xffff].d8_output;
+    }
+
+    std::string lineage =
+        "pass\tworkgroup\tlane\tidentity\trecord\tb535_record_low16\toutput_role\tflags\t"
+        "output_index\td8_input_valid\td8_input_selector\tsource_index\tsource_word0\t"
+        "source_word1\tsource_word1_low16\td8_output_selector_multiplicity\t"
+        "list_output_pair_multiplicity\n";
+    for (const auto& record : capture.b535_records) {
+        const u32 label = record.record & 0xffff;
+        ++label_counts[label].b535_input;
+        const bool terminal_b3 = (record.output_role & 8) != 0;
+        label_counts[label].b535_terminal_b3 += terminal_b3;
+        const bool input_valid = terminal_b3 && record.output_index < capture.d8_input.size();
+        label_counts[label].b535_linked_d8_input += input_valid;
+        const u32 selector = input_valid ? capture.d8_input[record.output_index] : 0;
+        const u32 source_index = selector >> 10;
+        const auto source = input_valid ? source_by_index.find(source_index) : source_by_index.end();
+        const bool source_valid = source != source_by_index.end();
+        const std::array<u32, 2> source_words = source_valid ? source->second
+                                                             : std::array<u32, 2>{};
+        lineage += fmt::format(
+            "{}\t{}\t{}\t{:#010x}\t{:#010x}\t{:#06x}\t{:#04x}\t{:#010x}\t{}\t{}\t"
+            "{:#010x}\t{}\t{:#010x}\t{:#010x}\t{:#06x}\t{}\t{}\n",
+            record.pass, record.workgroup, record.lane, record.identity, record.record, label,
+            record.output_role, record.flags, record.output_index, input_valid, selector,
+            source_index, source_words[0], source_words[1], source_words[1] & 0xffff,
+            input_valid ? d8_output_multiplicity[selector] : 0,
+            source_valid ? list_output_multiplicity[source_words] : 0);
+    }
+
+    std::string d8_records =
+        "position\tinput_selector\toutput_selector\toutput_source_index\toutput_word0\t"
+        "output_word1\toutput_word1_low16\n";
+    for (u32 position = 0; position < capture.active_count; ++position) {
+        const u32 selector = capture.d8_output[position];
+        const auto& source = source_by_index.at(selector >> 10);
+        d8_records += fmt::format("{}\t{:#010x}\t{:#010x}\t{}\t{:#010x}\t{:#010x}\t"
+                                  "{:#06x}\n",
+                                  position, capture.d8_input[position], selector, selector >> 10,
+                                  source[0], source[1], source[1] & 0xffff);
+    }
+
+    std::string source_rows = "source_index\tword0\tword1\tword1_low16\n";
+    std::vector<u32> source_words;
+    source_words.reserve(capture.source_rows.size() * 3);
+    for (const auto& source : capture.source_rows) {
+        source_rows += fmt::format("{}\t{:#010x}\t{:#010x}\t{:#06x}\n", source.index,
+                                   source.words[0], source.words[1], source.words[1] & 0xffff);
+        source_words.push_back(source.index);
+        source_words.insert(source_words.end(), source.words.begin(), source.words.end());
+    }
+
+    std::string output_records = "partition\tposition\tword0\tword1\tword1_low16\n";
+    std::vector<u32> output_words;
+    output_words.reserve(capture.list_output.size() * 4);
+    for (const auto& output : capture.list_output) {
+        output_records += fmt::format("{}\t{}\t{:#010x}\t{:#010x}\t{:#06x}\n",
+                                      output.partition, output.position, output.words[0],
+                                      output.words[1], output.words[1] & 0xffff);
+        output_words.push_back(output.partition);
+        output_words.push_back(output.position);
+        output_words.insert(output_words.end(), output.words.begin(), output.words.end());
+    }
+
+    std::string labels =
+        "low16_key\tb535_record_inputs\tb535_record_terminal_b3\t"
+        "b535_record_linked_d8_input\td8_input_source_word1\td8_output_source_word1\t"
+        "7aa_output_word1\n";
+    for (const auto& [label, counts] : label_counts) {
+        labels += fmt::format("{:#06x}\t{}\t{}\t{}\t{}\t{}\t{}\n", label,
+                              counts.b535_input, counts.b535_terminal_b3,
+                              counts.b535_linked_d8_input, counts.d8_input, counts.d8_output,
+                              counts.list_output);
+    }
+
+    const u64 output_delta =
+        u64{capture.list_final_counters[0] - capture.list_initial_counters[0]} +
+        u64{capture.list_final_counters[1] - capture.list_initial_counters[1]};
+    const u32 overlap_begin =
+        std::max(capture.list_initial_counters[0], capture.list_initial_counters[1]);
+    const u32 overlap_end =
+        std::min(capture.list_final_counters[0], capture.list_final_counters[1]);
+    const u32 partition_overlap_records =
+        overlap_end > overlap_begin ? overlap_end - overlap_begin : 0;
+    std::string manifest = "key\tvalue\n";
+    const auto row = [&](std::string_view key, const auto& value) {
+        manifest += fmt::format("{}\t{}\n", key, value);
+    };
+    row("capture", "b535-d8-7aa-upstream-lineage");
+    row("record_limit_per_stage", 4096);
+    row("b535_records", capture.b535_records.size());
+    row("b535_first_sequence", capture.b535_first_sequence);
+    row("b535_final_sequence", capture.b535_final_sequence);
+    row("d8_active_records", capture.active_count);
+    row("d8_input_hash", fmt::format("{:#018x}", HashDreamsTraceWords(capture.d8_input)));
+    row("d8_output_hash", fmt::format("{:#018x}", HashDreamsTraceWords(capture.d8_output)));
+    row("d8_permutation_valid", 1);
+    row("d8_input_base", fmt::format("{:#x}", capture.d8_input_base));
+    row("d8_output_base", fmt::format("{:#x}", capture.d8_output_base));
+    row("d8_input_bound_offset", fmt::format("{:#x}", capture.d8_input_bound_offset));
+    row("d8_input_bound_range", fmt::format("{:#x}", capture.d8_input_bound_range));
+    row("d8_input_logical_offset", fmt::format("{:#x}", capture.d8_input_logical_offset));
+    row("d8_output_bound_offset", fmt::format("{:#x}", capture.d8_output_bound_offset));
+    row("d8_output_bound_range", fmt::format("{:#x}", capture.d8_output_bound_range));
+    row("d8_output_logical_offset", fmt::format("{:#x}", capture.d8_output_logical_offset));
+    row("7aa_sequence", capture.list_sequence);
+    row("7aa_input_matches_d8_output", 1);
+    row("7aa_unique_source_rows", capture.source_rows.size());
+    row("7aa_initial_counters",
+        fmt::format("{},{}", capture.list_initial_counters[0],
+                    capture.list_initial_counters[1]));
+    row("7aa_final_counters",
+        fmt::format("{},{}", capture.list_final_counters[0],
+                    capture.list_final_counters[1]));
+    row("7aa_output_delta", output_delta);
+    row("7aa_captured_output_records", capture.list_output.size());
+    row("7aa_partition_overlap_records", partition_overlap_records);
+    row("7aa_input_bound_offset", fmt::format("{:#x}", capture.list_input_bound_offset));
+    row("7aa_input_bound_range", fmt::format("{:#x}", capture.list_input_bound_range));
+    row("7aa_input_logical_offset", fmt::format("{:#x}", capture.list_input_logical_offset));
+    row("7aa_source_bound_offset", fmt::format("{:#x}", capture.list_source_bound_offset));
+    row("7aa_source_bound_range", fmt::format("{:#x}", capture.list_source_bound_range));
+    row("7aa_source_logical_offset", fmt::format("{:#x}", capture.list_source_logical_offset));
+    row("7aa_output_bound_offset", fmt::format("{:#x}", capture.list_output_bound_offset));
+    row("7aa_output_bound_range", fmt::format("{:#x}", capture.list_output_bound_range));
+    row("7aa_output_logical_offset", fmt::format("{:#x}", capture.list_output_logical_offset));
+    row("readback", "exact bound Vulkan buffers; no guest CPU mirror used for payloads");
+    row("b535_low16_semantics",
+        "record low16 (guest instrumentation calls it object index); equality to 7aa word1 "
+        "low16 is measured by lineage.tsv, not assumed");
+    row("label_stage_count_key",
+        "numeric low16 union; B535 columns use record low16 and d8/7aa columns use source/output "
+        "word1 low16");
+    row("duplicate_selector_caveat",
+        "equal selectors preserve exact multiplicity but do not have a distinguishable identity");
+    row("completion_boundary", "immediately after matched 7aa; VS370 is not instrumented");
+
+    const auto write_verified_text = [](const std::filesystem::path& file,
+                                        std::string_view value) {
+        const std::span<const u8> bytes{reinterpret_cast<const u8*>(value.data()), value.size()};
+        return WriteDreamsCaptureText(file, value) &&
+               VerifyDreamsCaptureBytes(file, bytes, HashDreamsTraceBytes(bytes));
+    };
+    const auto write_verified_words = [](const std::filesystem::path& file,
+                                         std::span<const u32> words) {
+        u64 hash{};
+        const std::span<const u8> bytes{reinterpret_cast<const u8*>(words.data()),
+                                       words.size_bytes()};
+        return WriteDreamsCaptureWords(file, words, hash) &&
+               VerifyDreamsCaptureBytes(file, bytes, hash);
+    };
+
+    bool files_ok = write_verified_text(capture.directory / "lineage.tsv", lineage);
+    files_ok &= write_verified_text(capture.directory / "d8-records.tsv", d8_records);
+    files_ok &= write_verified_text(capture.directory / "7aa-source-rows.tsv", source_rows);
+    files_ok &= write_verified_text(capture.directory / "7aa-output-records.tsv", output_records);
+    files_ok &= write_verified_text(capture.directory / "label-stage-counts.tsv", labels);
+    files_ok &= write_verified_text(capture.directory / "manifest.tsv", manifest);
+    files_ok &= write_verified_words(capture.directory / "d8-input.bin", capture.d8_input);
+    files_ok &= write_verified_words(capture.directory / "d8-output.bin", capture.d8_output);
+    files_ok &= write_verified_words(capture.directory / "7aa-input.bin", capture.list_input);
+    files_ok &= write_verified_words(capture.directory / "7aa-source-rows.bin", source_words);
+    files_ok &= write_verified_words(capture.directory / "7aa-output-records.bin", output_words);
+    if (!files_ok || output_delta != capture.list_output.size()) {
+        FailDreamsUpstreamLineageCapture(
+            !files_ok ? "one or more lineage files failed write-back verification"
+                      : "7aa output counter deltas do not match the captured records");
+        return;
+    }
+    if (!WriteDreamsCaptureCompletionMarker(capture.directory)) {
+        FailDreamsUpstreamLineageCapture("verified lineage files were written but marker failed");
+        return;
+    }
+    capture.phase = Phase::Complete;
+    LOG_WARNING(Render_Vulkan,
+                "Dreams upstream lineage complete b535_rows={} active={} source_rows={} "
+                "7aa_output={} directory={}",
+                capture.b535_records.size(), capture.active_count, capture.source_rows.size(),
+                capture.list_output.size(), capture.directory.string());
 }
 
 static void FailDreamsVs370ListSliceCapture(std::string_view reason) {
@@ -4290,6 +4688,10 @@ static void FailDreamsB535MembershipCapture(std::string_view reason) {
     if (const auto directory = DreamsB535MembershipCaptureDirectory()) {
         WriteDreamsCaptureText(*directory / "failed.txt", fmt::format("{}\n", reason));
     }
+    if (g_dreams_upstream_lineage_capture.phase ==
+        DreamsUpstreamLineageCaptureState::Phase::CapturingB535) {
+        FailDreamsUpstreamLineageCapture(reason);
+    }
 }
 
 static bool FinalizeDreamsB535InstructionTrace(
@@ -4896,6 +5298,12 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
     std::vector<u32> provenance_identities;
     capture.dropped_records.clear();
     capture.input_records.clear();
+    const bool capture_upstream_lineage =
+        g_dreams_upstream_lineage_capture.phase ==
+        DreamsUpstreamLineageCaptureState::Phase::CapturingB535;
+    if (capture_upstream_lineage) {
+        g_dreams_upstream_lineage_capture.b535_records.clear();
+    }
     for (u32 pass = 0; pass < capture.pass_count; ++pass) {
         const u32 workgroups = std::min(capture.dims[pass][0], B535Capture::MaxWorkgroupsPerPass);
         for (u32 workgroup = 0; workgroup < workgroups; ++workgroup) {
@@ -4912,6 +5320,18 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
                                         : fmt::format("\t0x{:08x}", record[field]);
                 }
                 const u32 role = record[B535Capture::OutputRole];
+                if (capture_upstream_lineage) {
+                    g_dreams_upstream_lineage_capture.b535_records.push_back({
+                        .pass = pass,
+                        .workgroup = workgroup,
+                        .lane = lane,
+                        .identity = record[B535Capture::Identity],
+                        .record = record[B535Capture::Record],
+                        .output_role = role,
+                        .output_index = record[B535Capture::OutputIndex],
+                        .flags = record[B535Capture::Flags],
+                    });
+                }
                 if ((record[B535Capture::Flags] & B535Capture::InputValid) != 0) {
                     const std::array<u32, 2> input{record[B535Capture::Identity],
                                                    record[B535Capture::Record]};
@@ -5117,6 +5537,16 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
     capture.active = false;
     capture.complete = success;
     capture.failed = !success;
+    if (success && capture_upstream_lineage) {
+        auto& lineage = g_dreams_upstream_lineage_capture;
+        lineage.b535_first_sequence = capture.pass_count != 0 ? capture.sequences[0] : 0;
+        lineage.b535_final_sequence =
+            capture.pass_count != 0 ? capture.sequences[capture.pass_count - 1] : 0;
+        lineage.phase = DreamsUpstreamLineageCaptureState::Phase::WaitingForD8;
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams upstream lineage B535 boundary complete passes={} rows={}",
+                    capture.pass_count, lineage.b535_records.size());
+    }
     LOG_WARNING(Render_Vulkan,
                 "Dreams B535 membership capture complete passes={} raw_hash={:#x} directory={}",
                 capture.pass_count, raw_hash, directory->string());
@@ -24129,6 +24559,42 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
         return;
     }
 
+    const auto resolve_upstream_bound_binding =
+        [&](u32 binding, const AmdGpu::Buffer& sharp, vk::DescriptorBufferInfo& source,
+            u64& binding_size, u64& logical_offset) {
+            if (binding >= cs.buffers.size() || binding >= buffer_infos.size() ||
+                cs.buffers[binding].IsSpecial()) {
+                return false;
+            }
+            binding_size = ResolveGuestBufferBindingSize(memory, cs, binding,
+                                                         cs.buffers[binding], sharp);
+            source = buffer_infos[binding];
+            if (static_cast<VkBuffer>(source.buffer) == VK_NULL_HANDLE ||
+                source.range == VK_WHOLE_SIZE || source.range < binding_size) {
+                return false;
+            }
+            logical_offset = source.range - binding_size;
+            return true;
+        };
+    const auto read_upstream_bound_binding =
+        [&](u32 binding, const AmdGpu::Buffer& sharp, u64 guest_relative_offset,
+            std::span<u8> destination, u64& bound_offset, u64& bound_range,
+            u64& logical_offset) {
+            vk::DescriptorBufferInfo source{};
+            u64 binding_size{};
+            if (!resolve_upstream_bound_binding(binding, sharp, source, binding_size,
+                                                logical_offset) ||
+                guest_relative_offset > binding_size ||
+                destination.size() > binding_size - guest_relative_offset) {
+                return false;
+            }
+            bound_offset = source.offset;
+            bound_range = source.range;
+            return ReadDreamsBoundBufferForCapture(
+                scheduler, buffer_cache, source, logical_offset + guest_relative_offset,
+                destination);
+        };
+
     const bool profile_dreams = ShouldProfileDreamsTraversal(cs);
     const bool profile = ShouldProfileCompute() || profile_dreams;
     VideoCore::Buffer* finalize_b535_membership_after_dispatch{};
@@ -24481,6 +24947,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
     std::array<u32, Shader::DreamsCompat::VisibilityCandidateOrderedPassCount>
         dreams_sculpt_candidate_ordered_before{};
     bool capture_dreams_ordered_chain_d8_pass{};
+    bool capture_dreams_upstream_d8_pass{};
     if (is_dreams_sculpt_candidate_compact && DreamsOrderedChainCaptureEnabled()) {
         auto& chain = g_dreams_ordered_chain_capture;
         if (chain.phase == DreamsOrderedChainCaptureState::Phase::WaitingForD8 &&
@@ -24638,6 +25105,78 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
                 if (capture_dreams_ordered_chain_d8_pass) {
                     ++chain.next_d8_pass;
                 }
+            }
+        }
+    }
+
+    if (is_dreams_sculpt_candidate_compact && DreamsUpstreamLineageCaptureLive()) {
+        auto& lineage = g_dreams_upstream_lineage_capture;
+        using Phase = DreamsUpstreamLineageCaptureState::Phase;
+        if (lineage.phase == Phase::WaitingForD8 && dreams_sculpt_candidate_pass == 0) {
+            if (!use_dreams_visibility_candidate_ordered_prefix ||
+                lineage.b535_records.empty() || cs.buffers.size() <= 1 ||
+                cs.buffers[1].IsSpecial()) {
+                FailDreamsUpstreamLineageCapture(
+                    "the first d8 pass lacks an exact ordered dispatch or binding 1");
+            } else {
+                const auto input = cs.buffers[1].GetSharp(cs);
+                constexpr u32 MaxRecords = 4096;
+                const u32 capacity = static_cast<u32>(
+                    std::min<u64>(input.GetSize() / sizeof(u32), MaxRecords));
+                std::vector<u32> exact_input(capacity);
+                std::span<u8> destination{reinterpret_cast<u8*>(exact_input.data()),
+                                          exact_input.size() * sizeof(u32)};
+                if (input.base_address == 0 || input.stride != sizeof(u32) || capacity == 0 ||
+                    !read_upstream_bound_binding(
+                        1, input, 0, destination, lineage.d8_input_bound_offset,
+                        lineage.d8_input_bound_range, lineage.d8_input_logical_offset)) {
+                    FailDreamsUpstreamLineageCapture("exact d8 pass-0 binding-1 read failed");
+                } else {
+                    const auto* capture_gds = buffer_cache.GetGdsBuffer();
+                    constexpr u64 CountOffset = 324 * sizeof(u32);
+                    u32 active_count{};
+                    if (CountOffset + sizeof(active_count) > capture_gds->mapped_data.size()) {
+                        FailDreamsUpstreamLineageCapture("d8 active-count GDS slot is unavailable");
+                    } else {
+                        std::memcpy(&active_count,
+                                    capture_gds->mapped_data.data() + CountOffset,
+                                    sizeof(active_count));
+                        if (active_count == 0 || active_count > capacity ||
+                            active_count > MaxRecords) {
+                            FailDreamsUpstreamLineageCapture(fmt::format(
+                                "d8 active count {} is outside exact capture capacity {}",
+                                active_count, capacity));
+                        } else {
+                            exact_input.resize(active_count);
+                            lineage.phase = Phase::CapturingD8;
+                            lineage.d8_args_address = args_address;
+                            lineage.d8_next_pass = 0;
+                            lineage.active_count = active_count;
+                            lineage.d8_input_base = input.base_address;
+                            lineage.d8_input_size = input.GetSize();
+                            lineage.d8_input_stride = input.stride;
+                            lineage.d8_input = std::move(exact_input);
+                            LOG_WARNING(Render_Vulkan,
+                                        "Dreams upstream lineage d8 started active={} sequence={}",
+                                        active_count, g_compute_dispatch_sequence);
+                        }
+                    }
+                }
+            }
+        }
+        if (lineage.phase == Phase::CapturingD8) {
+            if (!use_dreams_visibility_candidate_ordered_prefix ||
+                dreams_sculpt_candidate_pass != lineage.d8_next_pass ||
+                args_address != lineage.d8_args_address) {
+                FailDreamsUpstreamLineageCapture(fmt::format(
+                    "unaligned d8 pass: expected {} at {:#x}, observed {} at {:#x}",
+                    lineage.d8_next_pass, lineage.d8_args_address,
+                    dreams_sculpt_candidate_pass, args_address));
+            } else {
+                lineage.d8_sequences[dreams_sculpt_candidate_pass] =
+                    g_compute_dispatch_sequence;
+                capture_dreams_upstream_d8_pass = dreams_sculpt_candidate_pass == 9;
+                ++lineage.d8_next_pass;
             }
         }
     }
@@ -25212,6 +25751,129 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
                                        DreamsOrderedChainCaptureEnabled() &&
                                        g_dreams_ordered_chain_capture.phase ==
                                            DreamsOrderedChainCaptureState::Phase::WaitingFor7aa;
+    bool capture_dreams_upstream_list{};
+    if (cs.pgm_hash == DreamsVisibilityListShader && DreamsUpstreamLineageCaptureLive() &&
+        g_dreams_upstream_lineage_capture.phase ==
+            DreamsUpstreamLineageCaptureState::Phase::WaitingFor7aa &&
+        cs.buffers.size() > 2 && !cs.buffers[0].IsSpecial() &&
+        !cs.buffers[1].IsSpecial() && !cs.buffers[2].IsSpecial()) {
+        auto& lineage = g_dreams_upstream_lineage_capture;
+        const auto output = cs.buffers[0].GetSharp(cs);
+        const auto input = cs.buffers[1].GetSharp(cs);
+        const auto source = cs.buffers[2].GetSharp(cs);
+        if (input.base_address == lineage.d8_output_base &&
+            input.stride == lineage.d8_output_stride) {
+            vk::DescriptorBufferInfo input_bound{};
+            vk::DescriptorBufferInfo source_bound{};
+            vk::DescriptorBufferInfo output_bound{};
+            u64 input_binding_size{};
+            u64 source_binding_size{};
+            u64 output_binding_size{};
+            u64 input_logical_offset{};
+            u64 source_logical_offset{};
+            u64 output_logical_offset{};
+            bool bindings_valid = resolve_upstream_bound_binding(
+                1, input, input_bound, input_binding_size, input_logical_offset);
+            bindings_valid &= resolve_upstream_bound_binding(
+                2, source, source_bound, source_binding_size, source_logical_offset);
+            bindings_valid &= resolve_upstream_bound_binding(
+                0, output, output_bound, output_binding_size, output_logical_offset);
+            const u64 input_bytes = u64{lineage.active_count} * sizeof(u32);
+            bindings_valid &= input_bytes <= input_binding_size;
+
+            std::vector<u32> source_indices;
+            source_indices.reserve(lineage.d8_output.size());
+            for (const u32 selector : lineage.d8_output) {
+                source_indices.push_back(selector >> 10);
+            }
+            std::ranges::sort(source_indices);
+            const auto unique_end = std::ranges::unique(source_indices).begin();
+            source_indices.erase(unique_end, source_indices.end());
+            bindings_valid &= !source_indices.empty() && source_indices.size() <= 4096;
+
+            lineage.list_input.assign(lineage.active_count, 0);
+            lineage.source_rows.clear();
+            lineage.source_rows.reserve(source_indices.size());
+            for (const u32 index : source_indices) {
+                const u64 row_offset = u64{index} * 2 * sizeof(u32);
+                if (row_offset > source_binding_size ||
+                    2 * sizeof(u32) > source_binding_size - row_offset) {
+                    bindings_valid = false;
+                    break;
+                }
+                lineage.source_rows.push_back({.index = index});
+            }
+
+            std::vector<DreamsBoundBufferCaptureRegion> regions;
+            if (bindings_valid) {
+                regions.reserve(lineage.source_rows.size() + 1);
+                regions.push_back({
+                    .source = input_bound,
+                    .relative_offset = input_logical_offset,
+                    .destination = {reinterpret_cast<u8*>(lineage.list_input.data()),
+                                    lineage.list_input.size() * sizeof(u32)},
+                });
+                for (auto& row : lineage.source_rows) {
+                    regions.push_back({
+                        .source = source_bound,
+                        .relative_offset =
+                            source_logical_offset + u64{row.index} * 2 * sizeof(u32),
+                        .destination = {reinterpret_cast<u8*>(row.words.data()),
+                                        row.words.size() * sizeof(u32)},
+                    });
+                }
+                bindings_valid =
+                    ReadDreamsBoundBufferRegionsForCapture(scheduler, buffer_cache, regions);
+            }
+            if (!bindings_valid || lineage.list_input != lineage.d8_output) {
+                FailDreamsUpstreamLineageCapture(
+                    !bindings_valid ? "exact 7aa input/source binding read failed"
+                                    : "exact 7aa binding 1 differs from d8 pass-9 output");
+            } else {
+                constexpr auto CounterIndices =
+                    Shader::DreamsCompat::VisibilityListOrderedCounterIndices;
+                const auto* capture_gds = buffer_cache.GetGdsBuffer();
+                bool counters_valid{};
+                if (CounterIndices[1] * sizeof(u32) + sizeof(u32) <=
+                    capture_gds->mapped_data.size()) {
+                    std::memcpy(&lineage.list_initial_counters[0],
+                                capture_gds->mapped_data.data() +
+                                    CounterIndices[0] * sizeof(u32),
+                                sizeof(u32));
+                    std::memcpy(&lineage.list_initial_counters[1],
+                                capture_gds->mapped_data.data() +
+                                    CounterIndices[1] * sizeof(u32),
+                                sizeof(u32));
+                    counters_valid = true;
+                }
+                if (!counters_valid || output.base_address == 0 || output.stride != 2 * sizeof(u32)) {
+                    FailDreamsUpstreamLineageCapture(
+                        "7aa counters or two-word output descriptor are invalid");
+                } else {
+                    lineage.list_sequence = g_compute_dispatch_sequence;
+                    lineage.list_output_base = output.base_address;
+                    lineage.list_output_size = output.GetSize();
+                    lineage.list_output_stride = output.stride;
+                    lineage.list_input_bound_offset = input_bound.offset;
+                    lineage.list_input_bound_range = input_bound.range;
+                    lineage.list_input_logical_offset = input_logical_offset;
+                    lineage.list_source_bound_offset = source_bound.offset;
+                    lineage.list_source_bound_range = source_bound.range;
+                    lineage.list_source_logical_offset = source_logical_offset;
+                    lineage.list_output_bound_offset = output_bound.offset;
+                    lineage.list_output_bound_range = output_bound.range;
+                    lineage.list_output_logical_offset = output_logical_offset;
+                    lineage.phase = DreamsUpstreamLineageCaptureState::Phase::Capturing7aa;
+                    capture_dreams_upstream_list = true;
+                    LOG_WARNING(Render_Vulkan,
+                                "Dreams upstream lineage matched 7aa sequence={} active={} "
+                                "source_rows={}",
+                                lineage.list_sequence, lineage.active_count,
+                                lineage.source_rows.size());
+                }
+            }
+        }
+    }
     bool capture_ordered_chain_list{};
     if (ordered_chain_waiting && cs.buffers.size() > 1 && !cs.buffers[1].IsSpecial()) {
         const auto input = cs.buffers[1].GetSharp(cs);
@@ -26787,6 +27449,37 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
             }
         }
     }
+    if (capture_dreams_upstream_d8_pass && dreams_sculpt_candidate_pass == 9) {
+        auto& lineage = g_dreams_upstream_lineage_capture;
+        using Phase = DreamsUpstreamLineageCaptureState::Phase;
+        if (lineage.phase != Phase::CapturingD8 || lineage.d8_next_pass != 10 ||
+            cs.buffers.empty() || cs.buffers[0].IsSpecial()) {
+            FailDreamsUpstreamLineageCapture("d8 pass-9 output arrived in an invalid state");
+        } else {
+            const auto output = cs.buffers[0].GetSharp(cs);
+            std::vector<u32> exact_output(lineage.active_count);
+            std::span<u8> destination{reinterpret_cast<u8*>(exact_output.data()),
+                                      exact_output.size() * sizeof(u32)};
+            if (output.base_address == 0 || output.stride != sizeof(u32) ||
+                destination.size() > output.GetSize() ||
+                !read_upstream_bound_binding(
+                    0, output, 0, destination, lineage.d8_output_bound_offset,
+                    lineage.d8_output_bound_range, lineage.d8_output_logical_offset)) {
+                FailDreamsUpstreamLineageCapture("exact d8 pass-9 binding-0 read failed");
+            } else {
+                lineage.d8_output_base = output.base_address;
+                lineage.d8_output_size = output.GetSize();
+                lineage.d8_output_stride = output.stride;
+                lineage.d8_output = std::move(exact_output);
+                lineage.phase = Phase::WaitingFor7aa;
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams upstream lineage d8 complete active={} input_hash={:#x} "
+                            "output_hash={:#x}",
+                            lineage.active_count, HashDreamsTraceWords(lineage.d8_input),
+                            HashDreamsTraceWords(lineage.d8_output));
+            }
+        }
+    }
     if (order_dreams_sculpt_candidate) {
         scheduler.Finish();
         std::array<u32, 35> gds_after{};
@@ -27018,6 +27711,112 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
                             "sequence={} counters={}->{} / {}->{}",
                             chain.active_count, chain.list_output.size() / 2, chain.list_sequence,
                             chain.initial_a, chain.final_a, chain.initial_b, chain.final_b);
+            }
+        }
+    }
+    if (capture_dreams_upstream_list) {
+        auto& lineage = g_dreams_upstream_lineage_capture;
+        using Phase = DreamsUpstreamLineageCaptureState::Phase;
+        if (lineage.phase != Phase::Capturing7aa ||
+            lineage.list_sequence != g_compute_dispatch_sequence || cs.buffers.empty() ||
+            cs.buffers[0].IsSpecial()) {
+            FailDreamsUpstreamLineageCapture("matched 7aa post-dispatch state is invalid");
+        } else {
+            const auto output = cs.buffers[0].GetSharp(cs);
+            vk::DescriptorBufferInfo output_bound{};
+            u64 output_binding_size{};
+            u64 output_logical_offset{};
+            bool output_valid = resolve_upstream_bound_binding(
+                0, output, output_bound, output_binding_size, output_logical_offset);
+            output_valid &= output_bound.offset == lineage.list_output_bound_offset &&
+                            output_bound.range == lineage.list_output_bound_range &&
+                            output_logical_offset == lineage.list_output_logical_offset;
+
+            if (output_valid) {
+                // Establish the post-dispatch counter boundary before sizing either output
+                // partition. The following exact transfer then reads only emitted records.
+                scheduler.Finish();
+            }
+            constexpr auto CounterIndices =
+                Shader::DreamsCompat::VisibilityListOrderedCounterIndices;
+            const auto* capture_gds = buffer_cache.GetGdsBuffer();
+            if (output_valid &&
+                CounterIndices[1] * sizeof(u32) + sizeof(u32) <=
+                    capture_gds->mapped_data.size()) {
+                std::memcpy(&lineage.list_final_counters[0],
+                            capture_gds->mapped_data.data() + CounterIndices[0] * sizeof(u32),
+                            sizeof(u32));
+                std::memcpy(&lineage.list_final_counters[1],
+                            capture_gds->mapped_data.data() + CounterIndices[1] * sizeof(u32),
+                            sizeof(u32));
+            } else {
+                output_valid = false;
+            }
+
+            u64 total_delta{};
+            for (u32 partition = 0; partition < 2 && output_valid; ++partition) {
+                if (lineage.list_final_counters[partition] <
+                    lineage.list_initial_counters[partition]) {
+                    output_valid = false;
+                    break;
+                }
+                const u32 delta = lineage.list_final_counters[partition] -
+                                  lineage.list_initial_counters[partition];
+                if (delta > lineage.active_count) {
+                    output_valid = false;
+                    break;
+                }
+                total_delta += delta;
+            }
+            output_valid &= total_delta <= lineage.active_count;
+            std::array<std::vector<u32>, 2> partition_words;
+            std::vector<DreamsBoundBufferCaptureRegion> regions;
+            regions.reserve(2);
+            for (u32 partition = 0; partition < 2 && output_valid; ++partition) {
+                const u32 delta = lineage.list_final_counters[partition] -
+                                  lineage.list_initial_counters[partition];
+                const u64 first = lineage.list_initial_counters[partition];
+                const u64 relative = first * 2 * sizeof(u32);
+                const u64 capture_bytes = u64{delta} * 2 * sizeof(u32);
+                if (relative > output_binding_size ||
+                    capture_bytes > output_binding_size - relative) {
+                    output_valid = false;
+                    break;
+                }
+                partition_words[partition].resize(u64{delta} * 2);
+                if (delta != 0) {
+                    regions.push_back({
+                        .source = output_bound,
+                        .relative_offset = output_logical_offset + relative,
+                        .destination = {
+                            reinterpret_cast<u8*>(partition_words[partition].data()),
+                            partition_words[partition].size() * sizeof(u32)},
+                    });
+                }
+            }
+            if (output_valid) {
+                output_valid =
+                    ReadDreamsBoundBufferRegionsForCapture(scheduler, buffer_cache, regions);
+            }
+            if (!output_valid) {
+                FailDreamsUpstreamLineageCapture(
+                    "exact 7aa output read or ordered-counter delta is invalid");
+            } else {
+                lineage.list_output.clear();
+                lineage.list_output.reserve(total_delta);
+                for (u32 partition = 0; partition < 2; ++partition) {
+                    const u32 delta = lineage.list_final_counters[partition] -
+                                      lineage.list_initial_counters[partition];
+                    for (u32 index = 0; index < delta; ++index) {
+                        lineage.list_output.push_back({
+                            .partition = partition,
+                            .position = lineage.list_initial_counters[partition] + index,
+                            .words = {partition_words[partition][index * 2],
+                                      partition_words[partition][index * 2 + 1]},
+                        });
+                    }
+                }
+                CompleteDreamsUpstreamLineageCapture();
             }
         }
     }

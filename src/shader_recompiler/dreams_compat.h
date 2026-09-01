@@ -1228,6 +1228,18 @@ inline bool CaptureVs370Interface() {
     return enabled;
 }
 
+// One-shot host lineage capture for the sculpt visibility pipeline.  This deliberately remains
+// separate from CaptureOrderedChain(): the latter also instruments QueueProducer, several B1
+// writers, and VS370.  The upstream lineage capture needs only B535's fixed-slot membership
+// records; d8 and 7aa are captured from their exact bound Vulkan buffers by the rasterizer.
+inline bool CaptureUpstreamLineage() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_UPSTREAM_CHAIN_CAPTURE_DIR");
+        return value != nullptr && value[0] != '\0';
+    }();
+    return enabled;
+}
+
 inline bool CaptureCe3ReadConst() {
     static const bool enabled = [] {
         const char* value = std::getenv("SHADPS4_DREAMS_CE3_READCONST_CAPTURE");
@@ -1271,7 +1283,8 @@ inline bool CaptureB535Membership() {
         return (value != nullptr && value[0] == '1' && value[1] == '\0') ||
                (instruction_trace != nullptr && instruction_trace[0] == '1' &&
                 instruction_trace[1] == '\0') ||
-               (ordered_chain != nullptr && ordered_chain[0] != '\0');
+               (ordered_chain != nullptr && ordered_chain[0] != '\0') ||
+               CaptureUpstreamLineage();
     }();
     return enabled;
 }
