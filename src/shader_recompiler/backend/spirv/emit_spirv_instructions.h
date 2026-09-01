@@ -47,7 +47,7 @@ void EmitPrologue(EmitContext& ctx);
 void EmitEpilogue(EmitContext& ctx);
 void EmitDiscard(EmitContext& ctx);
 void EmitDiscardCond(EmitContext& ctx, Id condition);
-void EmitCe3CoverageInitial(EmitContext& ctx);
+void EmitCe3CoverageSample(EmitContext& ctx, u32 site, Id emitted);
 void EmitCe3CoverageConditional(EmitContext& ctx, Id condition);
 void EmitCe3CoverageUnconditional(EmitContext& ctx);
 void EmitDebugPrint(EmitContext& ctx, IR::Inst* inst, Id arg0, Id arg1, Id arg2, Id arg3, Id arg4);

@@ -7925,6 +7925,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::KeysBaseDword) * sizeof(u32);
     constexpr u32 Ce3CoverageTraceKeysSize =
         Shader::DreamsCompat::Ce3CoverageTrace::Slots * sizeof(u32);
+    constexpr u64 Ce3CoverageTraceParam1YOffset =
+        static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::Param1YBaseDword) * sizeof(u32);
+    constexpr u64 Ce3CoverageTraceFragXMinOffset =
+        static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::FragXMinBaseDword) * sizeof(u32);
+    constexpr u64 Ce3CoverageTraceFragYMinOffset =
+        static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::FragYMinBaseDword) * sizeof(u32);
     static bool dreams_ce3_coverage_trace_complete{};
     static u32 dreams_ce3_coverage_trace_misses{};
     const bool dreams_ce3_coverage_trace_target =
@@ -10001,6 +10007,15 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                                                  Ce3CoverageTraceSize, 0);
             dreams_ce3_coverage_trace_gds->Fill(
                 Ce3CoverageTraceKeysOffset, Ce3CoverageTraceKeysSize,
+                Shader::DreamsCompat::Ce3CoverageTrace::ClaimSentinel);
+            dreams_ce3_coverage_trace_gds->Fill(
+                Ce3CoverageTraceParam1YOffset, Ce3CoverageTraceKeysSize,
+                Shader::DreamsCompat::Ce3CoverageTrace::ClaimSentinel);
+            dreams_ce3_coverage_trace_gds->Fill(
+                Ce3CoverageTraceFragXMinOffset, Ce3CoverageTraceKeysSize,
+                Shader::DreamsCompat::Ce3CoverageTrace::ClaimSentinel);
+            dreams_ce3_coverage_trace_gds->Fill(
+                Ce3CoverageTraceFragYMinOffset, Ce3CoverageTraceKeysSize,
                 Shader::DreamsCompat::Ce3CoverageTrace::ClaimSentinel);
             dreams_ce3_coverage_trace_gds->Fill(Ce3CoverageTraceArmOffset, sizeof(u32), 1);
             dreams_ce3_coverage_trace_armed = true;
@@ -13792,25 +13807,54 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             return capture[absolute_dword - Capture::BaseDword];
         };
         const u32 miss_initial = word(Capture::MissInitialDword);
+        const u32 miss_raymarch_sample = word(Capture::MissRaymarchSampleDword);
         const u32 miss_conditional_true = word(Capture::MissConditionalTrueDword);
         const u32 miss_conditional_false = word(Capture::MissConditionalFalseDword);
         const u32 miss_unconditional = word(Capture::MissUnconditionalDword);
-        const u64 misses = static_cast<u64>(miss_initial) + miss_conditional_true +
-                           miss_conditional_false + miss_unconditional;
+        const u32 param1_y_conflicts = word(Capture::Param1YConflictDword);
+        const u32 sample_bin_overflows = word(Capture::SampleBinOverflowDword);
+        const u64 misses = static_cast<u64>(miss_initial) + miss_raymarch_sample +
+                           miss_conditional_true + miss_conditional_false + miss_unconditional;
         u32 occupied{};
+        u32 metadata_missing_rows{};
+        u32 initial_bin_mismatch_rows{};
         u64 initial_total{};
+        u64 initial_sample_low_total{};
+        u64 initial_sample_high_total{};
+        u64 raymarch_sample_low_total{};
+        u64 raymarch_sample_high_total{};
         u64 conditional_true_total{};
         u64 conditional_false_total{};
         u64 unconditional_total{};
         std::string coverage =
-            "slot\tparam1\tatlas_id\tinitial\tconditional_total\tconditional_true\t"
+            "slot\tparam1\tparam1_y\tatlas_id\tfrag_x_min\tfrag_x_max\tfrag_y_min\t"
+            "frag_y_max\tinitial\tinitial_sample_lt_half\tinitial_sample_ge_half\t"
+            "raymarch_sample_total\traymarch_sample_lt_half\t"
+            "raymarch_sample_ge_half\tconditional_total\tconditional_true\t"
             "conditional_false\tunconditional\tterminal_total\n";
         for (u32 slot = 0; slot < Capture::Slots; ++slot) {
             const u32 key = word(Capture::KeysBaseDword + slot);
             if (key == Capture::ClaimSentinel) {
                 continue;
             }
+            const u32 param1_y = word(Capture::Param1YBaseDword + slot);
+            const u32 frag_x_min_bits = word(Capture::FragXMinBaseDword + slot);
+            const u32 frag_x_max_bits = word(Capture::FragXMaxBaseDword + slot);
+            const u32 frag_y_min_bits = word(Capture::FragYMinBaseDword + slot);
+            const u32 frag_y_max_bits = word(Capture::FragYMaxBaseDword + slot);
+            const float frag_x_min = std::bit_cast<float>(frag_x_min_bits);
+            const float frag_x_max = std::bit_cast<float>(frag_x_max_bits);
+            const float frag_y_min = std::bit_cast<float>(frag_y_min_bits);
+            const float frag_y_max = std::bit_cast<float>(frag_y_max_bits);
             const u32 initial = word(Capture::InitialSampleBaseDword + slot);
+            const u32 initial_bins = word(Capture::InitialSampleBinsBaseDword + slot);
+            const u32 initial_sample_low = initial_bins & Capture::PackedBinMask;
+            const u32 initial_sample_high = initial_bins >> 16;
+            const u32 raymarch_bins = word(Capture::RaymarchSampleBinsBaseDword + slot);
+            const u32 raymarch_sample_low = raymarch_bins & Capture::PackedBinMask;
+            const u32 raymarch_sample_high = raymarch_bins >> 16;
+            const u64 raymarch_sample_total =
+                static_cast<u64>(raymarch_sample_low) + raymarch_sample_high;
             const u32 conditional_true = word(Capture::ConditionalTrueBaseDword + slot);
             const u32 conditional_false = word(Capture::ConditionalFalseBaseDword + slot);
             const u32 unconditional = word(Capture::UnconditionalBaseDword + slot);
@@ -13818,15 +13862,32 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                 static_cast<u64>(conditional_true) + conditional_false;
             const u64 terminal_total = conditional_total + unconditional;
             coverage += fmt::format(
-                "{}\t{:#010x}\t{:#08x}\t{}\t{}\t{}\t{}\t{}\t{}\n", slot, key,
-                key & 0x00ffffff, initial, conditional_total, conditional_true,
-                conditional_false, unconditional, terminal_total);
+                "{}\t{:#010x}\t{:#010x}\t{:#08x}\t{:.9g}\t{:.9g}\t{:.9g}\t{:.9g}\t"
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                slot, key, param1_y, key & 0x00ffffff, frag_x_min, frag_x_max,
+                frag_y_min, frag_y_max, initial, initial_sample_low, initial_sample_high,
+                raymarch_sample_total, raymarch_sample_low, raymarch_sample_high,
+                conditional_total, conditional_true, conditional_false, unconditional,
+                terminal_total);
             ++occupied;
+            metadata_missing_rows += param1_y == Capture::ClaimSentinel ||
+                                     frag_x_min_bits == Capture::ClaimSentinel ||
+                                     frag_y_min_bits == Capture::ClaimSentinel;
+            initial_bin_mismatch_rows +=
+                initial != static_cast<u64>(initial_sample_low) + initial_sample_high;
             initial_total += initial;
+            initial_sample_low_total += initial_sample_low;
+            initial_sample_high_total += initial_sample_high;
+            raymarch_sample_low_total += raymarch_sample_low;
+            raymarch_sample_high_total += raymarch_sample_high;
             conditional_true_total += conditional_true;
             conditional_false_total += conditional_false;
             unconditional_total += unconditional;
         }
+
+        const bool complete = occupied != 0 && misses == 0 && metadata_missing_rows == 0 &&
+                              param1_y_conflicts == 0 && sample_bin_overflows == 0 &&
+                              initial_bin_mismatch_rows == 0;
 
         bool files_ok{};
         if (const auto directory = DreamsCe3CoverageTraceDirectory()) {
@@ -13839,24 +13900,36 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                 *directory / "manifest.tsv",
                 fmt::format(
                     "field\tvalue\nshader\t{:#x}\nslots\t{}\nprobes\t{}\noccupied\t{}\n"
-                    "miss_initial\t{}\nmiss_conditional_true\t{}\n"
+                    "miss_initial\t{}\nmiss_raymarch_sample\t{}\n"
+                    "miss_conditional_true\t{}\n"
                     "miss_conditional_false\t{}\nmiss_unconditional\t{}\nmiss_total\t{}\n"
-                    "initial_total\t{}\nconditional_true_total\t{}\n"
+                    "metadata_missing_rows\t{}\nparam1_y_conflicts\t{}\n"
+                    "sample_bin_overflows\t{}\n"
+                    "initial_bin_mismatch_rows\t{}\ninitial_total\t{}\n"
+                    "initial_sample_lt_half_total\t{}\n"
+                    "initial_sample_ge_half_total\t{}\nraymarch_sample_total\t{}\n"
+                    "raymarch_sample_lt_half_total\t{}\n"
+                    "raymarch_sample_ge_half_total\t{}\nconditional_true_total\t{}\n"
                     "conditional_false_total\t{}\nunconditional_total\t{}\n"
                     "terminal_total\t{}\nraw_hash\t{:#x}\ncomplete\t{}\n",
                     Shader::DreamsCompat::Ce3ReadConstCaptureShader, Capture::Slots,
-                    Capture::Probes, occupied,
-                    miss_initial, miss_conditional_true, miss_conditional_false,
-                    miss_unconditional, misses, initial_total, conditional_true_total,
-                    conditional_false_total, unconditional_total,
+                    Capture::Probes, occupied, miss_initial, miss_raymarch_sample,
+                    miss_conditional_true, miss_conditional_false, miss_unconditional, misses,
+                    metadata_missing_rows, param1_y_conflicts, sample_bin_overflows,
+                    initial_bin_mismatch_rows, initial_total, initial_sample_low_total,
+                    initial_sample_high_total,
+                    raymarch_sample_low_total + raymarch_sample_high_total,
+                    raymarch_sample_low_total, raymarch_sample_high_total,
+                    conditional_true_total, conditional_false_total, unconditional_total,
                     conditional_true_total + conditional_false_total + unconditional_total,
-                    raw_hash, occupied != 0 && misses == 0));
-            if (files_ok && occupied != 0 && misses == 0) {
+                    raw_hash, complete));
+            if (files_ok && complete) {
                 files_ok &= WriteDreamsCaptureText(*directory / "complete.txt", "complete\n");
             } else if (files_ok && occupied != 0) {
                 files_ok &= WriteDreamsCaptureText(
                     *directory / "incomplete.txt",
-                    "Coverage table had unresolved bounded-probe collisions; rows are partial.\n");
+                    "Coverage trace had a collision, metadata conflict, bin overflow, or "
+                    "inconsistent sample count; rows are partial.\n");
             }
         }
 
@@ -13869,9 +13942,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             LOG_WARNING(
                 Render_Vulkan,
                 "Dreams ce3 coverage trace {} occupied={} misses={} initial={} conditional="
-                "{}/{} unconditional={} files_ok={} directory={}",
-                misses == 0 ? "complete" : "incomplete", occupied, misses, initial_total,
-                conditional_true_total, conditional_false_total, unconditional_total, files_ok,
+                "{}/{} unconditional={} sample0={}/{} sample1={}/{} files_ok={} directory={}",
+                complete ? "complete" : "incomplete", occupied, misses, initial_total,
+                conditional_true_total, conditional_false_total, unconditional_total,
+                initial_sample_low_total, initial_sample_high_total, raymarch_sample_low_total,
+                raymarch_sample_high_total, files_ok,
                 DreamsCe3CoverageTraceDirectory()->string());
         } else if (++dreams_ce3_coverage_trace_misses >= 8) {
             dreams_ce3_coverage_trace_complete = true;

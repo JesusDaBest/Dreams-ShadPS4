@@ -1014,20 +1014,41 @@ namespace Ce3CoverageTrace {
 constexpr u32 BaseDword =
     (A3LookupProducerTrace::BaseDword + A3LookupProducerTrace::DwordCount + 0xffU) & ~0xffU;
 constexpr u32 ArmDword = BaseDword;
-constexpr u32 Slots = 4096;
-constexpr u32 SlotBits = 12;
+// The complete 603-key edit-mode fixture has no insertion failures in this 2,048-slot table with
+// eight probes for the captured order, sorted/reverse order, or 100 shuffled orders. Runtime miss
+// counters remain authoritative: any collision still makes the capture explicitly incomplete.
+constexpr u32 Slots = 2048;
+constexpr u32 SlotBits = 11;
 constexpr u32 Probes = 8;
 constexpr u32 KeysBaseDword = BaseDword + 1;
-constexpr u32 InitialSampleBaseDword = KeysBaseDword + Slots;
-constexpr u32 ConditionalTrueBaseDword = InitialSampleBaseDword + Slots;
+constexpr u32 Param1YBaseDword = KeysBaseDword + Slots;
+constexpr u32 FragXMinBaseDword = Param1YBaseDword + Slots;
+constexpr u32 FragXMaxBaseDword = FragXMinBaseDword + Slots;
+constexpr u32 FragYMinBaseDword = FragXMaxBaseDword + Slots;
+constexpr u32 FragYMaxBaseDword = FragYMinBaseDword + Slots;
+constexpr u32 InitialSampleBaseDword = FragYMaxBaseDword + Slots;
+// Each packed sample-bin word holds two independent 16-bit counters. The low half counts atlas
+// samples below 0.5 (negative after ce3's `4 * sample - 2` decode); the high half counts samples
+// at or above 0.5. The overflow counter invalidates a capture before either half can wrap.
+constexpr u32 InitialSampleBinsBaseDword = InitialSampleBaseDword + Slots;
+constexpr u32 RaymarchSampleBinsBaseDword = InitialSampleBinsBaseDword + Slots;
+constexpr u32 ConditionalTrueBaseDword = RaymarchSampleBinsBaseDword + Slots;
 constexpr u32 ConditionalFalseBaseDword = ConditionalTrueBaseDword + Slots;
 constexpr u32 UnconditionalBaseDword = ConditionalFalseBaseDword + Slots;
 constexpr u32 MissInitialDword = UnconditionalBaseDword + Slots;
-constexpr u32 MissConditionalTrueDword = MissInitialDword + 1;
-constexpr u32 MissConditionalFalseDword = MissInitialDword + 2;
-constexpr u32 MissUnconditionalDword = MissInitialDword + 3;
-constexpr u32 DwordCount = MissUnconditionalDword - BaseDword + 1;
+constexpr u32 MissRaymarchSampleDword = MissInitialDword + 1;
+constexpr u32 MissConditionalTrueDword = MissRaymarchSampleDword + 1;
+constexpr u32 MissConditionalFalseDword = MissRaymarchSampleDword + 2;
+constexpr u32 MissUnconditionalDword = MissRaymarchSampleDword + 3;
+constexpr u32 Param1YConflictDword = MissRaymarchSampleDword + 4;
+constexpr u32 SampleBinOverflowDword = MissRaymarchSampleDword + 5;
+// Rejected bounded-probe events target this unused sink so metadata updates stay branchless before
+// the guest shader's ballot. No sink value is consumed or reported.
+constexpr u32 SinkDword = MissRaymarchSampleDword + 6;
+constexpr u32 DwordCount = SinkDword - BaseDword + 1;
 constexpr u32 ClaimSentinel = 0xffffffffU;
+constexpr u32 PackedBinMask = 0xffffU;
+constexpr u32 PackedBinHighIncrement = 1U << 16;
 static_assert(Slots == (1U << SlotBits));
 static_assert(Probes > 0 && Probes <= Slots);
 } // namespace Ce3CoverageTrace

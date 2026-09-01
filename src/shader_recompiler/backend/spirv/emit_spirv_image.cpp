@@ -220,8 +220,8 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
         if (DreamsCompat::CaptureCe3FleckTrace()) {
             EmitCe3FleckSampleCapture(ctx, site, coords, emitted);
         }
-        if (DreamsCompat::CaptureCe3CoverageTrace() && site == 0) {
-            EmitCe3CoverageInitial(ctx);
+        if (DreamsCompat::CaptureCe3CoverageTrace() && site < 2) {
+            EmitCe3CoverageSample(ctx, site, emitted);
         }
     }
     return emitted;
