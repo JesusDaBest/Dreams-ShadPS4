@@ -13838,13 +13838,14 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             files_ok &= WriteDreamsCaptureText(
                 *directory / "manifest.tsv",
                 fmt::format(
-                    "field\tvalue\nshader\t{:#x}\nslots\t{}\noccupied\t{}\n"
+                    "field\tvalue\nshader\t{:#x}\nslots\t{}\nprobes\t{}\noccupied\t{}\n"
                     "miss_initial\t{}\nmiss_conditional_true\t{}\n"
                     "miss_conditional_false\t{}\nmiss_unconditional\t{}\nmiss_total\t{}\n"
                     "initial_total\t{}\nconditional_true_total\t{}\n"
                     "conditional_false_total\t{}\nunconditional_total\t{}\n"
                     "terminal_total\t{}\nraw_hash\t{:#x}\ncomplete\t{}\n",
-                    Shader::DreamsCompat::Ce3ReadConstCaptureShader, Capture::Slots, occupied,
+                    Shader::DreamsCompat::Ce3ReadConstCaptureShader, Capture::Slots,
+                    Capture::Probes, occupied,
                     miss_initial, miss_conditional_true, miss_conditional_false,
                     miss_unconditional, misses, initial_total, conditional_true_total,
                     conditional_false_total, unconditional_total,
@@ -13855,7 +13856,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             } else if (files_ok && occupied != 0) {
                 files_ok &= WriteDreamsCaptureText(
                     *directory / "incomplete.txt",
-                    "Coverage table had unresolved two-probe collisions; rows are partial.\n");
+                    "Coverage table had unresolved bounded-probe collisions; rows are partial.\n");
             }
         }
 

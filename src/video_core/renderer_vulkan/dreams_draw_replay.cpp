@@ -44,7 +44,9 @@ constexpr u32 MaximumReplayInstances = Shader::DreamsCompat::Vs370InterfaceCaptu
 constexpr u32 ExpectedValidityMask = 0x0001ffff;
 constexpr u32 VsBufferCount = 5;
 constexpr u32 ReplayDescriptorCount = 16;
-constexpr vk::DeviceSize GdsBufferBytes = 32ULL * 1024 * 1024;
+// Match BufferCache's runtime GDS allocation so opt-in captures in the final private range remain
+// valid when the same shader is compiled and replayed by the standalone harness.
+constexpr vk::DeviceSize GdsBufferBytes = 52ULL * 1024 * 1024;
 constexpr std::array<u32, VsBufferCount> ExpectedVsBufferStrides{432, 4, 4, 8, 16};
 constexpr std::array<u16, ExpectedIndexCount> ExpectedIndices{
     2, 3, 0, 1, 5, 3, 7, 2, 6, 0, 4, 5, 6, 7,

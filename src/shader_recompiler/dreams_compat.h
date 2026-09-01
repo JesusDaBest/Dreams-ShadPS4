@@ -1006,13 +1006,17 @@ constexpr u32 RecordDword(u32 site, u32 field) {
 } // namespace Ce3FleckTrace
 // Separate whole-draw coverage inventory for ce3b8413. Keeping this mode independent from the
 // coordinate/sample trace avoids candidate-dependent capture branches before the guest's final
-// ballot. Each event uses two branchless direct-map probes; any unresolved collision invalidates
-// completeness rather than being attributed to the resident key.
+// ballot. Each event uses a bounded branchless probe sequence; any unresolved collision invalidates
+// completeness rather than being attributed to the resident key. Keep the table in the unused tail
+// of the 52 MiB private-GDS allocation so a complete edit-mode sculpt draw does not crowd the older
+// 8 MiB diagnostic ranges.
 namespace Ce3CoverageTrace {
 constexpr u32 BaseDword =
-    (Ce3FleckTrace::BaseDword + Ce3FleckTrace::DwordCount + 0xffU) & ~0xffU;
+    (A3LookupProducerTrace::BaseDword + A3LookupProducerTrace::DwordCount + 0xffU) & ~0xffU;
 constexpr u32 ArmDword = BaseDword;
-constexpr u32 Slots = 512;
+constexpr u32 Slots = 4096;
+constexpr u32 SlotBits = 12;
+constexpr u32 Probes = 8;
 constexpr u32 KeysBaseDword = BaseDword + 1;
 constexpr u32 InitialSampleBaseDword = KeysBaseDword + Slots;
 constexpr u32 ConditionalTrueBaseDword = InitialSampleBaseDword + Slots;
@@ -1024,7 +1028,8 @@ constexpr u32 MissConditionalFalseDword = MissInitialDword + 2;
 constexpr u32 MissUnconditionalDword = MissInitialDword + 3;
 constexpr u32 DwordCount = MissUnconditionalDword - BaseDword + 1;
 constexpr u32 ClaimSentinel = 0xffffffffU;
-static_assert((Slots & (Slots - 1)) == 0);
+static_assert(Slots == (1U << SlotBits));
+static_assert(Probes > 0 && Probes <= Slots);
 } // namespace Ce3CoverageTrace
 // Host-private storage for a diagnostic capture of the four dynamic ReadConst results consumed by
 // ce3b8413. The shader writes exactly what its BDA path returned; the host never reads or registers
@@ -1130,14 +1135,15 @@ static_assert(Vs370InterfaceCaptureBaseDword + Vs370InterfaceCaptureDwordCount <
 static_assert(Vs370InterfaceCaptureBaseDword + Vs370InterfaceCaptureDwordCount <=
               Ce3FleckTrace::BaseDword);
 static_assert(Ce3FleckTrace::BaseDword + Ce3FleckTrace::DwordCount <=
-              Ce3CoverageTrace::BaseDword);
-static_assert(Ce3CoverageTrace::BaseDword + Ce3CoverageTrace::DwordCount <=
               ImageGather3DConsumerCapture::BaseDword);
 static_assert(ImageGather3DConsumerCapture::BaseDword + ImageGather3DConsumerCapture::DwordCount <=
               ImageGather3DCapture::BaseDword);
 static_assert(ImageGather3DCapture::BaseDword + ImageGather3DCapture::DwordCount <=
               Ce3ReadConstCaptureBaseDword);
 static_assert(Ce3ReadConstCaptureBaseDword + Ce3ReadConstCaptureDwordCount <= 0x200000);
+static_assert(Ce3CoverageTrace::BaseDword >=
+              A3LookupProducerTrace::BaseDword + A3LookupProducerTrace::DwordCount);
+static_assert(Ce3CoverageTrace::BaseDword + Ce3CoverageTrace::DwordCount <= 0xd00000);
 
 inline bool CaptureVs370Interface() {
     static const bool enabled = [] {

@@ -129,36 +129,35 @@ static void EmitCe3CoverageCounter(EmitContext& ctx, Id counter_base, Id miss_co
         ctx.U32[1],
         ctx.OpBitwiseOr(
             ctx.U32[1],
-            ctx.OpShiftRightLogical(ctx.U32[1], hash, ctx.ConstU32(9U)),
+            ctx.OpShiftRightLogical(ctx.U32[1], hash, ctx.ConstU32(Capture::SlotBits)),
             ctx.u32_one_value),
         slot_mask);
-    const Id slot1 = ctx.OpBitwiseAnd(
-        ctx.U32[1], ctx.OpIAdd(ctx.U32[1], slot0, step), slot_mask);
     const auto key_index = [&](Id slot) {
         return ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(Capture::KeysBaseDword), slot);
     };
-    const Id previous0 = ctx.OpAtomicCompareExchange(
-        ctx.U32[1], pointer(key_index(slot0)), device_scope, acquire_release_semantics,
-        acquire_semantics, candidate, ctx.ConstU32(Capture::ClaimSentinel));
-    const Id available0 = ctx.OpLogicalOr(
-        ctx.U1[1],
-        ctx.OpIEqual(ctx.U1[1], previous0, ctx.ConstU32(Capture::ClaimSentinel)),
-        ctx.OpIEqual(ctx.U1[1], previous0, candidate));
-    const Id accepted0 = ctx.OpLogicalAnd(ctx.U1[1], valid, available0);
-    const Id compare1 = ctx.OpSelect(ctx.U32[1], accepted0, candidate,
-                                     ctx.ConstU32(Capture::ClaimSentinel));
-    const Id previous1 = ctx.OpAtomicCompareExchange(
-        ctx.U32[1], pointer(key_index(slot1)), device_scope, acquire_release_semantics,
-        acquire_semantics, candidate, compare1);
-    const Id available1 = ctx.OpLogicalOr(
-        ctx.U1[1],
-        ctx.OpIEqual(ctx.U1[1], previous1, ctx.ConstU32(Capture::ClaimSentinel)),
-        ctx.OpIEqual(ctx.U1[1], previous1, candidate));
-    const Id accepted1 = ctx.OpLogicalAnd(
-        ctx.U1[1], valid,
-        ctx.OpLogicalAnd(ctx.U1[1], ctx.OpLogicalNot(ctx.U1[1], accepted0), available1));
-    const Id accepted = ctx.OpLogicalOr(ctx.U1[1], accepted0, accepted1);
-    const Id selected_slot = ctx.OpSelect(ctx.U32[1], accepted0, slot0, slot1);
+    Id accepted = ctx.false_value;
+    Id selected_slot = slot0;
+    for (u32 probe = 0; probe < Capture::Probes; ++probe) {
+        const Id probe_offset = ctx.OpIMul(ctx.U32[1], step, ctx.ConstU32(probe));
+        const Id slot = ctx.OpBitwiseAnd(
+            ctx.U32[1], ctx.OpIAdd(ctx.U32[1], slot0, probe_offset), slot_mask);
+        // Once this invocation has a slot, compare against the candidate instead of the sentinel.
+        // That keeps every probe in straight-line SPIR-V without claiming any additional slots.
+        const Id comparator = ctx.OpSelect(ctx.U32[1], accepted, candidate,
+                                           ctx.ConstU32(Capture::ClaimSentinel));
+        const Id previous = ctx.OpAtomicCompareExchange(
+            ctx.U32[1], pointer(key_index(slot)), device_scope, acquire_release_semantics,
+            acquire_semantics, candidate, comparator);
+        const Id available = ctx.OpLogicalOr(
+            ctx.U1[1],
+            ctx.OpIEqual(ctx.U1[1], previous, ctx.ConstU32(Capture::ClaimSentinel)),
+            ctx.OpIEqual(ctx.U1[1], previous, candidate));
+        const Id accepted_here = ctx.OpLogicalAnd(
+            ctx.U1[1], valid,
+            ctx.OpLogicalAnd(ctx.U1[1], ctx.OpLogicalNot(ctx.U1[1], accepted), available));
+        selected_slot = ctx.OpSelect(ctx.U32[1], accepted_here, slot, selected_slot);
+        accepted = ctx.OpLogicalOr(ctx.U1[1], accepted, accepted_here);
+    }
     const Id counter_index = ctx.OpIAdd(ctx.U32[1], counter_base, selected_slot);
     const Id target = ctx.OpSelect(ctx.U32[1], accepted, counter_index, miss_counter);
     ctx.OpAtomicIAdd(ctx.U32[1], pointer(target), device_scope, acquire_release_semantics,
