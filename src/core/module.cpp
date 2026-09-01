@@ -517,7 +517,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
                 IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CSG_ACTION_TRACE") &&
                 !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_INPUT_TRACE") &&
-                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE")) {
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_BOUNDARY_TRACE")) {
                 constexpr std::array<std::pair<u64, u8>, 1> DreamsCsgActionTracePoints{{
                     {0x720950, 0x55},  // Arm at the start of one model build.
                 }};
@@ -543,7 +544,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
                 IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_INPUT_TRACE") &&
-                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE")) {
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_BOUNDARY_TRACE")) {
                 // Tag the GPU work submitted by each model build without enabling the much
                 // heavier full model-record trace. Both replaced instructions are emulated by
                 // HandleDreamsModelRecordTrace.
@@ -571,7 +573,44 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             }
 
             if (MemoryPatcher::g_game_serial == "CUSA04301" &&
-                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE")) {
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_BOUNDARY_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_INPUT_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_CSG_ACTION_TRACE")) {
+                // Follow one model from its guest request through CSG return and CPU aggregation
+                // without enabling renderer-wide diagnostics. Every replaced instruction is
+                // emulated by HandleDreamsModelBoundaryTrace.
+                constexpr std::array<std::pair<u64, u8>, 7> DreamsModelBoundaryTracePoints{{
+                    {0x720950, 0x55},  // Begin constructing one model record.
+                    {0x723870, 0x49},  // Return from model-record construction.
+                    {0x12850c1, 0xe8}, // Enter Dreams' CSG voxel compute pass.
+                    {0x12850c8, 0x75}, // Branch on the CSG pass status.
+                    {0x1281f5e, 0x48}, // Inspect one completed CSG replay result.
+                    {0x1281f6e, 0x41}, // Read that replay's output count.
+                    {0x1282390, 0x0f}, // Inspect the final aggregate count.
+                }};
+                bool trace_points_match = true;
+                for (const auto [offset, expected] : DreamsModelBoundaryTracePoints) {
+                    if (offset >= base_size ||
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) != expected) {
+                        trace_points_match = false;
+                        break;
+                    }
+                }
+                if (trace_points_match) {
+                    for (const auto [offset, expected] : DreamsModelBoundaryTracePoints) {
+                        *reinterpret_cast<u8*>(base_virtual_addr + offset) = 0xcc;
+                    }
+                    LOG_WARNING(Core_Linker, "Applied focused Dreams model-boundary trace");
+                } else {
+                    LOG_WARNING(Core_Linker,
+                                "Dreams model-boundary trace did not match this executable");
+                }
+            }
+
+            if (MemoryPatcher::g_game_serial == "CUSA04301" &&
+                IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_RECORD_TRACE") &&
+                !IsEnvironmentFlagEnabled("SHADPS4_DREAMS_MODEL_BOUNDARY_TRACE")) {
                 constexpr std::array<std::pair<u64, u8>, 11> DreamsModelRecordTracePoints{{
                     {0x7200b0, 0x55},   // Reset allocated model records.
                     {0x720950, 0x55},   // Begin constructing one model record.

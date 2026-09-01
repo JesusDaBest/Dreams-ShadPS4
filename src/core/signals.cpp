@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <span>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
@@ -71,6 +72,43 @@ static void AppendDreamsCsgCompletionTrace(const char* buffer, const int length)
     // materially perturb the short waits this trace is intended to measure.
     static const HANDLE file = CreateFileW(
         L"dreams-csg-completion-trace.txt", FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(file, buffer, static_cast<DWORD>(length), &written, nullptr);
+    }
+}
+
+static bool DreamsModelBoundaryTraceEnabled() noexcept {
+    static const bool enabled = [] {
+        char value[2]{};
+        const bool boundary =
+            GetEnvironmentVariableA("SHADPS4_DREAMS_MODEL_BOUNDARY_TRACE", value,
+                                    sizeof(value)) != 0 &&
+            value[0] == '1';
+        char record_value[2]{};
+        const bool full_record =
+            GetEnvironmentVariableA("SHADPS4_DREAMS_MODEL_RECORD_TRACE", record_value,
+                                    sizeof(record_value)) != 0 &&
+            record_value[0] == '1';
+        return boundary && !full_record;
+    }();
+    return enabled;
+}
+
+static bool DreamsModelBoundaryCaptureEnabled() noexcept {
+    return DreamsModelBoundaryTraceEnabled() &&
+           GetFileAttributesW(L"dreams-model-boundary.capture") != INVALID_FILE_ATTRIBUTES;
+}
+
+static void AppendDreamsModelBoundaryTrace(const char* buffer, const int length) noexcept {
+    if (length <= 0) {
+        return;
+    }
+    // Keep one handle for the run so this diagnostic does not add an open/close pair to every
+    // CSG replay. The capture marker controls which model builds are written.
+    static const HANDLE file = CreateFileW(
+        L"dreams-model-boundary-trace.txt", FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
@@ -174,6 +212,29 @@ static u16 ReadDreamsU16(const HANDLE process, const u64 address) noexcept {
     ReadProcessMemory(process, reinterpret_cast<const void*>(address), &value, sizeof(value),
                       &bytes_read);
     return value;
+}
+
+static bool ReadDreamsBytes(const HANDLE process, const u64 address, void* destination,
+                            const SIZE_T size) noexcept {
+    if (address == 0 || destination == nullptr || size == 0) {
+        return false;
+    }
+    SIZE_T bytes_read = 0;
+    return ReadProcessMemory(process, reinterpret_cast<const void*>(address), destination, size,
+                             &bytes_read) &&
+           bytes_read == size;
+}
+
+static u64 HashDreamsBytes(const void* source, const SIZE_T size) noexcept {
+    constexpr u64 FnvOffsetBasis = 1469598103934665603ULL;
+    constexpr u64 FnvPrime = 1099511628211ULL;
+    const auto* bytes = static_cast<const u8*>(source);
+    u64 hash = FnvOffsetBasis;
+    for (SIZE_T index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= FnvPrime;
+    }
+    return hash;
 }
 
 static bool IsDreamsVisibleSculptsWarningSource(const HANDLE process,
@@ -791,6 +852,269 @@ static bool ActivateDreamsCsgActionTrace(const u32 target) noexcept {
         trace, sizeof(trace), _TRUNCATE, "csg_action_trace=begin tick=%llu target=%u\r\n",
         static_cast<unsigned long long>(GetTickCount64()), target);
     AppendDreamsCpuRootTrace(trace, trace_length);
+    return true;
+}
+
+static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexcept {
+    constexpr u64 DreamsModelBuildOffset = 0x720950;
+    constexpr u64 DreamsModelBuildReturnOffset = 0x723870;
+    constexpr u64 DreamsCsgCallOffset = 0x12850c1;
+    constexpr u64 DreamsCsgReturnBranchOffset = 0x12850c8;
+    constexpr u64 DreamsCsgReplayResultOffset = 0x1281f5e;
+    constexpr u64 DreamsCsgReplayCountOffset = 0x1281f6e;
+    constexpr u64 DreamsModelAggregateCountOffset = 0x1282390;
+    constexpr u64 DreamsModelResultPointerOffset = 0x77ed7d8;
+    constexpr u64 DreamsCoordinateListPointerOffset = 0x782ed50;
+    constexpr u64 DreamsCoordinateListCountOffset = 0x782ed58;
+    constexpr u32 CoordinateSampleLimit = 4096;
+
+    if (!DreamsModelBoundaryTraceEnabled() || exception == nullptr ||
+        exception->ExceptionRecord == nullptr || exception->ContextRecord == nullptr ||
+        MemoryPatcher::g_eboot_address == 0) {
+        return false;
+    }
+
+    const u64 breakpoint_address =
+        reinterpret_cast<u64>(exception->ExceptionRecord->ExceptionAddress);
+    const u64 base = MemoryPatcher::g_eboot_address;
+    const u64 guest_offset = breakpoint_address - base;
+    if (guest_offset != DreamsModelBuildOffset &&
+        guest_offset != DreamsModelBuildReturnOffset && guest_offset != DreamsCsgCallOffset &&
+        guest_offset != DreamsCsgReturnBranchOffset &&
+        guest_offset != DreamsCsgReplayResultOffset &&
+        guest_offset != DreamsCsgReplayCountOffset &&
+        guest_offset != DreamsModelAggregateCountOffset) {
+        return false;
+    }
+
+    struct BoundaryState {
+        u32 build_sequence{};
+        u32 model_id{};
+        u32 target{};
+        u32 csg_sequence{};
+        bool active{};
+    };
+    static thread_local BoundaryState state{};
+    static std::atomic<u32> build_sequence{0};
+    static thread_local std::array<u32, CoordinateSampleLimit> coordinate_sample{};
+
+    CONTEXT* context = exception->ContextRecord;
+    const HANDLE process = GetCurrentProcess();
+
+    const auto trace_snapshot = [&](const char* kind, const u64 result, const u32 extra,
+                                    const u32 status) noexcept {
+        if (!state.active) {
+            return;
+        }
+        const u64 list_pointer =
+            ReadDreamsU64(process, base + DreamsCoordinateListPointerOffset);
+        const u32 list_count = ReadDreamsU32(process, base + DreamsCoordinateListCountOffset);
+        const u32 sample_count = std::min(list_count, CoordinateSampleLimit);
+        const bool list_valid =
+            sample_count == 0 ||
+            ReadDreamsBytes(process, list_pointer, coordinate_sample.data(),
+                            static_cast<SIZE_T>(sample_count) * sizeof(u32));
+        const u64 list_hash =
+            list_valid && sample_count != 0
+                ? HashDreamsBytes(coordinate_sample.data(),
+                                  static_cast<SIZE_T>(sample_count) * sizeof(u32))
+                : 0;
+        u32 min_x = 0xffffffffu;
+        u32 min_y = 0xffffffffu;
+        u32 min_z = 0xffffffffu;
+        u32 max_x = 0;
+        u32 max_y = 0;
+        u32 max_z = 0;
+        if (list_valid) {
+            for (u32 index = 0; index < sample_count; ++index) {
+                const u32 packed = coordinate_sample[index];
+                const u32 x = packed & 0x3ffu;
+                const u32 y = (packed >> 10) & 0x3ffu;
+                const u32 z = (packed >> 20) & 0x3ffu;
+                min_x = std::min(min_x, x);
+                min_y = std::min(min_y, y);
+                min_z = std::min(min_z, z);
+                max_x = std::max(max_x, x);
+                max_y = std::max(max_y, y);
+                max_z = std::max(max_z, z);
+            }
+        }
+
+        char buffer[1280]{};
+        const int length = _snprintf_s(
+            buffer, sizeof(buffer), _TRUNCATE,
+            "model_boundary kind=%s tick=%llu thread=%lu build=%u model=%u target=%u "
+            "csg=%u status=%u extra=%u result=0x%016llx "
+            "values=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u "
+            "min=%u,%u,%u max=%u,%u,%u accum=%u,%u,%u,%u,%u,%u "
+            "list=0x%016llx count=%u sampled=%u valid=%u hash=0x%016llx "
+            "sample_min=%u,%u,%u sample_max=%u,%u,%u\r\n",
+            kind, static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+            state.build_sequence, state.model_id, state.target, state.csg_sequence, status, extra,
+            static_cast<unsigned long long>(result), ReadDreamsU32(process, result),
+            ReadDreamsU32(process, result + 0x4), ReadDreamsU32(process, result + 0x8),
+            ReadDreamsU32(process, result + 0xc), ReadDreamsU32(process, result + 0x18),
+            ReadDreamsU32(process, result + 0x1c), ReadDreamsU32(process, result + 0x20),
+            ReadDreamsU32(process, result + 0x24), ReadDreamsU32(process, result + 0x28),
+            ReadDreamsU32(process, result + 0x48), ReadDreamsU32(process, result + 0x2c),
+            ReadDreamsU32(process, result + 0x30), ReadDreamsU32(process, result + 0x34),
+            ReadDreamsU32(process, result + 0x38), ReadDreamsU32(process, result + 0x3c),
+            ReadDreamsU32(process, result + 0x40), ReadDreamsU32(process, result + 0x50),
+            ReadDreamsU32(process, result + 0x54), ReadDreamsU32(process, result + 0x58),
+            ReadDreamsU32(process, result + 0x5c), ReadDreamsU32(process, result + 0x60),
+            ReadDreamsU32(process, result + 0x64),
+            static_cast<unsigned long long>(list_pointer), list_count, sample_count,
+            list_valid ? 1 : 0, static_cast<unsigned long long>(list_hash), min_x, min_y, min_z,
+            max_x, max_y, max_z);
+        AppendDreamsModelBoundaryTrace(buffer, length);
+    };
+
+    if (guest_offset == DreamsModelBuildOffset) {
+        state.build_sequence = build_sequence.fetch_add(1, std::memory_order_relaxed);
+        state.model_id = static_cast<u32>(context->R8);
+        state.target = static_cast<u32>(context->Rcx);
+        state.csg_sequence = 0;
+        state.active = DreamsModelBoundaryCaptureEnabled();
+        if (state.active) {
+            char buffer[384]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "model_boundary kind=build tick=%llu thread=%lu build=%u model=%u target=%u "
+                "args=%u,%u,%u,%u source=0x%016llx caller=0x%016llx\r\n",
+                static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                state.build_sequence, state.model_id, state.target,
+                static_cast<u32>(context->Rdi), static_cast<u32>(context->Rdx),
+                static_cast<u32>(context->R8), static_cast<u32>(context->R9),
+                static_cast<unsigned long long>(context->Rsi),
+                static_cast<unsigned long long>(ReadDreamsU64(process, context->Rsp)));
+            AppendDreamsModelBoundaryTrace(buffer, length);
+        }
+        // Emulate `push rbp`.
+        context->Rsp -= sizeof(u64);
+        SIZE_T bytes_written = 0;
+        WriteProcessMemory(process, reinterpret_cast<void*>(context->Rsp), &context->Rbp,
+                           sizeof(u64), &bytes_written);
+        context->Rip = breakpoint_address + 1;
+        return true;
+    }
+
+    if (guest_offset == DreamsModelBuildReturnOffset) {
+        if (state.active) {
+            char buffer[320]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "model_boundary kind=return tick=%llu thread=%lu build=%u model=%u target=%u "
+                "csg=%u status=%u frame_target=%u\r\n",
+                static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                state.build_sequence, state.model_id, state.target, state.csg_sequence,
+                static_cast<u32>(context->Rax), ReadDreamsU32(process, context->Rsp + 0x9c));
+            AppendDreamsModelBoundaryTrace(buffer, length);
+        }
+        state.active = false;
+        // Emulate `mov rcx, qword ptr [r15]`.
+        context->Rcx = ReadDreamsU64(process, context->R15);
+        context->Rip = breakpoint_address + 3;
+        return true;
+    }
+
+    if (guest_offset == DreamsCsgCallOffset) {
+        if (state.active) {
+            ++state.csg_sequence;
+            std::array<u32, 24> config{};
+            std::array<u32, 48> request{};
+            const bool config_valid =
+                ReadDreamsBytes(process, context->Rdx, config.data(), sizeof(config));
+            const bool request_valid =
+                ReadDreamsBytes(process, context->Rdi, request.data(), sizeof(request));
+            const u64 config_hash =
+                config_valid ? HashDreamsBytes(config.data(), sizeof(config)) : 0;
+            const u64 request_hash =
+                request_valid ? HashDreamsBytes(request.data(), sizeof(request)) : 0;
+            char buffer[2048]{};
+            int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "model_boundary kind=csg_call tick=%llu thread=%lu build=%u model=%u target=%u "
+                "csg=%u request=0x%016llx config=0x%016llx rsi=%u r8=%u r9=%u flags=%u "
+                "request_valid=%u request_hash=0x%016llx config_valid=%u "
+                "config_hash=0x%016llx config_words=",
+                static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                state.build_sequence, state.model_id, state.target, state.csg_sequence,
+                static_cast<unsigned long long>(context->Rdi),
+                static_cast<unsigned long long>(context->Rdx), static_cast<u32>(context->Rsi),
+                static_cast<u32>(context->R8), static_cast<u32>(context->R9),
+                ReadDreamsU32(process, context->Rsp), request_valid ? 1 : 0,
+                static_cast<unsigned long long>(request_hash), config_valid ? 1 : 0,
+                static_cast<unsigned long long>(config_hash));
+            const auto append_words = [&](const std::span<const u32> words) noexcept {
+                for (SIZE_T index = 0; index < words.size() && length > 0 &&
+                                             static_cast<SIZE_T>(length) < sizeof(buffer);
+                     ++index) {
+                    const int appended = _snprintf_s(
+                        buffer + length, sizeof(buffer) - static_cast<SIZE_T>(length), _TRUNCATE,
+                        index + 1 == words.size() ? "%08x" : "%08x,", words[index]);
+                    if (appended <= 0) {
+                        length = -1;
+                        break;
+                    }
+                    length += appended;
+                }
+            };
+            append_words(config);
+            if (length > 0) {
+                const int appended = _snprintf_s(
+                    buffer + length, sizeof(buffer) - static_cast<SIZE_T>(length), _TRUNCATE,
+                    " request_words=");
+                length = appended > 0 ? length + appended : -1;
+            }
+            append_words(request);
+            if (length > 0 && static_cast<SIZE_T>(length) + 2 < sizeof(buffer)) {
+                buffer[length++] = '\r';
+                buffer[length++] = '\n';
+            }
+            AppendDreamsModelBoundaryTrace(buffer, length);
+        }
+        // Emulate `call 0x1280290`.
+        const u64 return_address = breakpoint_address + 5;
+        context->Rsp -= sizeof(return_address);
+        SIZE_T bytes_written = 0;
+        WriteProcessMemory(process, reinterpret_cast<void*>(context->Rsp), &return_address,
+                           sizeof(return_address), &bytes_written);
+        context->Rip = base + 0x1280290;
+        return true;
+    }
+
+    if (guest_offset == DreamsCsgReplayResultOffset) {
+        trace_snapshot("replay_result", context->R12,
+                       ReadDreamsU32(process, context->Rbp - 0x160),
+                       ReadDreamsU64(process, context->Rbp - 0xf8) != 0 ? 0 : 1);
+        // Emulate `mov rdx, qword ptr [rbp - 0xf8]`.
+        context->Rdx = ReadDreamsU64(process, context->Rbp - 0xf8);
+        context->Rip = breakpoint_address + 7;
+        return true;
+    }
+
+    if (guest_offset == DreamsCsgReplayCountOffset) {
+        trace_snapshot("replay_count", context->R12, ReadDreamsU32(process, context->R12 + 8), 0);
+        // Emulate `mov eax, dword ptr [r12 + 8]`.
+        context->Rax = ReadDreamsU32(process, context->R12 + 8);
+        context->Rip = breakpoint_address + 5;
+        return true;
+    }
+
+    if (guest_offset == DreamsCsgReturnBranchOffset) {
+        const u64 result = ReadDreamsU64(process, base + DreamsModelResultPointerOffset);
+        trace_snapshot("csg_return", result, static_cast<u32>(context->Rax),
+                       static_cast<u32>(context->Rax));
+        // Emulate `jne 0x12850d3` using the flags from `test eax, eax`.
+        const bool zero = (context->EFlags & (1u << 6)) != 0;
+        context->Rip = zero ? breakpoint_address + 2 : base + 0x12850d3;
+        return true;
+    }
+
+    trace_snapshot("aggregate", context->Rbx, static_cast<u32>(context->R15), 0);
+    // Emulate `je 0x1283692`.
+    const bool zero = (context->EFlags & (1u << 6)) != 0;
+    context->Rip = zero ? base + 0x1283692 : breakpoint_address + 6;
     return true;
 }
 
@@ -4883,6 +5207,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                   HandleDreamsSceneCacheBootstrap(pExp) ||
                   HandleDreamsSculptLifecycleTrace(pExp) ||
                   HandleDreamsSculptProvenanceTrace(pExp) ||
+                  HandleDreamsModelBoundaryTrace(pExp) ||
                   HandleDreamsModelRecordTrace(pExp) ||
                   HandleDreamsPairQueueTrace(pExp) ||
                   HandleDreamsOfflineLimitsTrace(pExp) ||
