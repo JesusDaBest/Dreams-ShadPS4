@@ -464,10 +464,11 @@ constexpr u32 PassDword = BaseDword + 1;
 constexpr u32 OverflowDword = BaseDword + 2;
 constexpr u32 RecordBaseDword = BaseDword + HeaderDwords;
 constexpr u32 MaxPasses = 10;
-// The isolated sculpt chain currently dispatches one x workgroup. Keep a guarded 64-workgroup
-// envelope so every lane can carry the complete branch snapshot while remaining inside the
-// existing 32 MiB private-GDS allocation. Overflow is explicit; it never silently truncates.
-constexpr u32 MaxWorkgroupsPerPass = 64;
+// Keep the expanded record inside the legacy 64-workgroup x 52-dword reservation so adjacent
+// diagnostics retain their established absolute addresses. The isolated chain observed by this
+// diagnostic peaks below this guarded 48-workgroup envelope. Host and shader overflow checks make
+// any larger dispatch an explicit failed capture rather than a silent truncation.
+constexpr u32 MaxWorkgroupsPerPass = 48;
 constexpr u32 LanesPerWorkgroup = 64;
 constexpr u32 InitialGateSites = 5;
 constexpr u32 InitialGateCompleteMask = (1u << InitialGateSites) - 1;
@@ -586,12 +587,21 @@ constexpr u32 RecordDword(u32 pass, u32 workgroup, u32 lane, u32 field) {
 
 constexpr u32 RecordCapacity = MaxPasses * MaxWorkgroupsPerPass * LanesPerWorkgroup;
 constexpr u32 DwordCount = HeaderDwords + RecordCapacity * RecordDwords;
+// Do not move the captures that follow this one when the diagnostic schema grows. The original
+// B535 membership allocation reserved 64 workgroups with 52 dwords per lane.
+constexpr u32 ReservedMaxWorkgroupsPerPass = 64;
+constexpr u32 ReservedRecordDwords = 52;
+constexpr u32 ReservedDwordCount =
+    HeaderDwords + MaxPasses * ReservedMaxWorkgroupsPerPass * LanesPerWorkgroup *
+                       ReservedRecordDwords;
+constexpr u32 ReservedEndDword = BaseDword + ReservedDwordCount;
 } // namespace B535MembershipCapture
 static_assert(B535MembershipCapture::RecordDwords ==
               B535MembershipCapture::InitialGateTraceMask + 1);
 static_assert(B535MembershipCapture::BaseDword >=
               SculptOrderedStateBaseDword + SculptOrderedStateDwords);
-static_assert(B535MembershipCapture::BaseDword + B535MembershipCapture::DwordCount <= 0x800000);
+static_assert(B535MembershipCapture::DwordCount <= B535MembershipCapture::ReservedDwordCount);
+static_assert(B535MembershipCapture::ReservedEndDword <= 0x800000);
 
 // Exact values consumed by every active lane of QueueProducer's decisive B1/B2 stores. The
 // aligned Dreams dispatch is exactly one 64-lane Liverpool wave, so fixed lane slots preserve the
@@ -600,7 +610,7 @@ static_assert(B535MembershipCapture::BaseDword + B535MembershipCapture::DwordCou
 // so one ordered-chain capture can prove both sides of the handoff without relying on a
 // potentially stale guest CPU mirror.
 namespace QueueProducerCapture {
-constexpr u32 BaseDword = B535MembershipCapture::BaseDword + B535MembershipCapture::DwordCount;
+constexpr u32 BaseDword = B535MembershipCapture::ReservedEndDword;
 constexpr u32 Magic = 0x33465051; // "QPF3"
 constexpr u32 Schema = 3;
 constexpr u32 Lanes = 64;
@@ -644,6 +654,7 @@ constexpr u32 B2RecordDword(u32 lane, u32 site, u32 field) {
 } // namespace QueueProducerCapture
 static_assert(QueueProducerCapture::BaseDword >=
               B535MembershipCapture::BaseDword + B535MembershipCapture::DwordCount);
+static_assert(QueueProducerCapture::BaseDword == B535MembershipCapture::ReservedEndDword);
 static_assert(QueueProducerCapture::BaseDword + QueueProducerCapture::DwordCount <= 0x800000);
 
 // Strictly opt-in instruction-level trace for every active lane in B535 pass 4. Record identities
