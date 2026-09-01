@@ -108,6 +108,7 @@ static std::vector<DreamsAtlasExpectedImage> g_dreams_atlas_expected_images;
 // requires the same Vulkan backing and byte-coordinate layout at 2f/f030, and disarms after the
 // aligned boundary has either completed or failed.
 constexpr u32 DreamsSculptAtlasLineageMax84aaGroups = 8192;
+constexpr u32 DreamsSculptAtlasLineageMaxProducerAttempts = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxConsumerAttempts = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxF030Records = 65536;
 constexpr u32 DreamsSculptAtlasLineageMaxF030Waves = 65536;
@@ -156,6 +157,7 @@ struct DreamsSculptAtlasLineageCapture {
     u64 producer_sequence{};
     DreamsAtlasImageIdentity producer_image{};
     std::unordered_map<u64, DreamsSculptAtlasLineageBrick> bricks;
+    u32 producer_attempts{};
     u32 producer_groups{};
     u64 producer_mismatched_bytes{};
     u32 consumer_attempts{};
@@ -3273,6 +3275,34 @@ static bool WriteDreamsCaptureCompletionMarker(const std::filesystem::path& dire
     return verified;
 }
 
+static bool WriteDreamsCaptureRequestMarker(const std::filesystem::path& directory) {
+    static constexpr std::string_view RequestText = "capture\n";
+    const auto temporary = directory / "capture.request.tmp";
+    const auto request = directory / "capture.request";
+    const std::span<const u8> expected{
+        reinterpret_cast<const u8*>(RequestText.data()), RequestText.size()};
+    std::error_code error;
+    if (std::filesystem::is_regular_file(request, error) && !error) {
+        return VerifyDreamsCaptureBytes(request, expected, HashDreamsTraceBytes(expected));
+    }
+    error.clear();
+    std::filesystem::remove(temporary, error);
+    if (!WriteDreamsCaptureText(temporary, RequestText)) {
+        return false;
+    }
+    if (!VerifyDreamsCaptureBytes(temporary, expected, HashDreamsTraceBytes(expected))) {
+        return false;
+    }
+    error.clear();
+    std::filesystem::rename(temporary, request, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Dreams capture request rename failed for {}: {}",
+                  request.string(), error.message());
+        return false;
+    }
+    return VerifyDreamsCaptureBytes(request, expected, HashDreamsTraceBytes(expected));
+}
+
 static std::string_view DreamsSculptAtlasLineagePhaseName(
     DreamsSculptAtlasLineageCapture::Phase phase) {
     using Phase = DreamsSculptAtlasLineageCapture::Phase;
@@ -3345,6 +3375,49 @@ static void CheckDreamsSculptAtlasLineageDeadline(u64 sequence) {
     }
 }
 
+static bool RetryDreamsSculptAtlasLineageAfterEmptyProducer(std::string_view reason) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    if (capture.phase != Phase::Capturing84aa) {
+        return false;
+    }
+    const u32 completed_attempts = capture.producer_attempts + 1;
+    if (completed_attempts >= DreamsSculptAtlasLineageMaxProducerAttempts) {
+        FailDreamsSculptAtlasLineage(
+            fmt::format("{} after {} bounded producer attempts", reason, completed_attempts));
+        return false;
+    }
+    const auto root = capture.root;
+    const auto directory = capture.directory;
+    const auto skipped_text =
+        fmt::format("status\tskipped\nreason\t{}\nproducer_sequence\t{}\nproducer_groups\t{}\n"
+                    "completed_attempts\t{}\n",
+                    reason, capture.producer_sequence, capture.producer_groups,
+                    completed_attempts);
+    const std::span<const u8> skipped_bytes{reinterpret_cast<const u8*>(skipped_text.data()),
+                                            skipped_text.size()};
+    const auto skipped_file = directory / "skipped.txt";
+    if (directory.empty() || !WriteDreamsCaptureText(skipped_file, skipped_text) ||
+        !VerifyDreamsCaptureBytes(skipped_file, skipped_bytes,
+                                 HashDreamsTraceBytes(skipped_bytes))) {
+        FailDreamsSculptAtlasLineage("failed to record an empty producer attempt");
+        return false;
+    }
+    if (!WriteDreamsCaptureRequestMarker(root)) {
+        FailDreamsSculptAtlasLineage("failed to re-arm after an empty producer attempt");
+        return false;
+    }
+
+    DreamsSculptAtlasLineageCapture next{};
+    next.root = root;
+    next.producer_attempts = completed_attempts;
+    capture = std::move(next);
+    LOG_WARNING(Render_Vulkan,
+                "Dreams sculpt-atlas lineage skipped empty 84aa attempt {}/{} and remains armed",
+                completed_attempts, DreamsSculptAtlasLineageMaxProducerAttempts);
+    return true;
+}
+
 static bool AppendDreamsSculptAtlasLineageEvent(std::string_view stage, u64 sequence,
                                                 std::string_view relation,
                                                 std::string_view decision) {
@@ -3404,6 +3477,7 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
 
     capture.producer_sequence = sequence;
     capture.deadline_sequence = sequence + DreamsSculptAtlasLineageMaxDispatchGap;
+    capture.producer_groups = groups;
     const auto nonce = std::chrono::system_clock::now().time_since_epoch().count();
     capture.directory = capture.root / fmt::format("capture-{}-{}", sequence, nonce);
     error.clear();
@@ -3418,12 +3492,15 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
         WriteDreamsCaptureText(
             capture.directory / "started.tsv",
             fmt::format("schema\t1\nproducer_sequence\t{}\n84aa_groups\t{}\n"
+                        "producer_attempt\t{}\nmax_producer_attempts\t{}\n"
                         "max_84aa_groups\t{}\nmax_consumer_attempts\t{}\n"
                         "max_f030_records\t{}\nmax_f030_waves\t{}\n"
                         "max_consumer_invocations\t{}\n"
                         "sample_window\twg_xyz_lt_4_local_xyz_lt_2\n"
                         "max_candidates_per_site\t{}\n",
-                        sequence, groups, DreamsSculptAtlasLineageMax84aaGroups,
+                        sequence, groups, capture.producer_attempts + 1,
+                        DreamsSculptAtlasLineageMaxProducerAttempts,
+                        DreamsSculptAtlasLineageMax84aaGroups,
                         DreamsSculptAtlasLineageMaxConsumerAttempts,
                         DreamsSculptAtlasLineageMaxF030Records,
                         DreamsSculptAtlasLineageMaxF030Waves,
@@ -22545,9 +22622,12 @@ void Rasterizer::DispatchDirect(
             const u64 state_size = static_cast<u64>(dispatch_x) *
                                    Shader::DreamsCompat::SculptOrderedStateDwordsPerWorkgroup *
                                    sizeof(u32);
+            const u64 counter_offset =
+                static_cast<u64>(Shader::DreamsCompat::SculptOrderedCounterIndex) * sizeof(u32);
             const bool gds_ranges_valid =
                 scratch_base * sizeof(u32) + scratch_size <= gds->mapped_data.size() &&
-                state_base * sizeof(u32) + state_size <= gds->mapped_data.size();
+                state_base * sizeof(u32) + state_size <= gds->mapped_data.size() &&
+                counter_offset + sizeof(u32) <= gds->mapped_data.size();
             const bool resources_valid = cs.flattened_ud_buf.size() > 44 && cs.buffers.size() > 1 &&
                                          !cs.buffers[1].IsSpecial() && cs.images.size() > 1 &&
                                          cs.images[0].NumBindings(cs) == 1 &&
@@ -22569,26 +22649,36 @@ void Rasterizer::DispatchDirect(
             } else {
                 gds->InvalidateMappedRange(scratch_base * sizeof(u32), scratch_size);
                 gds->InvalidateMappedRange(state_base * sizeof(u32), state_size);
+                gds->InvalidateMappedRange(counter_offset, sizeof(u32));
                 const auto* words = std::bit_cast<const u32*>(gds->mapped_data.data());
                 const u32 destination_base = cs.flattened_ud_buf[44];
                 const auto lookup = cs.buffers[1].GetSharp(cs);
 
                 u32 valid_groups{};
                 u32 destination_failures{};
+                u32 doc_validation_failures{};
                 u32 first_destination = std::numeric_limits<u32>::max();
                 u32 last_destination{};
                 u64 lookup_bytes{};
+                u32 running_prefix =
+                    words[scratch_base + Shader::DreamsCompat::SculptOrderedPrefixOffset];
                 for (u32 group = 0; group < dispatch_x; ++group) {
                     const u64 entry = scratch_base + static_cast<u64>(group) *
                                                          Shader::DreamsCompat::OrderedEntryDwords;
                     const u32 payload =
                         words[entry + Shader::DreamsCompat::SculptOrderedPayloadOffset];
+                    const u32 prefix =
+                        words[entry + Shader::DreamsCompat::SculptOrderedPrefixOffset];
+                    const u32 token =
+                        words[entry + Shader::DreamsCompat::SculptOrderedTokenOffset];
+                    doc_validation_failures += payload > 1;
+                    doc_validation_failures += prefix != running_prefix;
+                    doc_validation_failures += (token & 0x7ff) != (group & 0x7ff);
+                    running_prefix += payload;
                     if (payload == 0) {
                         continue;
                     }
                     ++valid_groups;
-                    const u32 prefix =
-                        words[entry + Shader::DreamsCompat::SculptOrderedPrefixOffset];
                     if (payload != 1 ||
                         prefix > std::numeric_limits<u32>::max() - destination_base) {
                         ++destination_failures;
@@ -22600,6 +22690,8 @@ void Rasterizer::DispatchDirect(
                     lookup_bytes = std::max(lookup_bytes,
                                             (static_cast<u64>(destination >> 6) + 1) * sizeof(u16));
                 }
+                doc_validation_failures +=
+                    words[Shader::DreamsCompat::SculptOrderedCounterIndex] != running_prefix;
 
                 const bool lookup_valid = valid_groups != 0 && destination_failures == 0 &&
                                           lookup.base_address != 0 &&
@@ -22607,16 +22699,23 @@ void Rasterizer::DispatchDirect(
                                           memory->IsValidMapping(lookup.base_address, lookup_bytes);
                 if (!lookup_valid) {
                     if (capture_sculpt_atlas_lineage) {
-                        FailDreamsSculptAtlasLineage(
-                            "84aa lookup or destination map was incomplete");
+                        if (valid_groups == 0 && destination_failures == 0 && lookup_bytes == 0 &&
+                            doc_validation_failures == 0) {
+                            RetryDreamsSculptAtlasLineageAfterEmptyProducer(
+                                "84aa emitted no atlas bricks");
+                        } else {
+                            FailDreamsSculptAtlasLineage(
+                                "84aa lookup or destination map was incomplete");
+                        }
                     }
                     if (sculpt_replay_validation_skips++ < 8) {
                         LOG_ERROR(Render_Vulkan,
                                   "Dreams 84aa replay validation waiting: groups={} valid={} "
-                                  "destination_failures={} destination_base={} lookup={:#x}+{:#x} "
-                                  "needed={:#x}",
-                                  dispatch_x, valid_groups, destination_failures, destination_base,
-                                  lookup.base_address, lookup.GetSize(), lookup_bytes);
+                                  "destination_failures={} doc_failures={} destination_base={} "
+                                  "lookup={:#x}+{:#x} needed={:#x}",
+                                  dispatch_x, valid_groups, destination_failures,
+                                  doc_validation_failures, destination_base, lookup.base_address,
+                                  lookup.GetSize(), lookup_bytes);
                     }
                 } else {
                     buffer_cache.ReadMemory(lookup.base_address, lookup_bytes);
