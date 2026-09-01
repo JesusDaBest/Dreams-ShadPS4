@@ -3246,7 +3246,7 @@ static void CompleteDreamsVs370ListSliceCapture(
     static_assert(sizeof(pending.command) == sizeof(command_words));
     std::memcpy(command_words.data(), &pending.command, sizeof(pending.command));
     const std::span<const u8> command_bytes{
-        reinterpret_cast<const u8*>(command_words.data()), command_words.size_bytes()};
+        reinterpret_cast<const u8*>(command_words.data()), command_words.size() * sizeof(u32)};
     const u64 command_byte_hash = HashDreamsTraceBytes(command_bytes);
 
     std::string manifest = "key\tvalue\n";
@@ -8600,7 +8600,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                             const u64 settled_hash = HashDreamsTraceWords(settled_words);
                             const std::span<const u8> settled_bytes{
                                 reinterpret_cast<const u8*>(settled_words.data()),
-                                settled_words.size_bytes()};
+                                settled_words.size() * sizeof(u32)};
                             const u64 settled_byte_hash = HashDreamsTraceBytes(settled_bytes);
                             std::array<u32, sizeof(command) / sizeof(u32)> command_words{};
                             static_assert(sizeof(command) == sizeof(command_words));
