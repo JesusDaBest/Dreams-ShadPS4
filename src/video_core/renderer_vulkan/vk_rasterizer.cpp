@@ -112,6 +112,8 @@ constexpr u32 DreamsSculptAtlasLineageMaxConsumerAttempts = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxF030Records = 65536;
 constexpr u32 DreamsSculptAtlasLineageMaxF030Waves = 65536;
 constexpr u64 DreamsSculptAtlasLineageMaxConsumerInvocations = 4ULL * 1024 * 1024;
+constexpr u64 DreamsSculptAtlasLineageMaxDispatchGap = 8192;
+constexpr u64 DreamsSculptAtlasLineageRequestPollInterval = 256;
 static_assert(static_cast<u64>(DreamsSculptAtlasLineageMaxF030Waves) *
                   Shader::DreamsCompat::OrderedEntryDwords * sizeof(u32) <=
               1_MB);
@@ -151,6 +153,8 @@ struct DreamsSculptAtlasLineageCapture {
     Phase phase{Phase::WaitingRequest};
     std::filesystem::path root;
     std::filesystem::path directory;
+    u64 request_seen_sequence{};
+    u64 deadline_sequence{};
     u64 producer_sequence{};
     DreamsAtlasImageIdentity producer_image{};
     std::unordered_map<u64, DreamsSculptAtlasLineageBrick> bricks;
@@ -3301,14 +3305,73 @@ static void FailDreamsSculptAtlasLineage(std::string_view reason) {
     capture.phase = DreamsSculptAtlasLineageCapture::Phase::Failed;
     LOG_ERROR(Render_Vulkan, "Dreams sculpt-atlas lineage capture failed at {}: {}",
               DreamsSculptAtlasLineagePhaseName(previous_phase), reason);
-    const auto& directory = !capture.directory.empty() ? capture.directory : capture.root;
+    const auto directory = !capture.directory.empty() ? capture.directory : capture.root;
+    bool marker_written{};
     if (!directory.empty()) {
         std::error_code error;
         std::filesystem::remove(directory / "complete.txt", error);
-        WriteDreamsCaptureText(directory / "failed.txt",
-                               fmt::format("phase\t{}\nreason\t{}\nproducer_sequence\t{}\n",
-                                           DreamsSculptAtlasLineagePhaseName(previous_phase),
-                                           reason, capture.producer_sequence));
+        marker_written = WriteDreamsCaptureText(
+            directory / "failed.txt",
+            fmt::format("phase\t{}\nreason\t{}\nproducer_sequence\t{}\n",
+                        DreamsSculptAtlasLineagePhaseName(previous_phase), reason,
+                        capture.producer_sequence));
+    }
+    if (!marker_written && !capture.root.empty() && directory != capture.root) {
+        marker_written = WriteDreamsCaptureText(
+            capture.root / "failed.txt",
+            fmt::format("phase\t{}\nreason\t{}\nproducer_sequence\t{}\n",
+                        DreamsSculptAtlasLineagePhaseName(previous_phase), reason,
+                        capture.producer_sequence));
+    }
+    if (!marker_written) {
+        LOG_ERROR(Render_Vulkan, "Dreams sculpt-atlas lineage failure marker could not be written");
+    }
+}
+
+static void CheckDreamsSculptAtlasLineageDeadline(u64 sequence) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    if (!Shader::DreamsCompat::CaptureSculptAtlasLineage() ||
+        Common::ElfInfo::Instance().GameSerial() != "CUSA04301" ||
+        capture.phase == Phase::Complete || capture.phase == Phase::Failed) {
+        return;
+    }
+    if (capture.phase == Phase::WaitingRequest) {
+        if (sequence % DreamsSculptAtlasLineageRequestPollInterval != 0) {
+            return;
+        }
+        if (capture.root.empty()) {
+            const char* value = std::getenv("SHADPS4_DREAMS_SCULPT_ATLAS_LINEAGE_CAPTURE_DIR");
+            if (value == nullptr || value[0] == '\0') {
+                return;
+            }
+            capture.root = std::filesystem::path{value};
+        }
+        std::error_code error;
+        const bool requested =
+            std::filesystem::is_regular_file(capture.root / "capture.request", error) && !error;
+        if (!requested) {
+            capture.request_seen_sequence = 0;
+            return;
+        }
+        if (capture.request_seen_sequence == 0) {
+            capture.request_seen_sequence = sequence;
+            return;
+        }
+        if (sequence - capture.request_seen_sequence < DreamsSculptAtlasLineageMaxDispatchGap) {
+            return;
+        }
+        error.clear();
+        std::filesystem::remove(capture.root / "capture.request", error);
+        FailDreamsSculptAtlasLineage(
+            "no eligible bounded 84aa producer arrived before the dispatch deadline");
+        return;
+    }
+    if ((capture.phase == Phase::Waiting2f || capture.phase == Phase::WaitingF030) &&
+        capture.deadline_sequence != 0 && sequence > capture.deadline_sequence) {
+        FailDreamsSculptAtlasLineage(fmt::format(
+            "expected same-atlas consumer did not arrive before dispatch sequence {}",
+            capture.deadline_sequence));
     }
 }
 
@@ -3323,8 +3386,8 @@ static bool AppendDreamsSculptAtlasLineageEvent(std::string_view stage, u64 sequ
                                                stage, sequence, relation, decision));
 }
 
-static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups,
-                                                     const DreamsAtlasImageIdentity& producer) {
+static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, bool exact_doc,
+                                                      const DreamsAtlasImageIdentity& producer) {
     auto& capture = g_dreams_sculpt_atlas_lineage;
     using Phase = DreamsSculptAtlasLineageCapture::Phase;
     if (!Shader::DreamsCompat::CaptureSculptAtlasLineage() ||
@@ -3352,7 +3415,8 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups,
 
     // Leave the request in place until an exact, safely bounded producer dispatch is available.
     // Consuming it earlier could turn an ineligible 84aa into the lineage generation by accident.
-    if (!producer.valid || groups == 0 || groups > DreamsSculptAtlasLineageMax84aaGroups) {
+    if (!exact_doc || !producer.valid || groups == 0 ||
+        groups > DreamsSculptAtlasLineageMax84aaGroups) {
         return false;
     }
 
@@ -3361,6 +3425,7 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups,
     if (!std::filesystem::is_regular_file(trigger, error) || error) {
         return false;
     }
+    capture.request_seen_sequence = sequence;
     error.clear();
     if (!std::filesystem::remove(trigger, error) || error) {
         LOG_ERROR(Render_Vulkan, "Dreams sculpt-atlas lineage trigger {} could not be consumed: {}",
@@ -3369,6 +3434,7 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups,
     }
 
     capture.producer_sequence = sequence;
+    capture.deadline_sequence = sequence + DreamsSculptAtlasLineageMaxDispatchGap;
     const auto nonce = std::chrono::system_clock::now().time_since_epoch().count();
     capture.directory = capture.root / fmt::format("capture-{}-{}", sequence, nonce);
     error.clear();
@@ -3676,8 +3742,14 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
     }
     u64 gather_hash{};
     u64 stores_hash{};
+    const std::span<const u8> gather_bytes{reinterpret_cast<const u8*>(gather.data()),
+                                           gather.size() * sizeof(u32)};
+    const std::span<const u8> stores_bytes{reinterpret_cast<const u8*>(stores.data()),
+                                           stores.size() * sizeof(u32)};
     bool files_ok = WriteDreamsCaptureWords(output / "gather.bin", gather, gather_hash) &&
-                    WriteDreamsCaptureWords(output / "stores.bin", stores, stores_hash);
+                    VerifyDreamsCaptureBytes(output / "gather.bin", gather_bytes, gather_hash) &&
+                    WriteDreamsCaptureWords(output / "stores.bin", stores, stores_hash) &&
+                    VerifyDreamsCaptureBytes(output / "stores.bin", stores_bytes, stores_hash);
 
     u32 matched{};
     u32 mismatched{};
@@ -3808,6 +3880,7 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
     capture.consumer_attempts = 0;
     if (is_prepare) {
         capture.phase = Phase::WaitingF030;
+        capture.deadline_sequence = sequence + DreamsSculptAtlasLineageMaxDispatchGap;
     } else {
         FinalizeDreamsSculptAtlasLineage();
     }
@@ -8965,6 +9038,7 @@ static void TraceComputeShader(const Shader::Info& info, bool indirect, u32 dim_
         .dim_z = dim_z,
     };
     ++g_compute_dispatch_sequence;
+    CheckDreamsSculptAtlasLineageDeadline(g_compute_dispatch_sequence);
     TraceDreamsComputeWindow(info, indirect, dim_x, dim_y, dim_z);
 
     static const bool enabled = std::getenv("SHADPS4_TRACE_COMPUTE") != nullptr;
@@ -20831,12 +20905,10 @@ void Rasterizer::DispatchDirect(
     };
 
     bool capture_sculpt_atlas_lineage{};
-    if (cs.pgm_hash == Shader::DreamsCompat::SculptVolumeWriterShader &&
-        (use_dreams_sculpt_ordered_prefix ||
-         g_dreams_sculpt_atlas_lineage.phase !=
-             DreamsSculptAtlasLineageCapture::Phase::WaitingRequest)) {
+    if (cs.pgm_hash == Shader::DreamsCompat::SculptVolumeWriterShader) {
         capture_sculpt_atlas_lineage = BeginDreamsSculptAtlasLineageIfRequested(
-            g_compute_dispatch_sequence, cs_program.dim_x, describe_dreams_image_binding(1));
+            g_compute_dispatch_sequence, cs_program.dim_x, use_dreams_sculpt_ordered_prefix,
+            describe_dreams_image_binding(1));
     }
 
     const bool capture_all_image_gather = Shader::DreamsCompat::CaptureAllImageGather3D();
