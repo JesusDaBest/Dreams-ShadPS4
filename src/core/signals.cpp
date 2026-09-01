@@ -237,6 +237,57 @@ static u64 HashDreamsBytes(const void* source, const SIZE_T size) noexcept {
     return hash;
 }
 
+struct DreamsProcessHash {
+    u64 requested_size{};
+    u64 captured_size{};
+    u64 hash{};
+    std::array<u32, 4> head_words{};
+    bool valid{};
+    bool complete{};
+};
+
+static DreamsProcessHash HashDreamsProcessBytes(const HANDLE process, const u64 address,
+                                                const u64 requested_size,
+                                                const u64 capture_limit) noexcept {
+    constexpr u64 FnvOffsetBasis = 1469598103934665603ULL;
+    constexpr u64 FnvPrime = 1099511628211ULL;
+    constexpr SIZE_T ChunkSize = 64 * 1024;
+    static thread_local std::array<u8, ChunkSize> chunk{};
+
+    DreamsProcessHash result{};
+    result.requested_size = requested_size;
+    result.hash = FnvOffsetBasis;
+    if (requested_size == 0) {
+        result.valid = true;
+        result.complete = true;
+        return result;
+    }
+    if (address == 0 || requested_size > ~0ULL - address) {
+        return result;
+    }
+
+    const u64 capture_size = std::min(requested_size, capture_limit);
+    while (result.captured_size < capture_size) {
+        const SIZE_T read_size = static_cast<SIZE_T>(
+            std::min<u64>(ChunkSize, capture_size - result.captured_size));
+        if (!ReadDreamsBytes(process, address + result.captured_size, chunk.data(), read_size)) {
+            return result;
+        }
+        if (result.captured_size == 0) {
+            std::memcpy(result.head_words.data(), chunk.data(),
+                        std::min(read_size, sizeof(result.head_words)));
+        }
+        for (SIZE_T index = 0; index < read_size; ++index) {
+            result.hash ^= chunk[index];
+            result.hash *= FnvPrime;
+        }
+        result.captured_size += read_size;
+    }
+    result.valid = true;
+    result.complete = result.captured_size == requested_size;
+    return result;
+}
+
 static bool IsDreamsVisibleSculptsWarningSource(const HANDLE process,
                                                 const u64 address) noexcept {
     if (address == 0) {
@@ -860,6 +911,7 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
     constexpr u64 DreamsModelBuildReturnOffset = 0x723870;
     constexpr u64 DreamsCsgCallOffset = 0x12850c1;
     constexpr u64 DreamsCsgReturnBranchOffset = 0x12850c8;
+    constexpr u64 DreamsCsgInputDispatchOffset = 0x128087d;
     constexpr u64 DreamsCsgReplayResultOffset = 0x1281f5e;
     constexpr u64 DreamsCsgReplayCountOffset = 0x1281f6e;
     constexpr u64 DreamsModelAggregateCountOffset = 0x1282390;
@@ -881,6 +933,7 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
     if (guest_offset != DreamsModelBuildOffset &&
         guest_offset != DreamsModelBuildReturnOffset && guest_offset != DreamsCsgCallOffset &&
         guest_offset != DreamsCsgReturnBranchOffset &&
+        guest_offset != DreamsCsgInputDispatchOffset &&
         guest_offset != DreamsCsgReplayResultOffset &&
         guest_offset != DreamsCsgReplayCountOffset &&
         guest_offset != DreamsModelAggregateCountOffset) {
@@ -892,6 +945,8 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
         u32 model_id{};
         u32 target{};
         u32 csg_sequence{};
+        u64 csg_request_address{};
+        bool first_csg_input_pending{};
         bool active{};
     };
     static thread_local BoundaryState state{};
@@ -974,6 +1029,8 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
         state.model_id = static_cast<u32>(context->R8);
         state.target = static_cast<u32>(context->Rcx);
         state.csg_sequence = 0;
+        state.csg_request_address = 0;
+        state.first_csg_input_pending = false;
         state.active = DreamsModelBoundaryCaptureEnabled();
         if (state.active) {
             char buffer[384]{};
@@ -1019,15 +1076,35 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
 
     if (guest_offset == DreamsCsgCallOffset) {
         if (state.active) {
+            constexpr u32 ConfigWordsPerRecord = 0x60 / sizeof(u32);
+            constexpr u32 MaxConfigRecordCount = 0x1d4c0;
+            constexpr u32 MaxDumpedConfigRecords = 64;
             ++state.csg_sequence;
-            std::array<u32, 24> config{};
-            std::array<u32, 48> request{};
-            const bool config_valid =
-                ReadDreamsBytes(process, context->Rdx, config.data(), sizeof(config));
+            state.csg_request_address = context->Rdi;
+            state.first_csg_input_pending = true;
+            const u32 config_record_count = static_cast<u32>(context->R8);
+            const bool config_count_valid = config_record_count <= MaxConfigRecordCount;
+            const u64 config_size =
+                config_count_valid ? static_cast<u64>(config_record_count) * 0x60 : 0;
+            const DreamsProcessHash config_hash =
+                config_count_valid
+                    ? HashDreamsProcessBytes(process, context->Rdx, config_size, config_size)
+                    : DreamsProcessHash{};
+            const u32 dumped_config_records =
+                std::min(config_record_count, MaxDumpedConfigRecords);
+            static thread_local std::array<u32,
+                                           ConfigWordsPerRecord * MaxDumpedConfigRecords>
+                config{};
+            std::array<u32, 0x90 / sizeof(u32)> request{};
+            const SIZE_T config_dump_size =
+                static_cast<SIZE_T>(dumped_config_records) * 0x60;
+            const bool config_dump_valid =
+                config_dump_size == 0 ||
+                ReadDreamsBytes(process, context->Rdx, config.data(), config_dump_size);
+            const bool config_valid = config_count_valid && config_hash.valid &&
+                                      config_hash.complete && config_dump_valid;
             const bool request_valid =
                 ReadDreamsBytes(process, context->Rdi, request.data(), sizeof(request));
-            const u64 config_hash =
-                config_valid ? HashDreamsBytes(config.data(), sizeof(config)) : 0;
             const u64 request_hash =
                 request_valid ? HashDreamsBytes(request.data(), sizeof(request)) : 0;
             char buffer[2048]{};
@@ -1036,7 +1113,9 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
                 "model_boundary kind=csg_call tick=%llu thread=%lu build=%u model=%u target=%u "
                 "csg=%u request=0x%016llx config=0x%016llx rsi=%u r8=%u r9=%u flags=%u "
                 "request_valid=%u request_hash=0x%016llx config_valid=%u "
-                "config_hash=0x%016llx config_words=",
+                "config_records=%u config_bytes=%llu dumped_records=%u dump_truncated=%u "
+                "config_over_limit=%u "
+                "config_hash=0x%016llx request_words=",
                 static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
                 state.build_sequence, state.model_id, state.target, state.csg_sequence,
                 static_cast<unsigned long long>(context->Rdi),
@@ -1044,7 +1123,11 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
                 static_cast<u32>(context->R8), static_cast<u32>(context->R9),
                 ReadDreamsU32(process, context->Rsp), request_valid ? 1 : 0,
                 static_cast<unsigned long long>(request_hash), config_valid ? 1 : 0,
-                static_cast<unsigned long long>(config_hash));
+                config_record_count, static_cast<unsigned long long>(config_size),
+                dumped_config_records,
+                dumped_config_records != config_record_count ? 1 : 0,
+                config_count_valid ? 0 : 1,
+                static_cast<unsigned long long>(config_hash.hash));
             const auto append_words = [&](const std::span<const u32> words) noexcept {
                 for (SIZE_T index = 0; index < words.size() && length > 0 &&
                                              static_cast<SIZE_T>(length) < sizeof(buffer);
@@ -1059,19 +1142,44 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
                     length += appended;
                 }
             };
-            append_words(config);
-            if (length > 0) {
-                const int appended = _snprintf_s(
-                    buffer + length, sizeof(buffer) - static_cast<SIZE_T>(length), _TRUNCATE,
-                    " request_words=");
-                length = appended > 0 ? length + appended : -1;
-            }
             append_words(request);
             if (length > 0 && static_cast<SIZE_T>(length) + 2 < sizeof(buffer)) {
                 buffer[length++] = '\r';
                 buffer[length++] = '\n';
             }
             AppendDreamsModelBoundaryTrace(buffer, length);
+
+            if (config_dump_valid) {
+                for (u32 record = 0; record < dumped_config_records; ++record) {
+                    char record_buffer[768]{};
+                    int record_length = _snprintf_s(
+                        record_buffer, sizeof(record_buffer), _TRUNCATE,
+                        "model_boundary kind=csg_edit tick=%llu thread=%lu build=%u model=%u "
+                        "target=%u csg=%u record=%u hash=0x%016llx words=",
+                        static_cast<unsigned long long>(GetTickCount64()),
+                        GetCurrentThreadId(), state.build_sequence, state.model_id, state.target,
+                        state.csg_sequence, record,
+                        static_cast<unsigned long long>(HashDreamsBytes(
+                            config.data() + record * ConfigWordsPerRecord, 0x60)));
+                    for (u32 word = 0; word < ConfigWordsPerRecord && record_length > 0 &&
+                                           static_cast<SIZE_T>(record_length) <
+                                               sizeof(record_buffer);
+                         ++word) {
+                        const int appended = _snprintf_s(
+                            record_buffer + record_length,
+                            sizeof(record_buffer) - static_cast<SIZE_T>(record_length),
+                            _TRUNCATE, word + 1 == ConfigWordsPerRecord ? "%08x" : "%08x,",
+                            config[record * ConfigWordsPerRecord + word]);
+                        record_length = appended > 0 ? record_length + appended : -1;
+                    }
+                    if (record_length > 0 &&
+                        static_cast<SIZE_T>(record_length) + 2 < sizeof(record_buffer)) {
+                        record_buffer[record_length++] = '\r';
+                        record_buffer[record_length++] = '\n';
+                    }
+                    AppendDreamsModelBoundaryTrace(record_buffer, record_length);
+                }
+            }
         }
         // Emulate `call 0x1280290`.
         const u64 return_address = breakpoint_address + 5;
@@ -1080,6 +1188,69 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
         WriteProcessMemory(process, reinterpret_cast<void*>(context->Rsp), &return_address,
                            sizeof(return_address), &bytes_written);
         context->Rip = base + 0x1280290;
+        return true;
+    }
+
+    if (guest_offset == DreamsCsgInputDispatchOffset) {
+        if (state.active && state.first_csg_input_pending) {
+            constexpr u64 MaxInputCaptureBytes = 8ULL * 1024 * 1024;
+            state.first_csg_input_pending = false;
+            const u64 request_address = ReadDreamsU64(process, context->Rbp - 0x118);
+            std::array<u32, 4> srd4{};
+            std::array<u32, 4> srd8{};
+            const bool srd4_valid =
+                ReadDreamsBytes(process, context->Rbp - 0x50, srd4.data(), sizeof(srd4));
+            const bool srd8_valid =
+                ReadDreamsBytes(process, context->Rbp - 0x70, srd8.data(), sizeof(srd8));
+            const auto decode_address = [&](const u32 low_word, const u32 high_word) noexcept {
+                return static_cast<u64>(low_word) |
+                       (static_cast<u64>(high_word & 0xfffu) << 32);
+            };
+            const u64 input4_address =
+                srd4_valid ? decode_address(srd4[0], srd4[1]) : 0;
+            const u64 input8_address =
+                srd8_valid ? decode_address(srd8[0], srd8[1]) : 0;
+            const u64 input4_size = srd4_valid ? static_cast<u64>(srd4[2]) * 4 : 0;
+            const u64 input8_size = srd8_valid ? static_cast<u64>(srd8[2]) * 8 : 0;
+            const DreamsProcessHash input4 = HashDreamsProcessBytes(
+                process, input4_address, input4_size, MaxInputCaptureBytes);
+            const DreamsProcessHash input8 = HashDreamsProcessBytes(
+                process, input8_address, input8_size, MaxInputCaptureBytes);
+            char buffer[1536]{};
+            const int length = _snprintf_s(
+                buffer, sizeof(buffer), _TRUNCATE,
+                "model_boundary kind=csg_input tick=%llu thread=%lu build=%u model=%u "
+                "target=%u csg=%u stage=ChunkSoftBlendEvaluate request=0x%016llx "
+                "call_request=0x%016llx request_match=%u "
+                "srd4_valid=%u srd4=%08x,%08x,%08x,%08x input4=0x%016llx "
+                "bytes=%llu captured=%llu cpu_backing_valid=%u complete=%u "
+                "cpu_backing_hash=0x%016llx head=%08x,%08x,%08x,%08x "
+                "srd8_valid=%u srd8=%08x,%08x,%08x,%08x input8=0x%016llx "
+                "bytes=%llu captured=%llu cpu_backing_valid=%u complete=%u "
+                "cpu_backing_hash=0x%016llx head=%08x,%08x,%08x,%08x\r\n",
+                static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
+                state.build_sequence, state.model_id, state.target, state.csg_sequence,
+                static_cast<unsigned long long>(request_address),
+                static_cast<unsigned long long>(state.csg_request_address),
+                request_address == state.csg_request_address ? 1 : 0,
+                srd4_valid ? 1 : 0, srd4[0], srd4[1], srd4[2], srd4[3],
+                static_cast<unsigned long long>(input4_address),
+                static_cast<unsigned long long>(input4.requested_size),
+                static_cast<unsigned long long>(input4.captured_size), input4.valid ? 1 : 0,
+                input4.complete ? 1 : 0, static_cast<unsigned long long>(input4.hash),
+                input4.head_words[0], input4.head_words[1], input4.head_words[2],
+                input4.head_words[3], srd8_valid ? 1 : 0, srd8[0], srd8[1], srd8[2],
+                srd8[3], static_cast<unsigned long long>(input8_address),
+                static_cast<unsigned long long>(input8.requested_size),
+                static_cast<unsigned long long>(input8.captured_size), input8.valid ? 1 : 0,
+                input8.complete ? 1 : 0, static_cast<unsigned long long>(input8.hash),
+                input8.head_words[0], input8.head_words[1], input8.head_words[2],
+                input8.head_words[3]);
+            AppendDreamsModelBoundaryTrace(buffer, length);
+        }
+        // Emulate `mov esi, r12d` immediately before the first CSG dispatch.
+        context->Rsi = static_cast<u32>(context->R12);
+        context->Rip = breakpoint_address + 3;
         return true;
     }
 

@@ -580,11 +580,12 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 // Follow one model from its guest request through CSG return and CPU aggregation
                 // without enabling renderer-wide diagnostics. Every replaced instruction is
                 // emulated by HandleDreamsModelBoundaryTrace.
-                constexpr std::array<std::pair<u64, u8>, 7> DreamsModelBoundaryTracePoints{{
+                constexpr std::array<std::pair<u64, u8>, 8> DreamsModelBoundaryTracePoints{{
                     {0x720950, 0x55},  // Begin constructing one model record.
                     {0x723870, 0x49},  // Return from model-record construction.
                     {0x12850c1, 0xe8}, // Enter Dreams' CSG voxel compute pass.
                     {0x12850c8, 0x75}, // Branch on the CSG pass status.
+                    {0x128087d, 0x44}, // Capture finalized CSG input SRDs before dispatch.
                     {0x1281f5e, 0x48}, // Inspect one completed CSG replay result.
                     {0x1281f6e, 0x41}, // Read that replay's output count.
                     {0x1282390, 0x0f}, // Inspect the final aggregate count.
@@ -596,6 +597,11 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                         trace_points_match = false;
                         break;
                     }
+                }
+                if (trace_points_match &&
+                    (*reinterpret_cast<u8*>(base_virtual_addr + 0x128087e) != 0x89 ||
+                     *reinterpret_cast<u8*>(base_virtual_addr + 0x128087f) != 0xe6)) {
+                    trace_points_match = false;
                 }
                 if (trace_points_match) {
                     for (const auto [offset, expected] : DreamsModelBoundaryTracePoints) {
