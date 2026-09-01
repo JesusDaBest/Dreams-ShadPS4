@@ -2320,12 +2320,17 @@ static const DreamsModelInputSourceRange& GetDreamsModelInputSourceRange() {
     return range;
 }
 
-static bool IsDreamsModelInputSourceSelected(const Core::DreamsTrace::ModelBuildSnapshot& model) {
-    if (!model.valid || model.returned || model.epoch == 0) {
+static bool IsDreamsModelInputSourceRangeMatch(
+    const Core::DreamsTrace::ModelBuildSnapshot& model) {
+    if (!model.valid || model.epoch == 0) {
         return false;
     }
     const auto& range = GetDreamsModelInputSourceRange();
     return range.minimum <= model.model_id && model.model_id <= range.maximum;
+}
+
+static bool IsDreamsModelInputSourceSelected(const Core::DreamsTrace::ModelBuildSnapshot& model) {
+    return !model.returned && IsDreamsModelInputSourceRangeMatch(model);
 }
 
 static bool DreamsModelInputTraceTriggerExists() {
@@ -13506,6 +13511,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         const auto as_float = [](u32 bits) { return std::bit_cast<float>(bits); };
         const u32 seen = word(Capture::SeenDword);
         const u32 claimed = word(Capture::ClaimedParam1Dword);
+        const u32 conditional_discard_invocations =
+            word(Capture::ConditionalDiscardInvocationsDword);
+        const u32 conditional_discard_true = word(Capture::ConditionalDiscardTrueDword);
+        const u32 conditional_discard_false = word(Capture::ConditionalDiscardFalseDword);
         const bool sample_complete =
             (seen & ((1U << Capture::StaticSampleSites) - 1)) ==
             (1U << Capture::StaticSampleSites) - 1;
@@ -13629,12 +13638,19 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                 *directory / "manifest.tsv",
                 fmt::format("field\tvalue\nshader\t{:#x}\nclaimed_param1\t{:#010x}\n"
                             "claimed_atlas_id\t{:#08x}\nseen\t{:#x}\ndiscard_seen\t{}\n"
-                            "discard_condition\t{}\nsample_complete\t{}\nraw_hash\t{:#x}\n"
+                            "discard_condition\t{}\nconditional_discard_invocations\t{}\n"
+                            "conditional_discard_true\t{}\nconditional_discard_false\t{}\n"
+                            "conditional_discard_count_consistent\t{}\nsample_complete\t{}\n"
+                            "raw_hash\t{:#x}\n"
                             "atlas_neighborhood_ok\t{}\natlas_neighborhood_hash\t{:#x}\n",
                             Shader::DreamsCompat::Ce3ReadConstCaptureShader, claimed,
                             claimed & 0x00ffffff, seen,
                             (seen & (1U << Capture::StaticSampleSites)) != 0,
-                            word(Capture::DiscardConditionDword), sample_complete, raw_hash,
+                            word(Capture::DiscardConditionDword), conditional_discard_invocations,
+                            conditional_discard_true, conditional_discard_false,
+                            conditional_discard_invocations ==
+                                conditional_discard_true + conditional_discard_false,
+                            sample_complete, raw_hash,
                             atlas_neighborhood_ok, atlas_neighborhood_hash));
             if (files_ok && sample_complete) {
                 files_ok &= WriteDreamsCaptureText(*directory / "complete.txt", "complete\n");
@@ -13649,9 +13665,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             }
             LOG_WARNING(Render_Vulkan,
                         "Dreams ce3 fleck trace complete param1={:#010x} atlas_id={:#08x} "
-                        "seen={:#x} discard={} directory={}",
+                        "seen={:#x} discard={} conditional={}/{}+{} directory={}",
                         claimed, claimed & 0x00ffffff, seen,
                         word(Capture::DiscardConditionDword),
+                        conditional_discard_invocations, conditional_discard_true,
+                        conditional_discard_false,
                         DreamsCe3FleckTraceDirectory()->string());
         } else if (++dreams_ce3_fleck_trace_misses >= 8) {
             dreams_ce3_fleck_trace_complete = true;
@@ -14557,10 +14575,12 @@ void Rasterizer::DispatchDirect(
         bool enabled{};
         bool submitted_model_candidate{};
         bool submission_fallback{};
+        bool live_observation{};
         bool input_truncated{};
         bool pre_complete{};
         u32 ordinal{};
         u32 input_count{};
+        u32 predicted_attempts{};
         Core::DreamsTrace::ModelBuildSnapshot model{};
         std::filesystem::path directory;
         std::array<DreamsCsgBuilderBoundBuffer, 5> buffers{};
@@ -16730,17 +16750,40 @@ void Rasterizer::DispatchDirect(
     const auto dreams_csg_builder_live_model = trace_dreams_model_builder
                                                    ? Core::DreamsTrace::ReadModelBuild()
                                                    : Core::DreamsTrace::ModelBuildSnapshot{};
+    const bool dreams_csg_builder_live_observation =
+        trace_dreams_model_builder &&
+        IsDreamsModelInputSourceRangeMatch(dreams_csg_builder_live_model);
     if (dreams_csg_builder_marker_observation) {
         constexpr u32 MaxCapturedDispatches = 32;
+        constexpr u32 MaxB4ProbesPerEpoch = 256;
+        constexpr u32 MaxCapturedDispatchesPerEpoch = 2;
         constexpr u32 MaxInputRecords = 1024;
         constexpr u64 MaxB2CaptureBytes = 8_MB;
         constexpr u64 MaxB3CaptureBytes = 8_MB;
         constexpr std::array<u32, 5> ExpectedStrides{8, 92, 168, 56, 200};
         static u32 captured_dispatches{};
         static u32 gate_observations{};
-        const auto capture_model = dreams_csg_builder_submitted_model
-                                       ? submitted_model
-                                       : Core::DreamsTrace::ModelBuildSnapshot{};
+        static u32 probe_observations{};
+        static std::unordered_map<u32, u32> b4_probes_per_epoch;
+        static std::unordered_map<u32, u32> captures_per_epoch;
+        // A submission-wide fallback can remain attached to a long-lived command stream after the
+        // CPU has advanced through many model builds. Prefer the current in-range CPU observation;
+        // it is useful for selection but remains explicitly observational, not a causal GPU tag.
+        const bool capture_live_observation = dreams_csg_builder_live_observation;
+        const bool submitted_model_stale =
+            submitted_model.submission_fallback && dreams_csg_builder_live_model.valid &&
+            dreams_csg_builder_live_model.epoch != 0 &&
+            dreams_csg_builder_live_model.epoch != submitted_model.epoch;
+        const bool capture_submitted_model =
+            !capture_live_observation && dreams_csg_builder_submitted_model &&
+            !submitted_model_stale;
+        const bool capture_association_selected =
+            capture_live_observation || capture_submitted_model;
+        const auto capture_model = capture_live_observation
+                                       ? dreams_csg_builder_live_model
+                                       : capture_submitted_model
+                                             ? submitted_model
+                                             : Core::DreamsTrace::ModelBuildSnapshot{};
         {
             const auto resolve_binding = [&](const u32 binding) {
                 DreamsCsgBuilderBoundBuffer result{};
@@ -16808,6 +16851,12 @@ void Rasterizer::DispatchDirect(
                                         b2_capture_bytes == b2.size;
             const bool b3_range_valid = range_valid(b3, 0, b3_capture_bytes) &&
                                         b3_capture_bytes == b3.size;
+            const u32 probes_for_epoch = capture_association_selected
+                                             ? b4_probes_per_epoch[capture_model.epoch]
+                                             : 0;
+            const u32 captures_for_epoch = capture_association_selected
+                                               ? captures_per_epoch[capture_model.epoch]
+                                               : 0;
             u32 gate_reason{};
             gate_reason |= captured_input_count == 0 ? 1u << 0 : 0;
             for (u32 binding = 0; binding < dreams_tagged_csg_builder.buffers.size(); ++binding) {
@@ -16818,15 +16867,21 @@ void Rasterizer::DispatchDirect(
             gate_reason |= !b2_range_valid ? 1u << 6 : 0;
             gate_reason |= !b3_range_valid ? 1u << 7 : 0;
             gate_reason |= !b4_range_valid ? 1u << 8 : 0;
-            gate_reason |= captured_dispatches >= MaxCapturedDispatches ? 1u << 9 : 0;
+            gate_reason |= !capture_association_selected ? 1u << 9 : 0;
+            gate_reason |= captured_dispatches >= MaxCapturedDispatches ? 1u << 10 : 0;
+            gate_reason |= captures_for_epoch >= MaxCapturedDispatchesPerEpoch ? 1u << 11 : 0;
+            gate_reason |= probes_for_epoch >= MaxB4ProbesPerEpoch ? 1u << 12 : 0;
             const u32 gate_ordinal = gate_observations++;
-            if (gate_ordinal < 64) {
+            if (gate_ordinal < 4096) {
                 std::string gate;
                 if (gate_ordinal == 0) {
                     gate = "ordinal\tdispatch\tmarker\tsubmitted_selected\tsubmitted_valid\t"
-                           "submitted_returned\tsubmission_fallback\tsubmitted_epoch\t"
+                           "submitted_returned\tsubmission_fallback\tsubmitted_stale\t"
+                           "submitted_epoch\t"
                            "submitted_model\tlive_valid\tlive_returned\tlive_epoch\tlive_model\t"
-                           "input_count\tgate_reason";
+                           "association_selected\tlive_observation\tobserved_returned\t"
+                           "observed_epoch\tobserved_model\tprobes_for_epoch\t"
+                           "captures_for_epoch\tinput_count\tgate_reason";
                     for (u32 binding = 0; binding < dreams_tagged_csg_builder.buffers.size();
                          ++binding) {
                         gate += fmt::format("\tb{}_reject\tb{}_base\tb{}_stride\tb{}_size\t"
@@ -16836,15 +16891,19 @@ void Rasterizer::DispatchDirect(
                     gate += "\tb2_range\tb3_range\tb4_range\n";
                 }
                 gate += fmt::format(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t"
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     gate_ordinal, dreams_csg_builder_dispatch_ordinal,
                     dreams_csg_builder_marker_observation, dreams_csg_builder_submitted_model,
                     submitted_model.valid, submitted_model.returned,
-                    submitted_model.submission_fallback, submitted_model.epoch,
+                    submitted_model.submission_fallback, submitted_model_stale,
+                    submitted_model.epoch,
                     submitted_model.model_id, dreams_csg_builder_live_model.valid,
                     dreams_csg_builder_live_model.returned, dreams_csg_builder_live_model.epoch,
-                    dreams_csg_builder_live_model.model_id, dreams_csg_builder_input_count,
-                    gate_reason);
+                    dreams_csg_builder_live_model.model_id, capture_association_selected,
+                    capture_live_observation, capture_model.returned, capture_model.epoch,
+                    capture_model.model_id, probes_for_epoch, captures_for_epoch,
+                    dreams_csg_builder_input_count, gate_reason);
                 for (const auto& buffer : dreams_tagged_csg_builder.buffers) {
                     gate += fmt::format("\t{}\t{:#x}\t{}\t{}\t{}", buffer.rejection_mask,
                                         buffer.guest_base, buffer.stride, buffer.size,
@@ -16857,118 +16916,168 @@ void Rasterizer::DispatchDirect(
                 }
             }
             if (gate_reason == 0) {
-                dreams_tagged_csg_builder.enabled = true;
-                dreams_tagged_csg_builder.submitted_model_candidate =
-                    dreams_csg_builder_submitted_model;
-                dreams_tagged_csg_builder.submission_fallback =
-                    dreams_csg_builder_submitted_model && submitted_model.submission_fallback;
-                dreams_tagged_csg_builder.input_truncated =
-                    captured_input_count != dreams_csg_builder_input_count;
-                dreams_tagged_csg_builder.ordinal = ++captured_dispatches;
-                dreams_tagged_csg_builder.input_count = captured_input_count;
-                dreams_tagged_csg_builder.model = capture_model;
-                if (const auto& root = DreamsModelBuilderTraceDirectory()) {
-                    dreams_tagged_csg_builder.directory =
-                        *root / fmt::format(
-                                    "capture-{:03}-submitted-{}-handoff-{}-epoch-{}-model-{}-dispatch-{}",
-                                            dreams_tagged_csg_builder.ordinal,
-                                            dreams_csg_builder_submitted_model,
-                                            dreams_tagged_csg_builder.submission_fallback,
-                                            capture_model.epoch, capture_model.model_id,
-                                            dreams_csg_builder_dispatch_ordinal);
-                    std::error_code error;
-                    std::filesystem::create_directories(dreams_tagged_csg_builder.directory,
-                                                        error);
-                }
-
-                dreams_tagged_csg_builder.b4_pre.resize(
-                    static_cast<u64>(captured_input_count) * 50);
-                std::vector<u32> b2_all(b2_capture_bytes / sizeof(u32));
-                dreams_tagged_csg_builder.b3_pre.resize(b3_capture_bytes / sizeof(u32));
-                std::array<DreamsBoundBufferCaptureRegion, 3> input_regions{{
+                ++b4_probes_per_epoch[capture_model.epoch];
+                std::vector<u32> b4_probe(static_cast<u64>(captured_input_count) * 50);
+                const std::array<DreamsBoundBufferCaptureRegion, 1> probe_regions{{
                     {
                         .source = b4.descriptor,
                         .relative_offset = b4.logical_base_offset,
                         .destination = std::span<u8>{
-                            reinterpret_cast<u8*>(dreams_tagged_csg_builder.b4_pre.data()),
-                            dreams_tagged_csg_builder.b4_pre.size() * sizeof(u32)},
-                    },
-                    {
-                        .source = b2.descriptor,
-                        .relative_offset = b2.logical_base_offset,
-                        .destination = std::span<u8>{reinterpret_cast<u8*>(b2_all.data()),
-                                                     b2_all.size() * sizeof(u32)},
-                    },
-                    {
-                        .source = b3.descriptor,
-                        .relative_offset = b3.logical_base_offset,
-                        .destination = std::span<u8>{
-                            reinterpret_cast<u8*>(dreams_tagged_csg_builder.b3_pre.data()),
-                            dreams_tagged_csg_builder.b3_pre.size() * sizeof(u32)},
+                            reinterpret_cast<u8*>(b4_probe.data()),
+                            b4_probe.size() * sizeof(u32)},
                     },
                 }};
-                const bool inputs_read = ReadDreamsBoundBufferRegionsForCapture(
-                    scheduler, buffer_cache, input_regions);
-
-                auto* gds = buffer_cache.GetGdsBuffer();
-                constexpr u64 GdsOffset = 576 * sizeof(u32);
-                constexpr u64 GdsSize = 5 * sizeof(u32);
-                const bool gds_valid = GdsOffset + GdsSize <= gds->mapped_data.size();
-                if (gds_valid) {
-                    gds->InvalidateMappedRange(GdsOffset, GdsSize);
-                    std::memcpy(&dreams_tagged_csg_builder.gds_pre[0],
-                                gds->mapped_data.data() + 576 * sizeof(u32), sizeof(u32));
-                    std::memcpy(&dreams_tagged_csg_builder.gds_pre[1],
-                                gds->mapped_data.data() + 580 * sizeof(u32), sizeof(u32));
-                }
-
-                u32 invalid_b2_indices{};
-                dreams_tagged_csg_builder.b2_indices.resize(captured_input_count);
-                dreams_tagged_csg_builder.b2_pre.resize(
-                    static_cast<u64>(captured_input_count) * 42);
-                if (inputs_read) {
+                const bool b4_probe_read = ReadDreamsBoundBufferRegionsForCapture(
+                    scheduler, buffer_cache, probe_regions);
+                u32 predicted_attempts{};
+                if (b4_probe_read) {
                     for (u32 record = 0; record < captured_input_count; ++record) {
-                        const u32 b2_index =
-                            dreams_tagged_csg_builder.b4_pre[record * 50 + 25] & 0xffffu;
-                        dreams_tagged_csg_builder.b2_indices[record] = b2_index;
-                        const u64 b2_word = static_cast<u64>(b2_index) * 42;
-                        if (b2_word + 42 > b2_all.size()) {
-                            ++invalid_b2_indices;
-                            continue;
+                        const u32 word24 = b4_probe[static_cast<u64>(record) * 50 + 24];
+                        if ((word24 & (1u << 30)) != 0) {
+                            predicted_attempts += std::popcount((word24 >> 16) & 0xfu);
                         }
-                        std::memcpy(dreams_tagged_csg_builder.b2_pre.data() + record * 42,
-                                    b2_all.data() + b2_word, 42 * sizeof(u32));
                     }
                 }
-                dreams_tagged_csg_builder.pre_complete =
-                    inputs_read && gds_valid && invalid_b2_indices == 0 &&
-                    !dreams_tagged_csg_builder.input_truncated;
+                const u32 probe_ordinal = probe_observations++;
+                if (probe_ordinal < 4096) {
+                    std::string probe;
+                    if (probe_ordinal == 0) {
+                        probe = "ordinal\tdispatch\tassociation\tlive_observation\t"
+                                "model_returned\tepoch\tmodel\tinput_count\tb4_read\t"
+                                "predicted_attempts\tprobes_for_epoch\tcaptures_for_epoch\n";
+                    }
+                    probe += fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                         probe_ordinal, dreams_csg_builder_dispatch_ordinal,
+                                         capture_live_observation ? "observational-live"
+                                                                  : "submitted",
+                                         capture_live_observation, capture_model.returned,
+                                         capture_model.epoch, capture_model.model_id,
+                                         captured_input_count, b4_probe_read, predicted_attempts,
+                                         b4_probes_per_epoch[capture_model.epoch],
+                                         captures_per_epoch[capture_model.epoch]);
+                    if (const auto& root = DreamsModelBuilderTraceDirectory()) {
+                        AppendDreamsCaptureText(*root / "probe.tsv", probe);
+                    }
+                }
+                if (b4_probe_read && predicted_attempts != 0) {
+                    ++captures_per_epoch[capture_model.epoch];
+                    dreams_tagged_csg_builder.enabled = true;
+                    dreams_tagged_csg_builder.submitted_model_candidate =
+                        capture_submitted_model;
+                    dreams_tagged_csg_builder.submission_fallback =
+                        capture_submitted_model && submitted_model.submission_fallback;
+                    dreams_tagged_csg_builder.live_observation = capture_live_observation;
+                    dreams_tagged_csg_builder.input_truncated =
+                        captured_input_count != dreams_csg_builder_input_count;
+                    dreams_tagged_csg_builder.ordinal = ++captured_dispatches;
+                    dreams_tagged_csg_builder.input_count = captured_input_count;
+                    dreams_tagged_csg_builder.predicted_attempts = predicted_attempts;
+                    dreams_tagged_csg_builder.model = capture_model;
+                    if (const auto& root = DreamsModelBuilderTraceDirectory()) {
+                        dreams_tagged_csg_builder.directory =
+                            *root / fmt::format(
+                                        "capture-{:03}-association-{}-epoch-{}-model-{}-dispatch-{}",
+                                        dreams_tagged_csg_builder.ordinal,
+                                        capture_live_observation ? "observational-live"
+                                                                 : "submitted",
+                                        capture_model.epoch, capture_model.model_id,
+                                        dreams_csg_builder_dispatch_ordinal);
+                        std::error_code error;
+                        std::filesystem::create_directories(dreams_tagged_csg_builder.directory,
+                                                            error);
+                    }
 
-                const u64 b0_available_records =
-                    dreams_tagged_csg_builder.gds_pre[1] <= b0.size / 8
-                        ? b0.size / 8 - dreams_tagged_csg_builder.gds_pre[1]
-                        : 0;
-                const u64 b1_available_records =
-                    dreams_tagged_csg_builder.gds_pre[0] <= b1.size / 92
-                        ? b1.size / 92 - dreams_tagged_csg_builder.gds_pre[0]
-                        : 0;
-                dreams_tagged_csg_builder.b0_post.resize(
-                    static_cast<u64>(std::min<u64>(captured_input_count, b0_available_records)) *
-                    2);
-                dreams_tagged_csg_builder.b1_post.resize(
-                    static_cast<u64>(std::min<u64>(captured_input_count, b1_available_records)) *
-                    23);
-                LOG_WARNING(
-                    Render_Vulkan,
-                    "Dreams tagged CSG builder pre #{} submitted={} handoff={} epoch={} model={} "
-                    "dispatch={} inputs={}/{} GDS576={} GDS580={} complete={} invalid_b2={}",
-                    dreams_tagged_csg_builder.ordinal,
-                    dreams_tagged_csg_builder.submitted_model_candidate,
-                    dreams_tagged_csg_builder.submission_fallback, capture_model.epoch,
-                    capture_model.model_id, dreams_csg_builder_dispatch_ordinal,
-                    captured_input_count, dreams_csg_builder_input_count,
-                    dreams_tagged_csg_builder.gds_pre[0], dreams_tagged_csg_builder.gds_pre[1],
-                    dreams_tagged_csg_builder.pre_complete, invalid_b2_indices);
+                    dreams_tagged_csg_builder.b4_pre = std::move(b4_probe);
+                    std::vector<u32> b2_all(b2_capture_bytes / sizeof(u32));
+                    dreams_tagged_csg_builder.b3_pre.resize(b3_capture_bytes / sizeof(u32));
+                    std::array<DreamsBoundBufferCaptureRegion, 2> input_regions{{
+                        {
+                            .source = b2.descriptor,
+                            .relative_offset = b2.logical_base_offset,
+                            .destination = std::span<u8>{reinterpret_cast<u8*>(b2_all.data()),
+                                                         b2_all.size() * sizeof(u32)},
+                        },
+                        {
+                            .source = b3.descriptor,
+                            .relative_offset = b3.logical_base_offset,
+                            .destination = std::span<u8>{
+                                reinterpret_cast<u8*>(dreams_tagged_csg_builder.b3_pre.data()),
+                                dreams_tagged_csg_builder.b3_pre.size() * sizeof(u32)},
+                        },
+                    }};
+                    const bool inputs_read = ReadDreamsBoundBufferRegionsForCapture(
+                        scheduler, buffer_cache, input_regions);
+
+                    auto* gds = buffer_cache.GetGdsBuffer();
+                    constexpr u64 GdsOffset = 576 * sizeof(u32);
+                    constexpr u64 GdsSize = 5 * sizeof(u32);
+                    const bool gds_valid = GdsOffset + GdsSize <= gds->mapped_data.size();
+                    if (gds_valid) {
+                        gds->InvalidateMappedRange(GdsOffset, GdsSize);
+                        std::memcpy(&dreams_tagged_csg_builder.gds_pre[0],
+                                    gds->mapped_data.data() + 576 * sizeof(u32), sizeof(u32));
+                        std::memcpy(&dreams_tagged_csg_builder.gds_pre[1],
+                                    gds->mapped_data.data() + 580 * sizeof(u32), sizeof(u32));
+                    }
+
+                    u32 invalid_b2_indices{};
+                    dreams_tagged_csg_builder.b2_indices.resize(captured_input_count);
+                    dreams_tagged_csg_builder.b2_pre.resize(
+                        static_cast<u64>(captured_input_count) * 42);
+                    if (inputs_read) {
+                        for (u32 record = 0; record < captured_input_count; ++record) {
+                            const u32 b2_index =
+                                dreams_tagged_csg_builder.b4_pre[record * 50 + 25] & 0xffffu;
+                            dreams_tagged_csg_builder.b2_indices[record] = b2_index;
+                            const u64 b2_word = static_cast<u64>(b2_index) * 42;
+                            if (b2_word + 42 > b2_all.size()) {
+                                ++invalid_b2_indices;
+                                continue;
+                            }
+                            std::memcpy(dreams_tagged_csg_builder.b2_pre.data() + record * 42,
+                                        b2_all.data() + b2_word, 42 * sizeof(u32));
+                        }
+                    }
+                    dreams_tagged_csg_builder.pre_complete =
+                        inputs_read && gds_valid && invalid_b2_indices == 0 &&
+                        !dreams_tagged_csg_builder.input_truncated;
+
+                    const u64 b0_available_records =
+                        dreams_tagged_csg_builder.gds_pre[1] <= b0.size / 8
+                            ? b0.size / 8 - dreams_tagged_csg_builder.gds_pre[1]
+                            : 0;
+                    const u64 b1_available_records =
+                        dreams_tagged_csg_builder.gds_pre[0] <= b1.size / 92
+                            ? b1.size / 92 - dreams_tagged_csg_builder.gds_pre[0]
+                            : 0;
+                    dreams_tagged_csg_builder.b0_post.resize(
+                        static_cast<u64>(
+                            std::min<u64>(predicted_attempts, b0_available_records)) *
+                        2);
+                    dreams_tagged_csg_builder.b1_post.resize(
+                        static_cast<u64>(
+                            std::min<u64>(predicted_attempts, b1_available_records)) *
+                        23);
+                    LOG_WARNING(
+                        Render_Vulkan,
+                        "Dreams tagged CSG builder pre #{} association={} live_observation={} "
+                        "returned={} submitted={} handoff={} epoch={} model={} dispatch={} "
+                        "inputs={}/{} predicted_attempts={} GDS576={} GDS580={} complete={} "
+                        "invalid_b2={}",
+                        dreams_tagged_csg_builder.ordinal,
+                        dreams_tagged_csg_builder.live_observation ? "observational-live"
+                                                                  : "submitted",
+                        dreams_tagged_csg_builder.live_observation,
+                        dreams_tagged_csg_builder.model.returned,
+                        dreams_tagged_csg_builder.submitted_model_candidate,
+                        dreams_tagged_csg_builder.submission_fallback, capture_model.epoch,
+                        capture_model.model_id, dreams_csg_builder_dispatch_ordinal,
+                        captured_input_count, dreams_csg_builder_input_count,
+                        dreams_tagged_csg_builder.predicted_attempts,
+                        dreams_tagged_csg_builder.gds_pre[0],
+                        dreams_tagged_csg_builder.gds_pre[1],
+                        dreams_tagged_csg_builder.pre_complete, invalid_b2_indices);
+                }
             }
         }
     }
@@ -22257,20 +22366,28 @@ void Rasterizer::DispatchDirect(
             files_ok &= WriteDreamsCaptureText(
                 dreams_tagged_csg_builder.directory / "identity.tsv", identity);
             const std::string metadata = fmt::format(
-                "ordinal\tsubmitted_candidate\tsubmission_fallback\tepoch\tmodel\tdispatch\t"
-                "input_count\t"
+                "ordinal\tassociation\tlive_observation\tmodel_returned\t"
+                "submitted_candidate\tsubmission_fallback\tepoch\tmodel\tdispatch\t"
+                "input_count\tpredicted_attempts\tidentity_mapping\t"
                 "input_truncated\tpre_complete\t"
                 "gds576_pre\tgds576_post\tb1_delta\tgds580_pre\tgds580_post\tb0_delta\t"
                 "counter_reset\toutputs_read\toutputs_truncated\tmapped_queue\tlow24_matches\t"
                 "full_matches\tb4_hash\tb2_hash\tb3_hash\tb0_hash\tb1_hash\n"
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t"
-                "{}\t{}\t{}\t{}\t{}\t{:#018x}\t{:#018x}\t{:#018x}\t{:#018x}\t{:#018x}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t"
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{:#018x}\t"
+                "{:#018x}\t{:#018x}\t{:#018x}\n",
                 dreams_tagged_csg_builder.ordinal,
+                dreams_tagged_csg_builder.live_observation ? "observational-live"
+                                                          : "submitted",
+                dreams_tagged_csg_builder.live_observation,
+                dreams_tagged_csg_builder.model.returned,
                 dreams_tagged_csg_builder.submitted_model_candidate,
                 dreams_tagged_csg_builder.submission_fallback,
                 dreams_tagged_csg_builder.model.epoch,
                 dreams_tagged_csg_builder.model.model_id, dreams_csg_builder_dispatch_ordinal,
                 dreams_tagged_csg_builder.input_count,
+                dreams_tagged_csg_builder.predicted_attempts,
+                "heuristic-low24",
                 dreams_tagged_csg_builder.input_truncated,
                 dreams_tagged_csg_builder.pre_complete, dreams_tagged_csg_builder.gds_pre[0],
                 dreams_tagged_csg_builder.gds_post[0], b1_delta,
@@ -22281,32 +22398,50 @@ void Rasterizer::DispatchDirect(
             files_ok &= WriteDreamsCaptureText(
                 dreams_tagged_csg_builder.directory / "metadata.tsv", metadata);
             if (const auto& root = DreamsModelBuilderTraceDirectory()) {
-                files_ok &= AppendDreamsCaptureText(
-                    *root / "manifest.tsv",
-                    fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                                dreams_tagged_csg_builder.ordinal,
-                                dreams_tagged_csg_builder.submitted_model_candidate,
-                                dreams_tagged_csg_builder.submission_fallback,
-                                dreams_tagged_csg_builder.model.epoch,
-                                dreams_tagged_csg_builder.model.model_id,
-                                dreams_csg_builder_dispatch_ordinal,
-                                dreams_tagged_csg_builder.input_count, b1_delta, b0_delta,
-                                low24_matches, full_metadata_matches,
-                                dreams_tagged_csg_builder.pre_complete,
-                                !outputs_truncated && outputs_read,
-                                dreams_tagged_csg_builder.directory.filename().string()));
+                std::string manifest;
+                if (dreams_tagged_csg_builder.ordinal == 1) {
+                    manifest = "ordinal\tassociation\tlive_observation\tmodel_returned\t"
+                               "submitted_candidate\tsubmission_fallback\tepoch\tmodel\tdispatch\t"
+                               "input_count\tpredicted_attempts\tidentity_mapping\tb1_delta\t"
+                               "b0_delta\tlow24_matches\tfull_matches\tpre_complete\t"
+                               "outputs_complete\tdirectory\n";
+                }
+                manifest += fmt::format(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t"
+                    "{}\t{}\t{}\n",
+                    dreams_tagged_csg_builder.ordinal,
+                    dreams_tagged_csg_builder.live_observation ? "observational-live"
+                                                              : "submitted",
+                    dreams_tagged_csg_builder.live_observation,
+                    dreams_tagged_csg_builder.model.returned,
+                    dreams_tagged_csg_builder.submitted_model_candidate,
+                    dreams_tagged_csg_builder.submission_fallback,
+                    dreams_tagged_csg_builder.model.epoch,
+                    dreams_tagged_csg_builder.model.model_id,
+                    dreams_csg_builder_dispatch_ordinal,
+                    dreams_tagged_csg_builder.input_count,
+                    dreams_tagged_csg_builder.predicted_attempts, "heuristic-low24", b1_delta,
+                    b0_delta, low24_matches, full_metadata_matches,
+                    dreams_tagged_csg_builder.pre_complete, !outputs_truncated && outputs_read,
+                    dreams_tagged_csg_builder.directory.filename().string());
+                files_ok &= AppendDreamsCaptureText(*root / "manifest.tsv", manifest);
             }
         }
         LOG_WARNING(
             Render_Vulkan,
-            "Dreams tagged CSG builder post #{} submitted={} handoff={} epoch={} model={} dispatch={} "
-            "GDS576={}->{} b1={} GDS580={}->{} b0={} mapped={} low24={} full={} "
-            "complete={} files_ok={}",
+            "Dreams tagged CSG builder post #{} association={} live_observation={} returned={} "
+            "submitted={} handoff={} epoch={} model={} dispatch={} predicted_attempts={} "
+            "GDS576={}->{} b1={} GDS580={}->{} b0={} mapped={} low24={} full={} complete={} "
+            "files_ok={}",
             dreams_tagged_csg_builder.ordinal,
+            dreams_tagged_csg_builder.live_observation ? "observational-live" : "submitted",
+            dreams_tagged_csg_builder.live_observation,
+            dreams_tagged_csg_builder.model.returned,
             dreams_tagged_csg_builder.submitted_model_candidate,
             dreams_tagged_csg_builder.submission_fallback,
             dreams_tagged_csg_builder.model.epoch,
             dreams_tagged_csg_builder.model.model_id, dreams_csg_builder_dispatch_ordinal,
+            dreams_tagged_csg_builder.predicted_attempts,
             dreams_tagged_csg_builder.gds_pre[0], dreams_tagged_csg_builder.gds_post[0], b1_delta,
             dreams_tagged_csg_builder.gds_pre[1], dreams_tagged_csg_builder.gds_post[1], b0_delta,
             mapped_queue_records, low24_matches, full_metadata_matches,

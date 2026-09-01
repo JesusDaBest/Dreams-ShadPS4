@@ -126,6 +126,14 @@ static void EmitCe3FleckDiscardCapture(EmitContext& ctx, Id condition) {
     ctx.OpBranchConditional(id_matches, match_label, match_merge_label);
 
     ctx.AddLabel(match_label);
+    ctx.OpAtomicIAdd(
+        ctx.U32[1], pointer(ctx.ConstU32(Capture::ConditionalDiscardInvocationsDword)),
+        device_scope, acquire_release_semantics, ctx.u32_one_value);
+    const Id condition_counter = ctx.OpSelect(
+        ctx.U32[1], condition, ctx.ConstU32(Capture::ConditionalDiscardTrueDword),
+        ctx.ConstU32(Capture::ConditionalDiscardFalseDword));
+    ctx.OpAtomicIAdd(ctx.U32[1], pointer(condition_counter), device_scope,
+                     acquire_release_semantics, ctx.u32_one_value);
     constexpr u32 DiscardBit = 1U << Capture::StaticSampleSites;
     const Id previous = ctx.OpAtomicOr(
         ctx.U32[1], pointer(ctx.ConstU32(Capture::SeenDword)), device_scope,
