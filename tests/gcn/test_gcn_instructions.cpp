@@ -96,6 +96,55 @@ TEST(GcnDecode, Vop3DestinationCountDistinguishesAFromB) {
     EXPECT_EQ(inst.dst[1].code, 0);
 }
 
+TEST(GcnDecode, DreamsB535InitialGateComparisonsKeepExactOperandsAndMaskDestinations) {
+    using namespace Shader::Gcn;
+    struct GateComparison {
+        std::array<u32, 2> words;
+        Opcode opcode;
+        OperandField src0_field;
+        u32 src0_code;
+        u32 src1_code;
+        OperandField mask_field;
+        u32 mask_code;
+        bool src1_abs;
+        bool src1_neg;
+    };
+    // Exact instruction words at PCs 0x190, 0x218, 0x258, 0x260, and 0x28c in Dreams compute
+    // shader 0xb535c6c8. VOP3A compares have one architectural mask destination; the decoder keeps
+    // that destination in dst[1] so it shares the VOPC/VOP3B translation path.
+    constexpr std::array comparisons{
+        GateComparison{{0xd008026a, 0x40020b02}, Opcode::V_CMP_GT_F32,
+                       OperandField::VectorGPR, 2, 5, OperandField::VccLo, 106, true, true},
+        GateComparison{{0xd0080208, 0x40020908}, Opcode::V_CMP_GT_F32,
+                       OperandField::VectorGPR, 8, 4, OperandField::ScalarGPR, 8, true, true},
+        GateComparison{{0xd008026a, 0x40020302}, Opcode::V_CMP_GT_F32,
+                       OperandField::VectorGPR, 2, 1, OperandField::VccLo, 106, true, true},
+        GateComparison{{0xd002000a, 0x0002081a}, Opcode::V_CMP_LT_F32,
+                       OperandField::ScalarGPR, 26, 4, OperandField::ScalarGPR, 10, false, false},
+        GateComparison{{0xd008026a, 0x40020d05}, Opcode::V_CMP_GT_F32,
+                       OperandField::VectorGPR, 5, 6, OperandField::VccLo, 106, true, true},
+    };
+
+    GcnDecodeContext decoder;
+    for (const auto& expected : comparisons) {
+        GcnCodeSlice code{expected.words.data(), expected.words.data() + expected.words.size()};
+        const GcnInst inst = decoder.decodeInstruction(code);
+        EXPECT_EQ(inst.opcode, expected.opcode);
+        EXPECT_EQ(inst.src_count, 2);
+        EXPECT_EQ(inst.dst_count, 1);
+        EXPECT_EQ(inst.src[0].field, expected.src0_field);
+        EXPECT_EQ(inst.src[0].code, expected.src0_code);
+        EXPECT_EQ(inst.src[1].field, OperandField::VectorGPR);
+        EXPECT_EQ(inst.src[1].code, expected.src1_code);
+        EXPECT_FALSE(inst.src[0].input_modifier.abs);
+        EXPECT_FALSE(inst.src[0].input_modifier.neg);
+        EXPECT_EQ(inst.src[1].input_modifier.abs, expected.src1_abs);
+        EXPECT_EQ(inst.src[1].input_modifier.neg, expected.src1_neg);
+        EXPECT_EQ(inst.dst[1].field, expected.mask_field);
+        EXPECT_EQ(inst.dst[1].code, expected.mask_code);
+    }
+}
+
 struct F32x2 {
     float a;
     float b;

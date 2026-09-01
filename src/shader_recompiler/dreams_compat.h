@@ -456,7 +456,7 @@ static_assert(SceneCompactOrderedScratchBaseDword + SceneCompactOrderedScratchDw
 namespace B535MembershipCapture {
 // Increment whenever the fixed per-lane record layout changes. This participates in the
 // diagnostic shader cache key, independently of the guest-visible traversal lowering revision.
-constexpr u32 Schema = 2;
+constexpr u32 Schema = 3;
 constexpr u32 BaseDword = SculptOrderedStateBaseDword + SculptOrderedStateDwords;
 constexpr u32 HeaderDwords = 0x40;
 constexpr u32 ArmDword = BaseDword;

@@ -2472,9 +2472,19 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
                 ASSERT_MSG(inst.opcode == expected_opcode,
                            "B535 initial gate PC {:#x} changed opcode from {} to {}", inst_pc,
                            static_cast<u32>(expected_opcode), static_cast<u32>(inst.opcode));
-                ASSERT_MSG(inst.src_count >= 2 && inst.dst_count >= 2,
-                           "B535 initial gate PC {:#x} no longer has two inputs and a mask output",
-                           inst_pc);
+                constexpr std::array expected_mask_fields{
+                    OperandField::VccLo, OperandField::ScalarGPR, OperandField::VccLo,
+                    OperandField::ScalarGPR, OperandField::VccLo,
+                };
+                constexpr std::array expected_mask_codes{106u, 8u, 106u, 10u, 106u};
+                ASSERT_MSG(
+                    inst.src_count == 2 &&
+                        inst.dst[1].field == expected_mask_fields[b535_initial_gate_site] &&
+                        inst.dst[1].code == expected_mask_codes[b535_initial_gate_site],
+                    "B535 initial gate PC {:#x} no longer has the expected two inputs and mask "
+                    "destination field/code {}/{}",
+                    inst_pc, static_cast<u32>(expected_mask_fields[b535_initial_gate_site]),
+                    expected_mask_codes[b535_initial_gate_site]);
                 b535_initial_gate_inputs = {GetSrc<IR::F32>(inst.src[0]),
                                             GetSrc<IR::F32>(inst.src[1])};
             }
