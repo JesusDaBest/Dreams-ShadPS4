@@ -7925,8 +7925,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::KeysBaseDword) * sizeof(u32);
     constexpr u32 Ce3CoverageTraceKeysSize =
         Shader::DreamsCompat::Ce3CoverageTrace::Slots * sizeof(u32);
-    constexpr u64 Ce3CoverageTraceParam1YOffset =
-        static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::Param1YBaseDword) * sizeof(u32);
+    constexpr u64 Ce3CoverageTraceParam1XMinOffset =
+        static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::Param1XMinBaseDword) *
+        sizeof(u32);
     constexpr u64 Ce3CoverageTraceFragXMinOffset =
         static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::FragXMinBaseDword) * sizeof(u32);
     constexpr u64 Ce3CoverageTraceFragYMinOffset =
@@ -10009,7 +10010,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                 Ce3CoverageTraceKeysOffset, Ce3CoverageTraceKeysSize,
                 Shader::DreamsCompat::Ce3CoverageTrace::ClaimSentinel);
             dreams_ce3_coverage_trace_gds->Fill(
-                Ce3CoverageTraceParam1YOffset, Ce3CoverageTraceKeysSize,
+                Ce3CoverageTraceParam1XMinOffset, Ce3CoverageTraceKeysSize,
                 Shader::DreamsCompat::Ce3CoverageTrace::ClaimSentinel);
             dreams_ce3_coverage_trace_gds->Fill(
                 Ce3CoverageTraceFragXMinOffset, Ce3CoverageTraceKeysSize,
@@ -13811,13 +13812,39 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         const u32 miss_conditional_true = word(Capture::MissConditionalTrueDword);
         const u32 miss_conditional_false = word(Capture::MissConditionalFalseDword);
         const u32 miss_unconditional = word(Capture::MissUnconditionalDword);
-        const u32 param1_y_conflicts = word(Capture::Param1YConflictDword);
+        std::array<u32, Capture::DecisionSites> miss_decision{};
+        for (u32 site = 0; site < Capture::DecisionSites; ++site) {
+            miss_decision[site] = word(Capture::MissDecisionBaseDword + site);
+        }
+        const u32 miss_loop = word(Capture::MissLoopDword);
+        std::array<u32, Capture::TrinarySites> miss_trinary{};
+        for (u32 site = 0; site < Capture::TrinarySites; ++site) {
+            miss_trinary[site] = word(Capture::MissTrinaryBaseDword + site);
+        }
         const u32 sample_bin_overflows = word(Capture::SampleBinOverflowDword);
-        const u64 misses = static_cast<u64>(miss_initial) + miss_raymarch_sample +
-                           miss_conditional_true + miss_conditional_false + miss_unconditional;
+        const u32 counter_overflows = word(Capture::CounterOverflowDword);
+        u64 misses = static_cast<u64>(miss_initial) + miss_raymarch_sample +
+                     miss_conditional_true + miss_conditional_false + miss_unconditional +
+                     miss_loop;
+        for (const u32 miss : miss_decision) {
+            misses += miss;
+        }
+        for (const u32 miss : miss_trinary) {
+            misses += miss;
+        }
         u32 occupied{};
         u32 metadata_missing_rows{};
+        u32 param1_x_varying_rows{};
         u32 initial_bin_mismatch_rows{};
+        u32 terminal_mismatch_rows{};
+        u32 decision_exact_mismatch_rows{};
+        u32 decision_initial_mismatch_rows{};
+        u32 decision_raymarch_mismatch_rows{};
+        u32 trinary_initial_mismatch_rows{};
+        u32 trinary_raymarch_mismatch_rows{};
+        u32 trinary_ray_entry_mismatch_rows{};
+        u32 loop_partition_mismatch_rows{};
+        u32 loop_hit_decision_mismatch_rows{};
         u64 initial_total{};
         u64 initial_sample_low_total{};
         u64 initial_sample_high_total{};
@@ -13826,18 +13853,45 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         u64 conditional_true_total{};
         u64 conditional_false_total{};
         u64 unconditional_total{};
+        std::array<std::array<u64, Capture::DecisionCategories>, Capture::DecisionSites>
+            decision_totals{};
+        std::array<u64, Capture::DecisionSites> decision_guest_negative_totals{};
+        std::array<u64, Capture::DecisionSites> decision_guest_nonnegative_totals{};
+        u64 loop_hit_total{};
+        u64 loop_bound_no_hit_total{};
+        std::array<u64, Capture::TrinarySites> trinary_invocation_totals{};
+        std::array<std::array<u64, Capture::TrinaryValues>, Capture::TrinarySites>
+            trinary_nan_totals{};
         std::string coverage =
-            "slot\tparam1\tparam1_y\tatlas_id\tfrag_x_min\tfrag_x_max\tfrag_y_min\t"
+            "slot\tparam1_y\tparam1_x_min\tparam1_x_max\tatlas_id_min\tatlas_id_max\t"
+            "frag_x_min\tfrag_x_max\tfrag_y_min\t"
             "frag_y_max\tinitial\tinitial_sample_lt_half\tinitial_sample_ge_half\t"
             "raymarch_sample_total\traymarch_sample_lt_half\t"
             "raymarch_sample_ge_half\tconditional_total\tconditional_true\t"
-            "conditional_false\tunconditional\tterminal_total\n";
+            "conditional_false\tunconditional\tterminal_total\t"
+            "decision_338_guest_negative\tdecision_338_guest_nonnegative\t"
+            "decision_338_nan\tdecision_338_robust_negative\tdecision_338_near_zero\t"
+            "decision_338_robust_positive\tdecision_430_guest_negative\t"
+            "decision_430_guest_nonnegative\tdecision_430_nan\t"
+            "decision_430_robust_negative\tdecision_430_near_zero\t"
+            "decision_430_robust_positive\tloop_hit\tloop_bound_no_hit\t"
+            "trinary_374_vs_decision_338_nonnegative_mismatch\t"
+            "loop_partition_vs_decision_338_nonnegative_mismatch\t"
+            "loop_hit_vs_decision_430_negative_mismatch";
+        for (u32 site = 0; site < Capture::TrinarySites; ++site) {
+            coverage += fmt::format(
+                "\ttrinary_{}_invocations\ttrinary_{}_input0_nan\t"
+                "trinary_{}_input1_nan\ttrinary_{}_input2_nan\ttrinary_{}_output_nan",
+                site, site, site, site, site);
+        }
+        coverage += "\n";
         for (u32 slot = 0; slot < Capture::Slots; ++slot) {
             const u32 key = word(Capture::KeysBaseDword + slot);
             if (key == Capture::ClaimSentinel) {
                 continue;
             }
-            const u32 param1_y = word(Capture::Param1YBaseDword + slot);
+            const u32 param1_x_min = word(Capture::Param1XMinBaseDword + slot);
+            const u32 param1_x_max = word(Capture::Param1XMaxBaseDword + slot);
             const u32 frag_x_min_bits = word(Capture::FragXMinBaseDword + slot);
             const u32 frag_x_max_bits = word(Capture::FragXMaxBaseDword + slot);
             const u32 frag_y_min_bits = word(Capture::FragYMinBaseDword + slot);
@@ -13861,20 +13915,98 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             const u64 conditional_total =
                 static_cast<u64>(conditional_true) + conditional_false;
             const u64 terminal_total = conditional_total + unconditional;
+            std::array<std::array<u32, Capture::DecisionCategories>, Capture::DecisionSites>
+                decisions{};
+            std::array<u64, Capture::DecisionSites> decision_site_totals{};
+            std::array<u32, Capture::DecisionSites> decision_guest_negative{};
+            std::array<u32, Capture::DecisionSites> decision_guest_nonnegative{};
+            for (u32 site = 0; site < Capture::DecisionSites; ++site) {
+                decision_guest_negative[site] =
+                    word(Capture::DecisionGuestNegativeBaseDword + site * Capture::Slots + slot);
+                decision_guest_nonnegative[site] = word(
+                    Capture::DecisionGuestNonnegativeBaseDword + site * Capture::Slots + slot);
+                decision_guest_negative_totals[site] += decision_guest_negative[site];
+                decision_guest_nonnegative_totals[site] += decision_guest_nonnegative[site];
+                for (u32 category = 0; category < Capture::DecisionCategories; ++category) {
+                    decisions[site][category] =
+                        word(Capture::DecisionDword(site, category, slot));
+                    decision_site_totals[site] += decisions[site][category];
+                    decision_totals[site][category] += decisions[site][category];
+                }
+            }
+            const u32 loop_hit = word(Capture::LoopHitBaseDword + slot);
+            const u32 loop_bound_no_hit = word(Capture::LoopBoundNoHitBaseDword + slot);
+            std::array<u32, Capture::TrinarySites> trinary_invocations{};
+            std::array<std::array<u32, Capture::TrinaryValues>, Capture::TrinarySites>
+                trinary_nans{};
+            for (u32 site = 0; site < Capture::TrinarySites; ++site) {
+                trinary_invocations[site] =
+                    word(Capture::TrinaryInvocationDword(site, slot));
+                trinary_invocation_totals[site] += trinary_invocations[site];
+                for (u32 value = 0; value < Capture::TrinaryValues; ++value) {
+                    trinary_nans[site][value] =
+                        word(Capture::TrinaryNaNDword(site, value, slot));
+                    trinary_nan_totals[site][value] += trinary_nans[site][value];
+                }
+            }
+            // The guest ISA removes PC-0x338 negative-class lanes before PC 0x374 and the loop.
+            // PC 0x430 removes a lane from the loop on its first negative-class result; after EXEC
+            // restoration, V6 at PC 0x444 distinguishes that hit from reaching the loop bound.
+            const bool trinary_ray_entry_mismatch =
+                trinary_invocations[2] != decision_guest_nonnegative[0];
+            const bool loop_partition_mismatch =
+                static_cast<u64>(loop_hit) + loop_bound_no_hit !=
+                decision_guest_nonnegative[0];
+            const bool loop_hit_decision_mismatch =
+                loop_hit != decision_guest_negative[1];
             coverage += fmt::format(
-                "{}\t{:#010x}\t{:#010x}\t{:#08x}\t{:.9g}\t{:.9g}\t{:.9g}\t{:.9g}\t"
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                slot, key, param1_y, key & 0x00ffffff, frag_x_min, frag_x_max,
-                frag_y_min, frag_y_max, initial, initial_sample_low, initial_sample_high,
-                raymarch_sample_total, raymarch_sample_low, raymarch_sample_high,
-                conditional_total, conditional_true, conditional_false, unconditional,
-                terminal_total);
+                "{}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#08x}\t{:#08x}\t{:.9g}\t{:.9g}\t"
+                "{:.9g}\t{:.9g}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                slot, key, param1_x_min, param1_x_max, param1_x_min & 0x00ffffff,
+                param1_x_max & 0x00ffffff, frag_x_min, frag_x_max, frag_y_min, frag_y_max,
+                initial, initial_sample_low, initial_sample_high, raymarch_sample_total,
+                raymarch_sample_low, raymarch_sample_high, conditional_total, conditional_true,
+                conditional_false, unconditional, terminal_total);
+            for (u32 site = 0; site < Capture::DecisionSites; ++site) {
+                coverage += fmt::format("\t{}\t{}", decision_guest_negative[site],
+                                        decision_guest_nonnegative[site]);
+                for (u32 category = 0; category < Capture::DecisionCategories; ++category) {
+                    coverage += fmt::format("\t{}", decisions[site][category]);
+                }
+            }
+            coverage += fmt::format("\t{}\t{}\t{}\t{}\t{}", loop_hit, loop_bound_no_hit,
+                                    trinary_ray_entry_mismatch, loop_partition_mismatch,
+                                    loop_hit_decision_mismatch);
+            for (u32 site = 0; site < Capture::TrinarySites; ++site) {
+                coverage += fmt::format("\t{}", trinary_invocations[site]);
+                for (u32 value = 0; value < Capture::TrinaryValues; ++value) {
+                    coverage += fmt::format("\t{}", trinary_nans[site][value]);
+                }
+            }
+            coverage += "\n";
             ++occupied;
-            metadata_missing_rows += param1_y == Capture::ClaimSentinel ||
+            metadata_missing_rows += param1_x_min == Capture::ClaimSentinel ||
                                      frag_x_min_bits == Capture::ClaimSentinel ||
                                      frag_y_min_bits == Capture::ClaimSentinel;
+            param1_x_varying_rows += param1_x_min != param1_x_max;
             initial_bin_mismatch_rows +=
                 initial != static_cast<u64>(initial_sample_low) + initial_sample_high;
+            terminal_mismatch_rows += initial != terminal_total;
+            for (u32 site = 0; site < Capture::DecisionSites; ++site) {
+                decision_exact_mismatch_rows +=
+                    decision_site_totals[site] !=
+                    static_cast<u64>(decision_guest_negative[site]) +
+                        decision_guest_nonnegative[site];
+            }
+            decision_initial_mismatch_rows += initial != decision_site_totals[0];
+            decision_raymarch_mismatch_rows += raymarch_sample_total != decision_site_totals[1];
+            trinary_initial_mismatch_rows +=
+                initial != trinary_invocations[0] || initial != trinary_invocations[1];
+            trinary_raymarch_mismatch_rows +=
+                raymarch_sample_total != trinary_invocations[3];
+            trinary_ray_entry_mismatch_rows += trinary_ray_entry_mismatch;
+            loop_partition_mismatch_rows += loop_partition_mismatch;
+            loop_hit_decision_mismatch_rows += loop_hit_decision_mismatch;
             initial_total += initial;
             initial_sample_low_total += initial_sample_low;
             initial_sample_high_total += initial_sample_high;
@@ -13883,11 +14015,31 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             conditional_true_total += conditional_true;
             conditional_false_total += conditional_false;
             unconditional_total += unconditional;
+            loop_hit_total += loop_hit;
+            loop_bound_no_hit_total += loop_bound_no_hit;
         }
 
+        const bool trinary_ray_entry_total_mismatch =
+            trinary_invocation_totals[2] != decision_guest_nonnegative_totals[0];
+        const bool loop_partition_total_mismatch =
+            loop_hit_total + loop_bound_no_hit_total != decision_guest_nonnegative_totals[0];
+        const bool loop_hit_decision_total_mismatch =
+            loop_hit_total != decision_guest_negative_totals[1];
+
         const bool complete = occupied != 0 && misses == 0 && metadata_missing_rows == 0 &&
-                              param1_y_conflicts == 0 && sample_bin_overflows == 0 &&
-                              initial_bin_mismatch_rows == 0;
+                              sample_bin_overflows == 0 && counter_overflows == 0 &&
+                              initial_bin_mismatch_rows == 0 && terminal_mismatch_rows == 0 &&
+                              decision_exact_mismatch_rows == 0 &&
+                              decision_initial_mismatch_rows == 0 &&
+                              decision_raymarch_mismatch_rows == 0 &&
+                              trinary_initial_mismatch_rows == 0 &&
+                              trinary_raymarch_mismatch_rows == 0 &&
+                              trinary_ray_entry_mismatch_rows == 0 &&
+                              loop_partition_mismatch_rows == 0 &&
+                              loop_hit_decision_mismatch_rows == 0 &&
+                              !trinary_ray_entry_total_mismatch &&
+                              !loop_partition_total_mismatch &&
+                              !loop_hit_decision_total_mismatch;
 
         bool files_ok{};
         if (const auto directory = DreamsCe3CoverageTraceDirectory()) {
@@ -13896,40 +14048,85 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                                                 raw_hash);
             files_ok &=
                 WriteDreamsCaptureText(*directory / "ce3-coverage.tsv", coverage);
-            files_ok &= WriteDreamsCaptureText(
-                *directory / "manifest.tsv",
-                fmt::format(
-                    "field\tvalue\nshader\t{:#x}\nslots\t{}\nprobes\t{}\noccupied\t{}\n"
-                    "miss_initial\t{}\nmiss_raymarch_sample\t{}\n"
-                    "miss_conditional_true\t{}\n"
-                    "miss_conditional_false\t{}\nmiss_unconditional\t{}\nmiss_total\t{}\n"
-                    "metadata_missing_rows\t{}\nparam1_y_conflicts\t{}\n"
-                    "sample_bin_overflows\t{}\n"
-                    "initial_bin_mismatch_rows\t{}\ninitial_total\t{}\n"
-                    "initial_sample_lt_half_total\t{}\n"
-                    "initial_sample_ge_half_total\t{}\nraymarch_sample_total\t{}\n"
-                    "raymarch_sample_lt_half_total\t{}\n"
-                    "raymarch_sample_ge_half_total\t{}\nconditional_true_total\t{}\n"
-                    "conditional_false_total\t{}\nunconditional_total\t{}\n"
-                    "terminal_total\t{}\nraw_hash\t{:#x}\ncomplete\t{}\n",
-                    Shader::DreamsCompat::Ce3ReadConstCaptureShader, Capture::Slots,
-                    Capture::Probes, occupied, miss_initial, miss_raymarch_sample,
-                    miss_conditional_true, miss_conditional_false, miss_unconditional, misses,
-                    metadata_missing_rows, param1_y_conflicts, sample_bin_overflows,
-                    initial_bin_mismatch_rows, initial_total, initial_sample_low_total,
-                    initial_sample_high_total,
-                    raymarch_sample_low_total + raymarch_sample_high_total,
-                    raymarch_sample_low_total, raymarch_sample_high_total,
-                    conditional_true_total, conditional_false_total, unconditional_total,
-                    conditional_true_total + conditional_false_total + unconditional_total,
-                    raw_hash, complete));
+            std::string manifest = fmt::format(
+                "field\tvalue\nshader\t{:#x}\nslots\t{}\nprobes\t{}\noccupied\t{}\n"
+                "key\tparam1_y\nsecondary_metadata\tparam1_x_min_max\n"
+                "decision_epsilon\t{:.9g}\nmiss_initial\t{}\nmiss_raymarch_sample\t{}\n"
+                "miss_conditional_true\t{}\nmiss_conditional_false\t{}\n"
+                "miss_unconditional\t{}\nmiss_loop\t{}\n",
+                Shader::DreamsCompat::Ce3ReadConstCaptureShader, Capture::Slots,
+                Capture::Probes, occupied, Capture::DecisionEpsilon, miss_initial,
+                miss_raymarch_sample, miss_conditional_true, miss_conditional_false,
+                miss_unconditional, miss_loop);
+            for (u32 site = 0; site < Capture::DecisionSites; ++site) {
+                manifest += fmt::format("miss_decision_{}\t{}\n", site, miss_decision[site]);
+            }
+            for (u32 site = 0; site < Capture::TrinarySites; ++site) {
+                manifest += fmt::format("miss_trinary_{}\t{}\n", site, miss_trinary[site]);
+            }
+            manifest += fmt::format(
+                "miss_total\t{}\nmetadata_missing_rows\t{}\nparam1_x_varying_rows\t{}\n"
+                "sample_bin_overflows\t{}\ncounter_overflows\t{}\n"
+                "initial_bin_mismatch_rows\t{}\nterminal_mismatch_rows\t{}\n"
+                "decision_exact_mismatch_rows\t{}\n"
+                "decision_initial_mismatch_rows\t{}\ndecision_raymarch_mismatch_rows\t{}\n"
+                "trinary_initial_mismatch_rows\t{}\ntrinary_raymarch_mismatch_rows\t{}\n"
+                "trinary_374_vs_decision_338_nonnegative_mismatch_rows\t{}\n"
+                "loop_partition_vs_decision_338_nonnegative_mismatch_rows\t{}\n"
+                "loop_hit_vs_decision_430_negative_mismatch_rows\t{}\n"
+                "trinary_374_vs_decision_338_nonnegative_total_mismatch\t{}\n"
+                "loop_partition_vs_decision_338_nonnegative_total_mismatch\t{}\n"
+                "loop_hit_vs_decision_430_negative_total_mismatch\t{}\n"
+                "initial_total\t{}\ninitial_sample_lt_half_total\t{}\n"
+                "initial_sample_ge_half_total\t{}\nraymarch_sample_total\t{}\n"
+                "raymarch_sample_lt_half_total\t{}\nraymarch_sample_ge_half_total\t{}\n"
+                "conditional_true_total\t{}\nconditional_false_total\t{}\n"
+                "unconditional_total\t{}\nterminal_total\t{}\nloop_hit_total\t{}\n"
+                "loop_bound_no_hit_total\t{}\n",
+                misses, metadata_missing_rows, param1_x_varying_rows, sample_bin_overflows,
+                counter_overflows, initial_bin_mismatch_rows, terminal_mismatch_rows,
+                decision_exact_mismatch_rows, decision_initial_mismatch_rows,
+                decision_raymarch_mismatch_rows,
+                trinary_initial_mismatch_rows, trinary_raymarch_mismatch_rows,
+                trinary_ray_entry_mismatch_rows, loop_partition_mismatch_rows,
+                loop_hit_decision_mismatch_rows, trinary_ray_entry_total_mismatch,
+                loop_partition_total_mismatch, loop_hit_decision_total_mismatch, initial_total,
+                initial_sample_low_total, initial_sample_high_total,
+                raymarch_sample_low_total + raymarch_sample_high_total,
+                raymarch_sample_low_total, raymarch_sample_high_total, conditional_true_total,
+                conditional_false_total, unconditional_total,
+                conditional_true_total + conditional_false_total + unconditional_total,
+                loop_hit_total, loop_bound_no_hit_total);
+            for (u32 site = 0; site < Capture::DecisionSites; ++site) {
+                manifest += fmt::format("decision_{}_guest_negative_total\t{}\n", site,
+                                        decision_guest_negative_totals[site]);
+                manifest += fmt::format("decision_{}_guest_nonnegative_total\t{}\n", site,
+                                        decision_guest_nonnegative_totals[site]);
+                static constexpr std::array category_names{
+                    "nan", "robust_negative", "near_zero", "robust_positive"};
+                for (u32 category = 0; category < Capture::DecisionCategories; ++category) {
+                    manifest += fmt::format("decision_{}_{}_total\t{}\n", site,
+                                            category_names[category],
+                                            decision_totals[site][category]);
+                }
+            }
+            for (u32 site = 0; site < Capture::TrinarySites; ++site) {
+                manifest += fmt::format("trinary_{}_invocations_total\t{}\n", site,
+                                        trinary_invocation_totals[site]);
+                for (u32 value = 0; value < Capture::TrinaryValues; ++value) {
+                    manifest += fmt::format("trinary_{}_value{}_nan_total\t{}\n", site, value,
+                                            trinary_nan_totals[site][value]);
+                }
+            }
+            manifest += fmt::format("raw_hash\t{:#x}\ncomplete\t{}\n", raw_hash, complete);
+            files_ok &= WriteDreamsCaptureText(*directory / "manifest.tsv", manifest);
             if (files_ok && complete) {
                 files_ok &= WriteDreamsCaptureText(*directory / "complete.txt", "complete\n");
             } else if (files_ok && occupied != 0) {
                 files_ok &= WriteDreamsCaptureText(
                     *directory / "incomplete.txt",
-                    "Coverage trace had a collision, metadata conflict, bin overflow, or "
-                    "inconsistent sample count; rows are partial.\n");
+                    "Coverage trace had a collision, missing metadata, counter overflow, or "
+                    "failed count invariant; rows are partial.\n");
             }
         }
 

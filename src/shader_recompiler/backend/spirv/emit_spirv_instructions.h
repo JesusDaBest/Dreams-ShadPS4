@@ -47,6 +47,10 @@ void EmitPrologue(EmitContext& ctx);
 void EmitEpilogue(EmitContext& ctx);
 void EmitDiscard(EmitContext& ctx);
 void EmitDiscardCond(EmitContext& ctx, Id condition);
+void EmitCe3CoverageDecision(EmitContext& ctx, u32 site, Id value, Id guest_negative);
+void EmitCe3CoverageLoopExit(EmitContext& ctx, Id hit);
+void EmitCe3CoverageTrinary(EmitContext& ctx, u32 site, Id input0, Id input1, Id input2,
+                            Id output);
 void EmitCe3CoverageSample(EmitContext& ctx, u32 site, Id emitted);
 void EmitCe3CoverageConditional(EmitContext& ctx, Id condition);
 void EmitCe3CoverageUnconditional(EmitContext& ctx);

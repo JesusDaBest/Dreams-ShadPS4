@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/dreams_compat.h"
@@ -83,9 +84,48 @@ static bool IsCe3CoverageTarget(const EmitContext& ctx) {
            ctx.stage == Stage::Fragment && ctx.l_stage == LogicalStage::Fragment;
 }
 
-static void EmitCe3CoverageCounter(EmitContext& ctx, Id counter_base, Id miss_counter,
-                                   bool count_per_slot = true, u32 sample_site = 2,
-                                   Id emitted = {}) {
+struct Ce3CoverageAccess {
+    EmitContext& ctx;
+    Id buffer_id;
+    Id pointer_type;
+    Id device_scope;
+    Id acquire_release_semantics;
+    Id selected_slot;
+    Id accepted;
+
+    Id Pointer(Id index) {
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+    }
+
+    Id PerSlotIndex(Id base) {
+        return ctx.OpIAdd(ctx.U32[1], base, selected_slot);
+    }
+
+    void Increment(Id base, Id condition) {
+        namespace Capture = DreamsCompat::Ce3CoverageTrace;
+        const Id sink = ctx.ConstU32(Capture::SinkDword);
+        const Id target = ctx.OpSelect(ctx.U32[1], accepted, PerSlotIndex(base), sink);
+        const Id contributes = ctx.OpLogicalAnd(ctx.U1[1], accepted, condition);
+        const Id increment =
+            ctx.OpSelect(ctx.U32[1], contributes, ctx.u32_one_value, ctx.u32_zero_value);
+        const Id previous = ctx.OpAtomicIAdd(ctx.U32[1], Pointer(target), device_scope,
+                                             acquire_release_semantics, increment);
+        const Id overflow = ctx.OpLogicalAnd(
+            ctx.U1[1], contributes,
+            ctx.OpIEqual(ctx.U1[1], previous, ctx.ConstU32(0xffffffffU)));
+        ctx.OpAtomicIAdd(
+            ctx.U32[1], Pointer(ctx.ConstU32(Capture::CounterOverflowDword)), device_scope,
+            acquire_release_semantics,
+            ctx.OpSelect(ctx.U32[1], overflow, ctx.u32_one_value, ctx.u32_zero_value));
+    }
+
+    void Increment(u32 base, Id condition) {
+        Increment(ctx.ConstU32(base), condition);
+    }
+};
+
+template <typename Callback>
+static void EmitCe3CoverageEvent(EmitContext& ctx, Id miss_counter, Callback&& callback) {
     namespace Capture = DreamsCompat::Ce3CoverageTrace;
     const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
                                        &EmitContext::BufferDefinition::buffer_type);
@@ -110,8 +150,11 @@ static void EmitCe3CoverageCounter(EmitContext& ctx, Id counter_base, Id miss_co
         spv::MemorySemanticsMask::Acquire | spv::MemorySemanticsMask::UniformMemory;
     const Id acquire_release_semantics = ctx.ConstU32(static_cast<u32>(acquire_release));
     const Id acquire_semantics = ctx.ConstU32(static_cast<u32>(acquire));
+    // Param1.y is observed as an exact, flat per-object label for this draw. Param1.x atlas records
+    // can be reused by different objects, so using x here merges unrelated shapes and produces
+    // misleading screen bounds.
     const Id candidate = ctx.OpBitcast(
-        ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param1, 0, 0));
+        ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param1, 1, 0));
     const Id valid = ctx.OpINotEqual(ctx.U1[1], candidate, ctx.ConstU32(Capture::ClaimSentinel));
 
     Id hash = ctx.OpBitwiseXor(
@@ -160,14 +203,32 @@ static void EmitCe3CoverageCounter(EmitContext& ctx, Id counter_base, Id miss_co
         selected_slot = ctx.OpSelect(ctx.U32[1], accepted_here, slot, selected_slot);
         accepted = ctx.OpLogicalOr(ctx.U1[1], accepted, accepted_here);
     }
-    const Id counter_index = count_per_slot
-                                 ? ctx.OpIAdd(ctx.U32[1], counter_base, selected_slot)
-                                 : counter_base;
-    const Id target = ctx.OpSelect(ctx.U32[1], accepted, counter_index, miss_counter);
-    ctx.OpAtomicIAdd(ctx.U32[1], pointer(target), device_scope, acquire_release_semantics,
-                     ctx.u32_one_value);
+    const Id miss_target = ctx.OpSelect(
+        ctx.U32[1], accepted, ctx.ConstU32(Capture::SinkDword), miss_counter);
+    ctx.OpAtomicIAdd(
+        ctx.U32[1], pointer(miss_target), device_scope, acquire_release_semantics,
+        ctx.OpSelect(ctx.U32[1], accepted, ctx.u32_zero_value, ctx.u32_one_value));
 
-    if (sample_site < 2) {
+    Ce3CoverageAccess access{ctx, buffer_id, pointer_type, device_scope,
+                             acquire_release_semantics, selected_slot, accepted};
+    callback(access);
+
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
+static void EmitCe3CoverageCounter(EmitContext& ctx, Id counter_base, Id miss_counter,
+                                   bool count_per_slot = true, u32 sample_site = 2,
+                                   Id emitted = {}) {
+    namespace Capture = DreamsCompat::Ce3CoverageTrace;
+    EmitCe3CoverageEvent(ctx, miss_counter, [&](Ce3CoverageAccess& access) {
+        if (count_per_slot) {
+            access.Increment(counter_base, ctx.true_value);
+        }
+
+        if (sample_site >= 2) {
+            return;
+        }
         const Id sink = ctx.ConstU32(Capture::SinkDword);
         const Id sample_bins_base = ctx.ConstU32(
             sample_site == 0 ? Capture::InitialSampleBinsBaseDword
@@ -178,13 +239,13 @@ static void EmitCe3CoverageCounter(EmitContext& ctx, Id counter_base, Id miss_co
         const Id bin_increment =
             ctx.OpSelect(ctx.U32[1], below_half, ctx.u32_one_value,
                          ctx.ConstU32(Capture::PackedBinHighIncrement));
-        const Id bin_index = ctx.OpIAdd(ctx.U32[1], sample_bins_base, selected_slot);
-        const Id bin_target = ctx.OpSelect(ctx.U32[1], accepted, bin_index, sink);
+        const Id bin_index = access.PerSlotIndex(sample_bins_base);
+        const Id bin_target = ctx.OpSelect(ctx.U32[1], access.accepted, bin_index, sink);
         const Id applied_increment =
-            ctx.OpSelect(ctx.U32[1], accepted, bin_increment, ctx.u32_zero_value);
+            ctx.OpSelect(ctx.U32[1], access.accepted, bin_increment, ctx.u32_zero_value);
         const Id previous_bins =
-            ctx.OpAtomicIAdd(ctx.U32[1], pointer(bin_target), device_scope,
-                             acquire_release_semantics, applied_increment);
+            ctx.OpAtomicIAdd(ctx.U32[1], access.Pointer(bin_target), access.device_scope,
+                             access.acquire_release_semantics, applied_increment);
         const Id previous_low = ctx.OpBitwiseAnd(
             ctx.U32[1], previous_bins, ctx.ConstU32(Capture::PackedBinMask));
         const Id previous_high = ctx.OpShiftRightLogical(
@@ -192,62 +253,108 @@ static void EmitCe3CoverageCounter(EmitContext& ctx, Id counter_base, Id miss_co
         const Id previous_selected =
             ctx.OpSelect(ctx.U32[1], below_half, previous_low, previous_high);
         const Id bin_overflow = ctx.OpLogicalAnd(
-            ctx.U1[1], accepted,
+            ctx.U1[1], access.accepted,
             ctx.OpIEqual(ctx.U1[1], previous_selected,
                          ctx.ConstU32(Capture::PackedBinMask)));
         ctx.OpAtomicIAdd(
-            ctx.U32[1], pointer(ctx.ConstU32(Capture::SampleBinOverflowDword)), device_scope,
-            acquire_release_semantics,
+            ctx.U32[1], access.Pointer(ctx.ConstU32(Capture::SampleBinOverflowDword)),
+            access.device_scope, access.acquire_release_semantics,
             ctx.OpSelect(ctx.U32[1], bin_overflow, ctx.u32_one_value,
                          ctx.u32_zero_value));
 
         if (sample_site == 0) {
-            const Id param1_y = ctx.OpBitcast(
-                ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param1, 1, 0));
-            const Id param1_y_index = ctx.OpIAdd(
-                ctx.U32[1], ctx.ConstU32(Capture::Param1YBaseDword), selected_slot);
-            const Id param1_y_target =
-                ctx.OpSelect(ctx.U32[1], accepted, param1_y_index, sink);
-            const Id previous_param1_y = ctx.OpAtomicCompareExchange(
-                ctx.U32[1], pointer(param1_y_target), device_scope,
-                acquire_release_semantics, acquire_semantics, param1_y,
-                ctx.ConstU32(Capture::ClaimSentinel));
-            const Id param1_y_matches = ctx.OpLogicalOr(
-                ctx.U1[1],
-                ctx.OpIEqual(ctx.U1[1], previous_param1_y,
-                             ctx.ConstU32(Capture::ClaimSentinel)),
-                ctx.OpIEqual(ctx.U1[1], previous_param1_y, param1_y));
-            const Id param1_y_conflict = ctx.OpLogicalAnd(
-                ctx.U1[1], accepted,
-                ctx.OpLogicalNot(ctx.U1[1], param1_y_matches));
-            ctx.OpAtomicIAdd(
-                ctx.U32[1], pointer(ctx.ConstU32(Capture::Param1YConflictDword)), device_scope,
-                acquire_release_semantics,
-                ctx.OpSelect(ctx.U32[1], param1_y_conflict, ctx.u32_one_value,
-                             ctx.u32_zero_value));
-
+            const Id param1_x = ctx.OpBitcast(
+                ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param1, 0, 0));
             const Id frag_x = ctx.OpBitcast(
                 ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::FragCoord, 0, 0));
             const Id frag_y = ctx.OpBitcast(
                 ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::FragCoord, 1, 0));
             const auto metadata_target = [&](u32 base) {
-                const Id index =
-                    ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(base), selected_slot);
-                return pointer(ctx.OpSelect(ctx.U32[1], accepted, index, sink));
+                const Id index = access.PerSlotIndex(ctx.ConstU32(base));
+                return access.Pointer(
+                    ctx.OpSelect(ctx.U32[1], access.accepted, index, sink));
             };
+            ctx.OpAtomicUMin(ctx.U32[1], metadata_target(Capture::Param1XMinBaseDword),
+                             access.device_scope, access.acquire_release_semantics, param1_x);
+            ctx.OpAtomicUMax(ctx.U32[1], metadata_target(Capture::Param1XMaxBaseDword),
+                             access.device_scope, access.acquire_release_semantics, param1_x);
             ctx.OpAtomicUMin(ctx.U32[1], metadata_target(Capture::FragXMinBaseDword),
-                             device_scope, acquire_release_semantics, frag_x);
+                             access.device_scope, access.acquire_release_semantics, frag_x);
             ctx.OpAtomicUMax(ctx.U32[1], metadata_target(Capture::FragXMaxBaseDword),
-                             device_scope, acquire_release_semantics, frag_x);
+                             access.device_scope, access.acquire_release_semantics, frag_x);
             ctx.OpAtomicUMin(ctx.U32[1], metadata_target(Capture::FragYMinBaseDword),
-                             device_scope, acquire_release_semantics, frag_y);
+                             access.device_scope, access.acquire_release_semantics, frag_y);
             ctx.OpAtomicUMax(ctx.U32[1], metadata_target(Capture::FragYMaxBaseDword),
-                             device_scope, acquire_release_semantics, frag_y);
+                             access.device_scope, access.acquire_release_semantics, frag_y);
         }
-    }
+    });
+}
 
-    ctx.OpBranch(merge_label);
-    ctx.AddLabel(merge_label);
+void EmitCe3CoverageDecision(EmitContext& ctx, u32 site, Id value, Id guest_negative) {
+    if (!IsCe3CoverageTarget(ctx)) {
+        return;
+    }
+    namespace Capture = DreamsCompat::Ce3CoverageTrace;
+    ASSERT_MSG(site < Capture::DecisionSites, "ce3 decision site is outside the audited shader");
+    EmitCe3CoverageEvent(
+        ctx, ctx.ConstU32(Capture::MissDecisionBaseDword + site),
+        [&](Ce3CoverageAccess& access) {
+            const Id is_nan = ctx.OpIsNan(ctx.U1[1], value);
+            const Id robust_negative = ctx.OpFOrdLessThan(
+                ctx.U1[1], value, ctx.ConstF32(-Capture::DecisionEpsilon));
+            const Id near_zero = ctx.OpFOrdLessThanEqual(
+                ctx.U1[1], ctx.OpFAbs(ctx.F32[1], value),
+                ctx.ConstF32(Capture::DecisionEpsilon));
+            const Id category = ctx.OpSelect(
+                ctx.U32[1], is_nan, ctx.ConstU32(Capture::DecisionNaN),
+                ctx.OpSelect(
+                    ctx.U32[1], robust_negative,
+                    ctx.ConstU32(Capture::DecisionRobustNegative),
+                    ctx.OpSelect(ctx.U32[1], near_zero,
+                                 ctx.ConstU32(Capture::DecisionNearZero),
+                                 ctx.ConstU32(Capture::DecisionRobustPositive))));
+            const Id base = ctx.OpIAdd(
+                ctx.U32[1], ctx.ConstU32(Capture::DecisionDword(site, 0)),
+                ctx.OpIMul(ctx.U32[1], category, ctx.ConstU32(Capture::Slots)));
+            access.Increment(base, ctx.true_value);
+            access.Increment(Capture::DecisionGuestNegativeBaseDword + site * Capture::Slots,
+                             guest_negative);
+            access.Increment(Capture::DecisionGuestNonnegativeBaseDword +
+                                 site * Capture::Slots,
+                             ctx.OpLogicalNot(ctx.U1[1], guest_negative));
+        });
+}
+
+void EmitCe3CoverageLoopExit(EmitContext& ctx, Id hit) {
+    if (!IsCe3CoverageTarget(ctx)) {
+        return;
+    }
+    namespace Capture = DreamsCompat::Ce3CoverageTrace;
+    EmitCe3CoverageEvent(ctx, ctx.ConstU32(Capture::MissLoopDword),
+                         [&](Ce3CoverageAccess& access) {
+                             access.Increment(Capture::LoopHitBaseDword, hit);
+                             access.Increment(Capture::LoopBoundNoHitBaseDword,
+                                              ctx.OpLogicalNot(ctx.U1[1], hit));
+                         });
+}
+
+void EmitCe3CoverageTrinary(EmitContext& ctx, u32 site, Id input0, Id input1, Id input2,
+                            Id output) {
+    if (!IsCe3CoverageTarget(ctx)) {
+        return;
+    }
+    namespace Capture = DreamsCompat::Ce3CoverageTrace;
+    ASSERT_MSG(site < Capture::TrinarySites, "ce3 trinary site is outside the audited shader");
+    EmitCe3CoverageEvent(
+        ctx, ctx.ConstU32(Capture::MissTrinaryBaseDword + site),
+        [&](Ce3CoverageAccess& access) {
+            access.Increment(Capture::TrinaryInvocationDword(site), ctx.true_value);
+            const std::array values{input0, input1, input2, output};
+            for (u32 value_index = 0; value_index < values.size(); ++value_index) {
+                access.Increment(Capture::TrinaryNaNDword(site, value_index),
+                                 ctx.OpIsNan(ctx.U1[1], values[value_index]));
+            }
+        });
 }
 
 void EmitCe3CoverageSample(EmitContext& ctx, u32 site, Id emitted) {

@@ -8,6 +8,9 @@
 
 #include "gcn_test_runner.hpp"
 #include "instructions.hpp"
+#include "shader_recompiler/dreams_compat.h"
+#include "shader_recompiler/ir/basic_block.h"
+#include "shader_recompiler/ir/opcodes.h"
 #include "translator.hpp"
 
 class GcnTest : public ::testing::Test {
@@ -20,6 +23,31 @@ protected:
         gcn_test::Runner::DestroyInstance();
     }
 };
+
+TEST(Ce3CoverageTrace, DecisionAndTrinaryRangesAreContiguousAndBounded) {
+    namespace Capture = Shader::DreamsCompat::Ce3CoverageTrace;
+    EXPECT_EQ(Capture::DecisionDword(Capture::DecisionSites - 1,
+                                     Capture::DecisionCategories - 1, Capture::Slots - 1) +
+                  1,
+              Capture::DecisionGuestNegativeBaseDword);
+    EXPECT_EQ(Capture::TrinaryInvocationDword(Capture::TrinarySites - 1,
+                                              Capture::Slots - 1) +
+                  1,
+              Capture::TrinaryNaNBaseDword);
+    EXPECT_EQ(Capture::TrinaryNaNDword(Capture::TrinarySites - 1,
+                                      Capture::TrinaryValues - 1, Capture::Slots - 1) +
+                  1,
+              Capture::MissInitialDword);
+    EXPECT_LE(Capture::BaseDword + Capture::DwordCount, 0xd00000U);
+}
+
+TEST(Ce3CoverageTrace, DiagnosticMicroinstructionsSurviveDeadCodeElimination) {
+    using Shader::IR::Inst;
+    using Shader::IR::Opcode;
+    EXPECT_TRUE((Inst{Opcode::Ce3CoverageDecision, 0}.MayHaveSideEffects()));
+    EXPECT_TRUE((Inst{Opcode::Ce3CoverageLoopExit, 0}.MayHaveSideEffects()));
+    EXPECT_TRUE((Inst{Opcode::Ce3CoverageTrinary, 0}.MayHaveSideEffects()));
+}
 
 struct F32x2 {
     float a;

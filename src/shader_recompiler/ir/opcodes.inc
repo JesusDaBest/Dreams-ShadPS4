@@ -14,6 +14,9 @@ OPCODE(Prologue,                                            Void,               
 OPCODE(Epilogue,                                            Void,                                                                                           )
 OPCODE(Discard,                                             Void,                                                                                           )
 OPCODE(DiscardCond,                                         Void,           U1,                                                                             )
+OPCODE(Ce3CoverageDecision,                                 Void,           U32,            F32,            U1,                                             )
+OPCODE(Ce3CoverageLoopExit,                                 Void,           U1,                                                                             )
+OPCODE(Ce3CoverageTrinary,                                 Void,           U32,            F32,            F32,            F32,            F32,            )
 OPCODE(DebugPrint,                                          Void,           StringLiteral,  Opaque,          Opaque,        Opaque,         Opaque,         )
 
 // Constant memory operations

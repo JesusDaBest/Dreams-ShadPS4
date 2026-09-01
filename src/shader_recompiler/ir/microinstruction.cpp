@@ -47,6 +47,9 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::Epilogue:
     case Opcode::Discard:
     case Opcode::DiscardCond:
+    case Opcode::Ce3CoverageDecision:
+    case Opcode::Ce3CoverageLoopExit:
+    case Opcode::Ce3CoverageTrinary:
     case Opcode::SetAttribute:
     case Opcode::SetTcsGenericAttribute:
     case Opcode::SetPatch:

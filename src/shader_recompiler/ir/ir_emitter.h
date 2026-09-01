@@ -45,6 +45,10 @@ public:
     void Epilogue();
     void Discard();
     void Discard(const U1& cond);
+    void Ce3CoverageDecision(u32 site, const F32& value, const U1& guest_negative);
+    void Ce3CoverageLoopExit(const U1& hit);
+    void Ce3CoverageTrinary(u32 site, const F32& input0, const F32& input1, const F32& input2,
+                            const F32& output);
     void DebugPrint(const char* fmt, boost::container::small_vector<Value, 5> args);
 
     void Barrier();

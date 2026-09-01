@@ -1358,6 +1358,10 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
     const bool a3_lookup_producer_trace =
         info.pgm_hash == DreamsCompat::A3LookupProducerShader &&
         DreamsCompat::CaptureA3LookupProducerTrace();
+    const bool ce3_coverage_trace =
+        info.pgm_hash == DreamsCompat::Ce3ReadConstCaptureShader &&
+        info.stage == Stage::Fragment && info.l_stage == LogicalStage::Fragment &&
+        DreamsCompat::CaptureCe3CoverageTrace();
     const auto emit_gather_stage = [&](u32 stage, const IR::U1& condition) {
         // Every Gather workgroup is one guest wave. Elect its first currently-active lane and
         // make only that lane contribute to the aggregate stage counter.
@@ -2434,7 +2438,70 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
             continue;
         }
 
+        // Preserve the exact post-modifier trinary inputs before translation overwrites a
+        // destination which can also be one of the sources (PC 0x374 uses V5 as src2 and dst).
+        // The values remain SSA references and are consumed only by the opt-in diagnostic after
+        // the guest instruction has produced its output.
+        u32 ce3_trinary_site = DreamsCompat::Ce3CoverageTrace::TrinarySites;
+        std::array<IR::F32, 3> ce3_trinary_inputs{};
+        if (ce3_coverage_trace) {
+            Opcode expected_opcode{};
+            switch (inst_pc) {
+            case 0x28c:
+                ce3_trinary_site = 0;
+                expected_opcode = Opcode::V_MED3_F32;
+                break;
+            case 0x2c8:
+                ce3_trinary_site = 1;
+                expected_opcode = Opcode::V_MAX3_F32;
+                break;
+            case 0x374:
+                ce3_trinary_site = 2;
+                expected_opcode = Opcode::V_MIN3_F32;
+                break;
+            case 0x3ec:
+                ce3_trinary_site = 3;
+                expected_opcode = Opcode::V_MED3_F32;
+                break;
+            default:
+                break;
+            }
+            if (ce3_trinary_site < DreamsCompat::Ce3CoverageTrace::TrinarySites) {
+                ASSERT_MSG(inst.opcode == expected_opcode,
+                           "ce3 trinary PC {:#x} changed opcode from {} to {}", inst_pc,
+                           static_cast<u32>(expected_opcode), static_cast<u32>(inst.opcode));
+                ce3_trinary_inputs = {
+                    GetSrc<IR::F32>(inst.src[0]), GetSrc<IR::F32>(inst.src[1]),
+                    GetSrc<IR::F32>(inst.src[2])};
+            }
+        }
+
         TranslateInstruction(inst);
+
+        if (ce3_coverage_trace) {
+            namespace Capture = DreamsCompat::Ce3CoverageTrace;
+            if (ce3_trinary_site < Capture::TrinarySites) {
+                ASSERT_MSG(inst.dst_count == 1 && inst.dst[0].field == OperandField::VectorGPR,
+                           "ce3 trinary PC {:#x} no longer has one VGPR destination", inst_pc);
+                const IR::F32 output =
+                    ir.GetVectorReg<IR::F32>(IR::VectorReg(inst.dst[0].code));
+                ir.Ce3CoverageTrinary(ce3_trinary_site, ce3_trinary_inputs[0],
+                                      ce3_trinary_inputs[1], ce3_trinary_inputs[2], output);
+            }
+            if (inst_pc == 0x338 || inst_pc == 0x430) {
+                ASSERT_MSG(inst.opcode == Opcode::V_CMP_CLASS_F32,
+                           "ce3 decision PC {:#x} changed opcode from V_CMP_CLASS_F32 to {}",
+                           inst_pc, static_cast<u32>(inst.opcode));
+                ir.Ce3CoverageDecision(
+                    inst_pc == 0x338 ? 0 : 1,
+                    ir.GetVectorReg<IR::F32>(IR::VectorReg::V23), ir.GetVcc());
+            } else if (inst_pc == 0x444) {
+                ASSERT_MSG(inst.opcode == Opcode::V_CMP_NE_U32,
+                           "ce3 loop-exit PC 0x444 changed opcode from V_CMP_NE_U32 to {}",
+                           static_cast<u32>(inst.opcode));
+                ir.Ce3CoverageLoopExit(ir.GetVcc());
+            }
+        }
 
         if (a3_lookup_producer_trace &&
             (inst_pc == DreamsCompat::A3LookupProducerTrace::PairPc ||

@@ -110,6 +110,19 @@ void IREmitter::Discard(const U1& cond) {
     Inst(Opcode::DiscardCond, cond);
 }
 
+void IREmitter::Ce3CoverageDecision(u32 site, const F32& value, const U1& guest_negative) {
+    Inst(Opcode::Ce3CoverageDecision, Imm32(site), value, guest_negative);
+}
+
+void IREmitter::Ce3CoverageLoopExit(const U1& hit) {
+    Inst(Opcode::Ce3CoverageLoopExit, hit);
+}
+
+void IREmitter::Ce3CoverageTrinary(u32 site, const F32& input0, const F32& input1,
+                                    const F32& input2, const F32& output) {
+    Inst(Opcode::Ce3CoverageTrinary, Imm32(site), input0, input1, input2, output);
+}
+
 void IREmitter::Barrier() {
     Inst(Opcode::Barrier);
 }

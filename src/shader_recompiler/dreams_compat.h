@@ -1004,25 +1004,27 @@ constexpr u32 RecordDword(u32 site, u32 field) {
 }
 
 } // namespace Ce3FleckTrace
-// Separate whole-draw coverage inventory for ce3b8413. Keeping this mode independent from the
-// coordinate/sample trace avoids candidate-dependent capture branches before the guest's final
-// ballot. Each event uses a bounded branchless probe sequence; any unresolved collision invalidates
-// completeness rather than being attributed to the resident key. Keep the table in the unused tail
-// of the 52 MiB private-GDS allocation so a complete edit-mode sculpt draw does not crowd the older
-// 8 MiB diagnostic ranges.
+// Separate whole-draw coverage and decision inventory for ce3b8413. Param1.y is observed as a flat
+// per-sculpt/object label in the captured edit-mode draw; Param1.x atlas records are reused across
+// those objects and therefore are secondary min/max metadata rather than the hash key. Keeping this
+// mode independent from the coordinate/sample trace avoids candidate-dependent capture branches
+// before the guest's final ballot. Each event uses a bounded branchless probe sequence; any
+// unresolved collision invalidates completeness rather than being attributed to the resident key.
+// Keep the table in the unused tail of the 52 MiB private-GDS allocation so a complete edit-mode
+// sculpt draw does not crowd the older 8 MiB diagnostic ranges.
 namespace Ce3CoverageTrace {
 constexpr u32 BaseDword =
     (A3LookupProducerTrace::BaseDword + A3LookupProducerTrace::DwordCount + 0xffU) & ~0xffU;
 constexpr u32 ArmDword = BaseDword;
-// The complete 603-key edit-mode fixture has no insertion failures in this 2,048-slot table with
-// eight probes for the captured order, sorted/reverse order, or 100 shuffled orders. Runtime miss
-// counters remain authoritative: any collision still makes the capture explicitly incomplete.
-constexpr u32 Slots = 2048;
-constexpr u32 SlotBits = 11;
+// The captured fixture has eleven observed Param1.y object labels. Leave ample headroom for other
+// draws; runtime miss counters remain authoritative and make every unresolved collision explicit.
+constexpr u32 Slots = 256;
+constexpr u32 SlotBits = 8;
 constexpr u32 Probes = 8;
 constexpr u32 KeysBaseDword = BaseDword + 1;
-constexpr u32 Param1YBaseDword = KeysBaseDword + Slots;
-constexpr u32 FragXMinBaseDword = Param1YBaseDword + Slots;
+constexpr u32 Param1XMinBaseDword = KeysBaseDword + Slots;
+constexpr u32 Param1XMaxBaseDword = Param1XMinBaseDword + Slots;
+constexpr u32 FragXMinBaseDword = Param1XMaxBaseDword + Slots;
 constexpr u32 FragXMaxBaseDword = FragXMinBaseDword + Slots;
 constexpr u32 FragYMinBaseDword = FragXMaxBaseDword + Slots;
 constexpr u32 FragYMaxBaseDword = FragYMinBaseDword + Slots;
@@ -1035,22 +1037,71 @@ constexpr u32 RaymarchSampleBinsBaseDword = InitialSampleBinsBaseDword + Slots;
 constexpr u32 ConditionalTrueBaseDword = RaymarchSampleBinsBaseDword + Slots;
 constexpr u32 ConditionalFalseBaseDword = ConditionalTrueBaseDword + Slots;
 constexpr u32 UnconditionalBaseDword = ConditionalFalseBaseDword + Slots;
-constexpr u32 MissInitialDword = UnconditionalBaseDword + Slots;
+
+// V23 is the fully decoded procedural-plus-atlas decision value at guest PCs 0x338 (initial) and
+// 0x430 (raymarch loop). The four exhaustive classes use +/-0.001, the same refinement epsilon the
+// guest uses at PC 0x454, so values on either boundary remain in the near-zero class.
+constexpr u32 DecisionSites = 2;
+constexpr u32 DecisionCategories = 4;
+constexpr u32 DecisionNaN = 0;
+constexpr u32 DecisionRobustNegative = 1;
+constexpr u32 DecisionNearZero = 2;
+constexpr u32 DecisionRobustPositive = 3;
+constexpr float DecisionEpsilon = 0.001f;
+constexpr u32 DecisionBaseDword = UnconditionalBaseDword + Slots;
+constexpr u32 DecisionGuestNegativeBaseDword =
+    DecisionBaseDword + DecisionSites * DecisionCategories * Slots;
+constexpr u32 DecisionGuestNonnegativeBaseDword =
+    DecisionGuestNegativeBaseDword + DecisionSites * Slots;
+constexpr u32 LoopHitBaseDword = DecisionGuestNonnegativeBaseDword + DecisionSites * Slots;
+constexpr u32 LoopBoundNoHitBaseDword = LoopHitBaseDword + Slots;
+
+// Guest trinary instructions at PCs 0x28c, 0x2c8, 0x374, and 0x3ec. For each site retain an
+// invocation denominator and independent NaN counts for three post-modifier inputs plus output.
+constexpr u32 TrinarySites = 4;
+constexpr u32 TrinaryValues = 4;
+constexpr u32 TrinaryInvocationBaseDword = LoopBoundNoHitBaseDword + Slots;
+constexpr u32 TrinaryNaNBaseDword = TrinaryInvocationBaseDword + TrinarySites * Slots;
+
+constexpr u32 MissInitialDword =
+    TrinaryNaNBaseDword + TrinarySites * TrinaryValues * Slots;
 constexpr u32 MissRaymarchSampleDword = MissInitialDword + 1;
 constexpr u32 MissConditionalTrueDword = MissRaymarchSampleDword + 1;
 constexpr u32 MissConditionalFalseDword = MissRaymarchSampleDword + 2;
 constexpr u32 MissUnconditionalDword = MissRaymarchSampleDword + 3;
-constexpr u32 Param1YConflictDword = MissRaymarchSampleDword + 4;
-constexpr u32 SampleBinOverflowDword = MissRaymarchSampleDword + 5;
+constexpr u32 MissDecisionBaseDword = MissRaymarchSampleDword + 4;
+constexpr u32 MissLoopDword = MissDecisionBaseDword + DecisionSites;
+constexpr u32 MissTrinaryBaseDword = MissLoopDword + 1;
+constexpr u32 SampleBinOverflowDword = MissTrinaryBaseDword + TrinarySites;
+constexpr u32 CounterOverflowDword = SampleBinOverflowDword + 1;
 // Rejected bounded-probe events target this unused sink so metadata updates stay branchless before
 // the guest shader's ballot. No sink value is consumed or reported.
-constexpr u32 SinkDword = MissRaymarchSampleDword + 6;
+constexpr u32 SinkDword = CounterOverflowDword + 1;
 constexpr u32 DwordCount = SinkDword - BaseDword + 1;
 constexpr u32 ClaimSentinel = 0xffffffffU;
 constexpr u32 PackedBinMask = 0xffffU;
 constexpr u32 PackedBinHighIncrement = 1U << 16;
+
+constexpr u32 DecisionDword(u32 site, u32 category, u32 slot = 0) {
+    return DecisionBaseDword + (site * DecisionCategories + category) * Slots + slot;
+}
+
+constexpr u32 TrinaryInvocationDword(u32 site, u32 slot = 0) {
+    return TrinaryInvocationBaseDword + site * Slots + slot;
+}
+
+constexpr u32 TrinaryNaNDword(u32 site, u32 value, u32 slot = 0) {
+    return TrinaryNaNBaseDword + (site * TrinaryValues + value) * Slots + slot;
+}
+
 static_assert(Slots == (1U << SlotBits));
 static_assert(Probes > 0 && Probes <= Slots);
+static_assert(DecisionDword(DecisionSites - 1, DecisionCategories - 1, Slots - 1) + 1 ==
+              DecisionGuestNegativeBaseDword);
+static_assert(TrinaryInvocationDword(TrinarySites - 1, Slots - 1) + 1 ==
+              TrinaryNaNBaseDword);
+static_assert(TrinaryNaNDword(TrinarySites - 1, TrinaryValues - 1, Slots - 1) + 1 ==
+              MissInitialDword);
 } // namespace Ce3CoverageTrace
 // Host-private storage for a diagnostic capture of the four dynamic ReadConst results consumed by
 // ce3b8413. The shader writes exactly what its BDA path returned; the host never reads or registers
