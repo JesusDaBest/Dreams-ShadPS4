@@ -5569,11 +5569,15 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
                                           initial_gate_input_rows));
         return false;
     }
-    success &= WriteDreamsCaptureText(*directory / "complete.txt", "complete\n");
+    if (!WriteDreamsCaptureCompletionMarker(*directory)) {
+        FailDreamsB535MembershipCapture(
+            "capture completion marker could not be written or verified");
+        return false;
+    }
     capture.active = false;
-    capture.complete = success;
-    capture.failed = !success;
-    if (success && capture_upstream_lineage) {
+    capture.complete = true;
+    capture.failed = false;
+    if (capture_upstream_lineage) {
         auto& lineage = g_dreams_upstream_lineage_capture;
         lineage.b535_first_sequence = capture.pass_count != 0 ? capture.sequences[0] : 0;
         lineage.b535_final_sequence =
@@ -5586,7 +5590,7 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
     LOG_WARNING(Render_Vulkan,
                 "Dreams B535 membership capture complete passes={} raw_hash={:#x} directory={}",
                 capture.pass_count, raw_hash, directory->string());
-    return success;
+    return true;
 }
 
 struct DreamsVisibilityListConsumerSnapshot {
