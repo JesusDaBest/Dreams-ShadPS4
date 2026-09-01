@@ -3062,7 +3062,13 @@ static bool WriteDreamsCaptureCompletionMarker(const std::filesystem::path& dire
     }
     const std::span<const u8> expected{
         reinterpret_cast<const u8*>(CompleteText.data()), CompleteText.size()};
-    return VerifyDreamsCaptureBytes(complete, expected, HashDreamsTraceBytes(expected));
+    const bool verified =
+        VerifyDreamsCaptureBytes(complete, expected, HashDreamsTraceBytes(expected));
+    if (!verified) {
+        error.clear();
+        std::filesystem::remove(complete, error);
+    }
+    return verified;
 }
 
 static void FailDreamsVs370ListSliceCapture(std::string_view reason) {
@@ -3385,6 +3391,11 @@ static void CompleteDreamsVs370ListSliceCapture(
 
     std::error_code error;
     std::filesystem::remove(capture.directory / "failed.txt", error);
+    if (error || std::filesystem::is_regular_file(capture.directory / "failed.txt", error) ||
+        error) {
+        fail("verified outputs were written but a stale failure marker could not be removed");
+        return;
+    }
     if (!WriteDreamsCaptureCompletionMarker(capture.directory)) {
         fail("the verified list-slice outputs were written but the completion marker failed");
         return;
