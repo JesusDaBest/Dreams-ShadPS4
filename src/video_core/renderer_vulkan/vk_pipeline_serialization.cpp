@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/assert.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/dreams_compat.h"
@@ -29,6 +30,11 @@ namespace {
 
 std::string ShaderBinaryCacheKey(const Shader::Info& info,
                                  const ProgramCacheKey& program_key, size_t perm_idx) {
+    // Cache-isolation invariant: capture-instrumented shaders are rejected by LoadShaderMeta and
+    // both registration paths before reaching this function. They must never load an old normal
+    // binary or save their diagnostic SPIR-V under a normal-run key.
+    ASSERT_MSG(!Shader::DreamsCompat::IsCaptureInstrumentedShader(info.pgm_hash),
+               "Capture-instrumented shader reached the persistent binary cache");
     const u64 pgm_hash = info.pgm_hash;
     // Vertex ID lowering changed independently of every compute/fragment shader. Keep that
     // invalidation stage-local so a vertex fix cannot force Dreams' expensive compute shaders to
@@ -476,7 +482,7 @@ void PipelineCache::WarmUp() {
         LOG_INFO(Render, "Pipeline cache disabled while Dreams B1 writer provenance is active");
         return;
     }
-    if (Shader::DreamsCompat::CaptureImageGather3D()) {
+    if (Shader::DreamsCompat::CaptureAllImageGather3D()) {
         LOG_INFO(Render, "Pipeline cache disabled while 3D ImageGather capture is active");
         return;
     }

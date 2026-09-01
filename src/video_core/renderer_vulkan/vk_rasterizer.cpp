@@ -103,6 +103,67 @@ struct DreamsAtlasExpectedImage {
 
 static std::vector<DreamsAtlasExpectedImage> g_dreams_atlas_expected_images;
 
+// A one-shot, trigger-gated producer/consumer capture for the sculpt density atlas. This is kept
+// separate from the older broad 84aa/gather cross-check: it accepts exactly one 84aa generation,
+// requires the same Vulkan backing and byte-coordinate layout at 2f/f030, and disarms after the
+// aligned boundary has either completed or failed.
+constexpr u32 DreamsSculptAtlasLineageMax84aaGroups = 8192;
+constexpr u32 DreamsSculptAtlasLineageMaxConsumerAttempts = 8;
+constexpr u32 DreamsSculptAtlasLineageMaxF030Records = 65536;
+constexpr u32 DreamsSculptAtlasLineageMaxF030Waves = 65536;
+constexpr u64 DreamsSculptAtlasLineageMaxConsumerInvocations = 4ULL * 1024 * 1024;
+static_assert(static_cast<u64>(DreamsSculptAtlasLineageMaxF030Waves) *
+                  Shader::DreamsCompat::OrderedEntryDwords * sizeof(u32) <=
+              1_MB);
+static_assert(static_cast<u64>(DreamsSculptAtlasLineageMaxF030Records) * 4 * sizeof(u32) <= 1_MB);
+static_assert(Shader::DreamsCompat::ImageGather3DCapture::DwordCount * sizeof(u32) == 1812);
+static_assert(Shader::DreamsCompat::ImageGather3DConsumerCapture::DwordCount * sizeof(u32) ==
+              12324);
+
+struct DreamsSculptAtlasLineageBrick {
+    std::array<u8, 8 * 8 * 8> expected{};
+    std::array<u8, 8 * 8 * 8> actual{};
+    u32 group{};
+    u32 destination{};
+    u32 producer_mismatches{};
+};
+
+struct DreamsSculptAtlasLineageConsumerResult {
+    bool complete{};
+    u64 sequence{};
+    u32 gather_seen{};
+    u32 store_seen{};
+    u32 matched{};
+    u32 mismatched{};
+    u32 unknown{};
+};
+
+struct DreamsSculptAtlasLineageCapture {
+    enum class Phase : u32 {
+        WaitingRequest,
+        Capturing84aa,
+        Waiting2f,
+        WaitingF030,
+        Complete,
+        Failed,
+    };
+
+    Phase phase{Phase::WaitingRequest};
+    std::filesystem::path root;
+    std::filesystem::path directory;
+    u64 producer_sequence{};
+    DreamsAtlasImageIdentity producer_image{};
+    std::unordered_map<u64, DreamsSculptAtlasLineageBrick> bricks;
+    u32 producer_groups{};
+    u64 producer_mismatched_bytes{};
+    u32 consumer_attempts{};
+    bool f030_files_complete{};
+    DreamsSculptAtlasLineageConsumerResult prepare;
+    DreamsSculptAtlasLineageConsumerResult compact;
+};
+
+static DreamsSculptAtlasLineageCapture g_dreams_sculpt_atlas_lineage{};
+
 struct DreamsBoundBufferIdentity {
     bool valid{};
     u32 binding{};
@@ -218,7 +279,8 @@ static bool Dreams84aaGatherCrossCheck() {
 
 static bool SameDreamsAtlasBacking(const DreamsAtlasImageIdentity& lhs,
                                    const DreamsAtlasImageIdentity& rhs) {
-    return lhs.valid && rhs.valid && lhs.backing_handle != 0 &&
+    return lhs.valid && rhs.valid && lhs.image_uid != 0 && lhs.image_id == rhs.image_id &&
+           lhs.image_uid == rhs.image_uid && lhs.backing_handle != 0 &&
            lhs.backing_handle == rhs.backing_handle && lhs.guest_base == rhs.guest_base &&
            lhs.guest_size == rhs.guest_size;
 }
@@ -3207,6 +3269,549 @@ static bool WriteDreamsCaptureCompletionMarker(const std::filesystem::path& dire
         std::filesystem::remove(complete, error);
     }
     return verified;
+}
+
+static std::string_view DreamsSculptAtlasLineagePhaseName(
+    DreamsSculptAtlasLineageCapture::Phase phase) {
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    switch (phase) {
+    case Phase::WaitingRequest:
+        return "waiting-request";
+    case Phase::Capturing84aa:
+        return "capturing-84aa";
+    case Phase::Waiting2f:
+        return "waiting-2f";
+    case Phase::WaitingF030:
+        return "waiting-f030";
+    case Phase::Complete:
+        return "complete";
+    case Phase::Failed:
+        return "failed";
+    }
+    return "invalid";
+}
+
+static void FailDreamsSculptAtlasLineage(std::string_view reason) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    if (capture.phase == DreamsSculptAtlasLineageCapture::Phase::Complete ||
+        capture.phase == DreamsSculptAtlasLineageCapture::Phase::Failed) {
+        return;
+    }
+    const auto previous_phase = capture.phase;
+    capture.phase = DreamsSculptAtlasLineageCapture::Phase::Failed;
+    LOG_ERROR(Render_Vulkan, "Dreams sculpt-atlas lineage capture failed at {}: {}",
+              DreamsSculptAtlasLineagePhaseName(previous_phase), reason);
+    const auto& directory = !capture.directory.empty() ? capture.directory : capture.root;
+    if (!directory.empty()) {
+        std::error_code error;
+        std::filesystem::remove(directory / "complete.txt", error);
+        WriteDreamsCaptureText(directory / "failed.txt",
+                               fmt::format("phase\t{}\nreason\t{}\nproducer_sequence\t{}\n",
+                                           DreamsSculptAtlasLineagePhaseName(previous_phase),
+                                           reason, capture.producer_sequence));
+    }
+}
+
+static bool AppendDreamsSculptAtlasLineageEvent(std::string_view stage, u64 sequence,
+                                                std::string_view relation,
+                                                std::string_view decision) {
+    const auto& capture = g_dreams_sculpt_atlas_lineage;
+    return !capture.directory.empty() &&
+           AppendDreamsCaptureText(capture.directory / "events.tsv",
+                                   fmt::format("{}\t{}\t{}\t{}\t{}\n",
+                                               DreamsSculptAtlasLineagePhaseName(capture.phase),
+                                               stage, sequence, relation, decision));
+}
+
+static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups,
+                                                     const DreamsAtlasImageIdentity& producer) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    if (!Shader::DreamsCompat::CaptureSculptAtlasLineage() ||
+        Common::ElfInfo::Instance().GameSerial() != "CUSA04301") {
+        return false;
+    }
+    if (capture.phase != Phase::WaitingRequest) {
+        if ((capture.phase == Phase::Waiting2f || capture.phase == Phase::WaitingF030) &&
+            SameDreamsAtlasBacking(capture.producer_image, producer)) {
+            AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas",
+                                                "fail_intervening_writer");
+            FailDreamsSculptAtlasLineage(
+                fmt::format("intervening 84aa sequence {} rewrote the tracked atlas before {}",
+                            sequence, DreamsSculptAtlasLineagePhaseName(capture.phase)));
+        }
+        return false;
+    }
+    if (capture.root.empty()) {
+        const char* value = std::getenv("SHADPS4_DREAMS_SCULPT_ATLAS_LINEAGE_CAPTURE_DIR");
+        if (value == nullptr || value[0] == '\0') {
+            return false;
+        }
+        capture.root = std::filesystem::path{value};
+    }
+
+    // Leave the request in place until an exact, safely bounded producer dispatch is available.
+    // Consuming it earlier could turn an ineligible 84aa into the lineage generation by accident.
+    if (!producer.valid || groups == 0 || groups > DreamsSculptAtlasLineageMax84aaGroups) {
+        return false;
+    }
+
+    const auto trigger = capture.root / "capture.request";
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(trigger, error) || error) {
+        return false;
+    }
+    error.clear();
+    if (!std::filesystem::remove(trigger, error) || error) {
+        LOG_ERROR(Render_Vulkan, "Dreams sculpt-atlas lineage trigger {} could not be consumed: {}",
+                  trigger.string(), error.message());
+        return false;
+    }
+
+    capture.producer_sequence = sequence;
+    const auto nonce = std::chrono::system_clock::now().time_since_epoch().count();
+    capture.directory = capture.root / fmt::format("capture-{}-{}", sequence, nonce);
+    error.clear();
+    if (!std::filesystem::create_directory(capture.directory, error) || error) {
+        capture.phase = Phase::Capturing84aa;
+        FailDreamsSculptAtlasLineage(fmt::format("could not create unique capture directory {}: {}",
+                                                 capture.directory.string(), error.message()));
+        return false;
+    }
+    capture.phase = Phase::Capturing84aa;
+    const bool files_ok =
+        WriteDreamsCaptureText(
+            capture.directory / "started.tsv",
+            fmt::format("schema\t1\nproducer_sequence\t{}\n84aa_groups\t{}\n"
+                        "max_84aa_groups\t{}\nmax_consumer_attempts\t{}\n"
+                        "max_f030_records\t{}\nmax_f030_waves\t{}\n"
+                        "max_consumer_invocations\t{}\n"
+                        "sample_window\twg_xyz_lt_4_local_xyz_lt_2\n"
+                        "max_candidates_per_site\t{}\n",
+                        sequence, groups, DreamsSculptAtlasLineageMax84aaGroups,
+                        DreamsSculptAtlasLineageMaxConsumerAttempts,
+                        DreamsSculptAtlasLineageMaxF030Records,
+                        DreamsSculptAtlasLineageMaxF030Waves,
+                        DreamsSculptAtlasLineageMaxConsumerInvocations,
+                        Shader::DreamsCompat::ImageGather3DSampleWindow::MaxCandidatesPerSite)) &&
+        WriteDreamsCaptureText(
+            capture.directory / "resource-mismatches.tsv",
+            "attempt\tshader\tvalid\tbinding\timage_id\timage_uid\tbacking\t"
+            "descriptor_base\tguest_base\twidth\theight\tdepth\tview_format\n") &&
+        WriteDreamsCaptureText(capture.directory / "events.tsv",
+                               "phase\tstage\tsequence\trelation\tdecision\n");
+    if (!files_ok) {
+        FailDreamsSculptAtlasLineage("failed to write capture-start metadata");
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Dreams sculpt-atlas lineage accepted request directory={} sequence={} groups={}",
+                capture.directory.string(), sequence, groups);
+    return true;
+}
+
+static bool RecordDreamsSculptAtlasLineageProducer(const DreamsAtlasImageIdentity& identity,
+                                                   std::span<const u32> groups,
+                                                   std::span<const u32> destinations,
+                                                   std::span<const vk::Offset3D> offsets,
+                                                   std::span<const u8> expected,
+                                                   std::span<const u8> actual) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    constexpr u64 BrickBytes = 8 * 8 * 8;
+    if (capture.phase != Phase::Capturing84aa) {
+        return false;
+    }
+    if (!identity.valid || groups.empty() ||
+        groups.size() > DreamsSculptAtlasLineageMax84aaGroups ||
+        destinations.size() != groups.size() || offsets.size() != groups.size() ||
+        expected.size() != groups.size() * BrickBytes || actual.size() != expected.size()) {
+        FailDreamsSculptAtlasLineage("84aa producer capture was incomplete or exceeded its cap");
+        return false;
+    }
+
+    const auto output = capture.directory / "84aa";
+    std::error_code error;
+    std::filesystem::create_directory(output, error);
+    if (error) {
+        FailDreamsSculptAtlasLineage("could not create the 84aa output directory");
+        return false;
+    }
+    u64 expected_hash{};
+    u64 actual_hash{};
+    const auto expected_file = output / "expected-bricks.bin";
+    const auto actual_file = output / "actual-bricks.bin";
+    bool files_ok = WriteDreamsCaptureBytes(expected_file, expected, expected_hash) &&
+                    WriteDreamsCaptureBytes(actual_file, actual, actual_hash) &&
+                    VerifyDreamsCaptureBytes(expected_file, expected, expected_hash) &&
+                    VerifyDreamsCaptureBytes(actual_file, actual, actual_hash);
+
+    capture.producer_image = identity;
+    capture.producer_groups = static_cast<u32>(groups.size());
+    capture.bricks.clear();
+    capture.bricks.reserve(groups.size());
+    capture.producer_mismatched_bytes = 0;
+    std::string rows = "index\tgroup\tdestination\tbrick_x\tbrick_y\tbrick_z\tbrick_key\t"
+                       "expected_hash\tactual_hash\tproducer_mismatches\n";
+    for (u32 index = 0; index < groups.size(); ++index) {
+        const auto& offset = offsets[index];
+        const auto key = PackDreamsAtlasBrick(offset.x, offset.y, offset.z);
+        if (!key.has_value()) {
+            FailDreamsSculptAtlasLineage("84aa emitted an invalid atlas brick coordinate");
+            return false;
+        }
+        DreamsSculptAtlasLineageBrick brick{
+            .group = groups[index],
+            .destination = destinations[index],
+        };
+        const u64 base = static_cast<u64>(index) * BrickBytes;
+        std::copy_n(expected.data() + base, BrickBytes, brick.expected.data());
+        std::copy_n(actual.data() + base, BrickBytes, brick.actual.data());
+        for (u32 byte = 0; byte < BrickBytes; ++byte) {
+            brick.producer_mismatches += brick.expected[byte] != brick.actual[byte];
+        }
+        capture.producer_mismatched_bytes += brick.producer_mismatches;
+        if (!capture.bricks.emplace(*key, brick).second) {
+            FailDreamsSculptAtlasLineage("84aa emitted duplicate atlas brick coordinates");
+            return false;
+        }
+        rows += fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{:#018x}\t{:#018x}\t{}\n", index,
+                            groups[index], destinations[index], offset.x / 8, offset.y / 8,
+                            offset.z / 8, *key, HashDreamsTraceBytes(brick.expected),
+                            HashDreamsTraceBytes(brick.actual), brick.producer_mismatches);
+    }
+    files_ok &= WriteDreamsCaptureText(output / "bricks.tsv", rows);
+    files_ok &= WriteDreamsCaptureText(
+        output / "manifest.tsv",
+        fmt::format("schema\t1\nshader\t{:#x}\nsequence\t{}\ngroups\t{}\nbrick_bytes\t{}\n"
+                    "expected_bytes\t{}\nactual_bytes\t{}\nexpected_fnv1a64\t{:#018x}\n"
+                    "actual_fnv1a64\t{:#018x}\nproducer_mismatched_bytes\t{}\n"
+                    "binding\t{}\nimage_id\t{}\nimage_uid\t{}\nbacking\t{:#x}\n"
+                    "descriptor_base\t{:#x}\nguest_base\t{:#x}\nguest_size\t{}\n"
+                    "descriptor_shape\t{}x{}x{}\ndescriptor_pitch\t{}\n"
+                    "cached_shape\t{}x{}x{}\ncached_pitch\t{}\nview_type\t{}\n"
+                    "view_format\t{}\nbase_level\t{}\nlevels\t{}\nbase_layer\t{}\nlayers\t{}\n",
+                    Shader::DreamsCompat::SculptVolumeWriterShader, capture.producer_sequence,
+                    groups.size(), BrickBytes, expected.size(), actual.size(), expected_hash,
+                    actual_hash, capture.producer_mismatched_bytes, identity.binding,
+                    identity.image_id, identity.image_uid, identity.backing_handle,
+                    identity.descriptor_base, identity.guest_base, identity.guest_size,
+                    identity.descriptor_width, identity.descriptor_height,
+                    identity.descriptor_depth, identity.descriptor_pitch, identity.cached_width,
+                    identity.cached_height, identity.cached_depth, identity.cached_pitch,
+                    identity.view_type, identity.view_format, identity.base_level, identity.levels,
+                    identity.base_layer, identity.layers));
+    if (!files_ok) {
+        FailDreamsSculptAtlasLineage("failed to write or verify the 84aa producer files");
+        return false;
+    }
+    capture.phase = Phase::Waiting2f;
+    LOG_WARNING(Render_Vulkan,
+                "Dreams sculpt-atlas lineage captured 84aa sequence={} groups={} bricks={} "
+                "producer_mismatched_bytes={}",
+                capture.producer_sequence, capture.producer_groups, capture.bricks.size(),
+                capture.producer_mismatched_bytes);
+    return true;
+}
+
+static bool WantsDreamsSculptAtlasLineageConsumer(u64 shader, u64 sequence,
+                                                  const DreamsAtlasImageIdentity& consumer) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    if (capture.phase != Phase::Waiting2f && capture.phase != Phase::WaitingF030) {
+        return false;
+    }
+    if (SameDreamsAtlasByteCoordinates(capture.producer_image, consumer)) {
+        const u64 expected_shader = capture.phase == Phase::Waiting2f
+                                        ? Shader::DreamsCompat::SculptAtlasPrepareShader
+                                        : Shader::DreamsCompat::SculptSurfaceCompactShader;
+        if (shader != expected_shader) {
+            AppendDreamsSculptAtlasLineageEvent(fmt::format("{:#x}", shader), sequence,
+                                                "same_atlas", "fail_out_of_order");
+            FailDreamsSculptAtlasLineage(fmt::format(
+                "out-of-order same-atlas consumer {:#x}; expected {:#x} during {}", shader,
+                expected_shader, DreamsSculptAtlasLineagePhaseName(capture.phase)));
+            return false;
+        }
+        const u64 predecessor_sequence = capture.phase == Phase::Waiting2f
+                                             ? capture.producer_sequence
+                                             : capture.prepare.sequence;
+        if (sequence <= predecessor_sequence) {
+            AppendDreamsSculptAtlasLineageEvent(fmt::format("{:#x}", shader), sequence,
+                                                "same_atlas", "fail_non_monotonic");
+            FailDreamsSculptAtlasLineage(
+                fmt::format("same-atlas consumer {:#x} sequence {} did not follow predecessor {}",
+                            shader, sequence, predecessor_sequence));
+            return false;
+        }
+        if (!AppendDreamsSculptAtlasLineageEvent(fmt::format("{:#x}", shader), sequence,
+                                                 "same_atlas", "ordering_valid")) {
+            FailDreamsSculptAtlasLineage("failed to append the consumer ordering event");
+            return false;
+        }
+        return true;
+    }
+
+    ++capture.consumer_attempts;
+    AppendDreamsCaptureText(
+        capture.directory / "resource-mismatches.tsv",
+        fmt::format("{}\t{:#x}\t{}\t{}\t{}\t{}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\n",
+                    capture.consumer_attempts, shader, consumer.valid, consumer.binding,
+                    consumer.image_id, consumer.image_uid, consumer.backing_handle,
+                    consumer.descriptor_base, consumer.guest_base, consumer.descriptor_width,
+                    consumer.descriptor_height, consumer.descriptor_depth, consumer.view_format));
+    LOG_WARNING(Render_Vulkan,
+                "Dreams sculpt-atlas lineage rejected consumer {:#x} attempt={}/{}: exact "
+                "producer backing/byte coordinates did not match",
+                shader, capture.consumer_attempts, DreamsSculptAtlasLineageMaxConsumerAttempts);
+    if (capture.consumer_attempts >= DreamsSculptAtlasLineageMaxConsumerAttempts) {
+        FailDreamsSculptAtlasLineage("consumer resource identity did not match after the cap");
+    }
+    return false;
+}
+
+static void MarkDreamsSculptAtlasLineageF030Files(bool complete) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    if (capture.phase != DreamsSculptAtlasLineageCapture::Phase::WaitingF030) {
+        return;
+    }
+    if (!complete) {
+        FailDreamsSculptAtlasLineage("f030 count/record capture was incomplete");
+        return;
+    }
+    capture.f030_files_complete = true;
+}
+
+static bool FinalizeDreamsSculptAtlasLineage() {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    if (capture.phase != Phase::WaitingF030 || !capture.prepare.complete ||
+        !capture.compact.complete || !capture.f030_files_complete) {
+        return false;
+    }
+    const bool manifest_ok = WriteDreamsCaptureText(
+        capture.directory / "manifest.tsv",
+        fmt::format("schema\t1\nstatus\tcomplete\n"
+                    "capture_scope\tbounded_sampled_gather_store_boundary\n"
+                    "sample_window\twg_xyz_lt_4_local_xyz_lt_2\n"
+                    "max_candidates_per_site\t{}\n"
+                    "gather_scope\tfirst_winner_per_static_site_within_sample_window\n"
+                    "store_scope\tfirst_16_claimants_per_static_site_within_sample_window\n"
+                    "gather_store_pairing\tindependent_claimants_no_per_invocation_join\n"
+                    "store_reload_evidence\timmediate_shader_observation_not_host_persistence\n"
+                    "producer_shader\t{:#x}\nproducer_sequence\t{}\n"
+                    "producer_groups\t{}\nproducer_bricks\t{}\nproducer_mismatched_bytes\t{}\n"
+                    "prepare_shader\t{:#x}\nprepare_sequence\t{}\nprepare_match\t{}\n"
+                    "prepare_mismatch\t{}\nprepare_unknown\t{}\ncompact_shader\t{:#x}\n"
+                    "compact_sequence\t{}\ncompact_match\t{}\ncompact_mismatch\t{}\n"
+                    "compact_unknown\t{}\nf030_files_complete\t{}\nce3_join\tnot_captured\n",
+                    Shader::DreamsCompat::ImageGather3DSampleWindow::MaxCandidatesPerSite,
+                    Shader::DreamsCompat::SculptVolumeWriterShader, capture.producer_sequence,
+                    capture.producer_groups, capture.bricks.size(),
+                    capture.producer_mismatched_bytes,
+                    Shader::DreamsCompat::SculptAtlasPrepareShader, capture.prepare.sequence,
+                    capture.prepare.matched, capture.prepare.mismatched, capture.prepare.unknown,
+                    Shader::DreamsCompat::SculptSurfaceCompactShader, capture.compact.sequence,
+                    capture.compact.matched, capture.compact.mismatched, capture.compact.unknown,
+                    capture.f030_files_complete));
+    if (!manifest_ok || !WriteDreamsCaptureCompletionMarker(capture.directory)) {
+        FailDreamsSculptAtlasLineage("failed to write the verified completion marker");
+        return false;
+    }
+    capture.phase = Phase::Complete;
+    LOG_WARNING(Render_Vulkan,
+                "Dreams sculpt-atlas lineage complete directory={} producer={} 2f={} f030={} "
+                "(CE3 join deliberately not captured)",
+                capture.directory.string(), capture.producer_sequence, capture.prepare.sequence,
+                capture.compact.sequence);
+    return true;
+}
+
+static bool RecordDreamsSculptAtlasLineageConsumer(
+    u64 shader, u64 sequence, const DreamsAtlasImageIdentity& consumer,
+    const std::array<u32, Gather3DCapture::DwordCount>& gather,
+    const std::array<u32, Gather3DConsumerCapture::DwordCount>& stores) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    const bool is_prepare = shader == Shader::DreamsCompat::SculptAtlasPrepareShader &&
+                            capture.phase == Phase::Waiting2f;
+    const bool is_compact = shader == Shader::DreamsCompat::SculptSurfaceCompactShader &&
+                            capture.phase == Phase::WaitingF030;
+    if (!is_prepare && !is_compact) {
+        return false;
+    }
+    if (!SameDreamsAtlasByteCoordinates(capture.producer_image, consumer)) {
+        FailDreamsSculptAtlasLineage("captured consumer resource identity changed after arming");
+        return false;
+    }
+
+    const auto gather_word = [&](u32 absolute_dword) {
+        return gather[absolute_dword - Gather3DCapture::BaseDword];
+    };
+    const auto gather_record = [&](u32 site, u32 field) {
+        return gather_word(Gather3DCapture::RecordDword(site, field));
+    };
+    const auto store_word = [&](u32 absolute_dword) {
+        return stores[absolute_dword - Gather3DConsumerCapture::BaseDword];
+    };
+    const auto store_record = [&](u32 site, u32 index, u32 field) {
+        return store_word(Gather3DConsumerCapture::RecordDword(site, index, field));
+    };
+    const u32 gather_seen = gather_word(Gather3DCapture::SeenDword);
+    const u32 store_seen = store_word(Gather3DConsumerCapture::SeenDword);
+    constexpr u32 RequiredGatherSites = 0x3;
+    if ((gather_seen & RequiredGatherSites) != RequiredGatherSites || store_seen == 0) {
+        FailDreamsSculptAtlasLineage(
+            fmt::format("consumer {:#x} capture incomplete: gather_seen={:#x} store_seen={:#x}",
+                        shader, gather_seen, store_seen));
+        return false;
+    }
+
+    const auto output = capture.directory / (is_prepare ? "2f" : "f030") / "gather";
+    std::error_code error;
+    std::filesystem::create_directories(output, error);
+    if (error) {
+        FailDreamsSculptAtlasLineage("could not create the consumer output directory");
+        return false;
+    }
+    u64 gather_hash{};
+    u64 stores_hash{};
+    bool files_ok = WriteDreamsCaptureWords(output / "gather.bin", gather, gather_hash) &&
+                    WriteDreamsCaptureWords(output / "stores.bin", stores, stores_hash);
+
+    u32 matched{};
+    u32 mismatched{};
+    u32 unknown{};
+    std::string gather_rows =
+        "site\tsource\tx\ty\tz\tbinding\tcomponent\tsampled_raw\tsampled_byte\t"
+        "producer_actual\tproducer_expected\tproducer_mismatches\tstatus\n";
+    for (u32 site = 0; site < Gather3DCapture::MaxSites; ++site) {
+        if ((gather_seen & (1U << site)) == 0) {
+            continue;
+        }
+        const u64 captured_hash = u64{gather_record(site, Gather3DCapture::ShaderHashLo)} |
+                                  (u64{gather_record(site, Gather3DCapture::ShaderHashHi)} << 32);
+        const u32 binding = gather_record(site, Gather3DCapture::ImageBinding);
+        const u32 component = gather_record(site, Gather3DCapture::Component);
+        if (captured_hash != shader || binding != 0 || component != 0) {
+            FailDreamsSculptAtlasLineage(
+                "consumer gather site did not use the expected shader/image/red component");
+            return false;
+        }
+        for (u32 source = 0; source < 4; ++source) {
+            const s32 x = std::bit_cast<s32>(
+                gather_record(site, Gather3DCapture::SourceCoordinates + source * 3));
+            const s32 y = std::bit_cast<s32>(
+                gather_record(site, Gather3DCapture::SourceCoordinates + source * 3 + 1));
+            const s32 z = std::bit_cast<s32>(
+                gather_record(site, Gather3DCapture::SourceCoordinates + source * 3 + 2));
+            const u32 sampled_raw =
+                gather_record(site, Gather3DCapture::SelectedComponents + source);
+            const float sampled_float = std::bit_cast<float>(sampled_raw);
+            const bool sampled_valid =
+                std::isfinite(sampled_float) && sampled_float >= 0.0f && sampled_float <= 1.0f;
+            const u32 sampled_byte = sampled_valid
+                                         ? static_cast<u32>(std::lround(sampled_float * 255.0f))
+                                         : std::numeric_limits<u32>::max();
+            const auto key = PackDreamsAtlasBrick(x, y, z);
+            const auto brick_it =
+                key.has_value() ? capture.bricks.find(*key) : capture.bricks.end();
+            u32 producer_actual = std::numeric_limits<u32>::max();
+            u32 producer_expected = std::numeric_limits<u32>::max();
+            u32 producer_mismatches{};
+            std::string_view status = "UNKNOWN";
+            if (brick_it != capture.bricks.end()) {
+                const u32 lane = (static_cast<u32>(y) & 7U) * 8U + (static_cast<u32>(x) & 7U);
+                const u32 byte = static_cast<u32>(z) & 7U;
+                const u32 offset = byte * 64 + lane;
+                producer_actual = brick_it->second.actual[offset];
+                producer_expected = brick_it->second.expected[offset];
+                producer_mismatches = brick_it->second.producer_mismatches;
+                if (sampled_valid && sampled_byte == producer_actual) {
+                    status = "MATCH";
+                    ++matched;
+                } else {
+                    status = "MISMATCH";
+                    ++mismatched;
+                }
+            } else {
+                ++unknown;
+            }
+            gather_rows +=
+                fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\n",
+                            site, source, x, y, z, binding, component, sampled_raw, sampled_byte,
+                            producer_actual, producer_expected, producer_mismatches, status);
+        }
+    }
+
+    std::string store_rows =
+        "site\tindex\twindow_claims\thandle\tcomponents\traw_address\tresolved_address\t"
+        "input0\tinput1\tinput2\tinput3\treload0\treload1\treload2\treload3\t"
+        "match_mask\tbuffer_type\n";
+    for (u32 site = 0; site < Gather3DConsumerCapture::MaxSites; ++site) {
+        const u32 total = store_word(Gather3DConsumerCapture::CounterDword(site));
+        const u32 stored = std::min(total, Gather3DConsumerCapture::MaxRecordsPerSite);
+        for (u32 index = 0; index < stored; ++index) {
+            store_rows += fmt::format(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t"
+                "{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#x}\t{}\n",
+                site, index, total, store_record(site, index, Gather3DConsumerCapture::Handle),
+                store_record(site, index, Gather3DConsumerCapture::Components),
+                store_record(site, index, Gather3DConsumerCapture::RawAddress),
+                store_record(site, index, Gather3DConsumerCapture::ResolvedAddress),
+                store_record(site, index, Gather3DConsumerCapture::InputValues),
+                store_record(site, index, Gather3DConsumerCapture::InputValues + 1),
+                store_record(site, index, Gather3DConsumerCapture::InputValues + 2),
+                store_record(site, index, Gather3DConsumerCapture::InputValues + 3),
+                store_record(site, index, Gather3DConsumerCapture::ReloadedValues),
+                store_record(site, index, Gather3DConsumerCapture::ReloadedValues + 1),
+                store_record(site, index, Gather3DConsumerCapture::ReloadedValues + 2),
+                store_record(site, index, Gather3DConsumerCapture::ReloadedValues + 3),
+                store_record(site, index, Gather3DConsumerCapture::MatchMask),
+                store_record(site, index, Gather3DConsumerCapture::BufferType));
+        }
+    }
+    files_ok &= WriteDreamsCaptureText(output / "gather.tsv", gather_rows);
+    files_ok &= WriteDreamsCaptureText(output / "stores.tsv", store_rows);
+    files_ok &= WriteDreamsCaptureText(
+        output / "manifest.tsv",
+        fmt::format(
+            "schema\t1\nshader\t{:#x}\nsequence\t{}\n"
+            "capture_scope\tbounded_sampled_gather_store_boundary\n"
+            "sample_window\twg_xyz_lt_4_local_xyz_lt_2\n"
+            "max_candidates_per_site\t{}\n"
+            "gather_scope\tfirst_winner_per_static_site_within_sample_window\n"
+            "store_scope\tfirst_16_claimants_per_static_site_within_sample_window\n"
+            "gather_store_pairing\tindependent_claimants_no_per_invocation_join\n"
+            "store_reload_evidence\timmediate_shader_observation_not_host_persistence\n"
+            "gather_seen\t{:#x}\n"
+            "store_seen\t{:#x}\nmatched\t{}\nmismatched\t{}\nunknown\t{}\n"
+            "gather_fnv1a64\t{:#018x}\nstores_fnv1a64\t{:#018x}\n"
+            "resource_identity\texact_same_backing_and_byte_coordinates\n",
+            shader, sequence, Shader::DreamsCompat::ImageGather3DSampleWindow::MaxCandidatesPerSite,
+            gather_seen, store_seen, matched, mismatched, unknown, gather_hash, stores_hash));
+    if (!files_ok) {
+        FailDreamsSculptAtlasLineage("failed to write the consumer gather/store files");
+        return false;
+    }
+
+    auto& result = is_prepare ? capture.prepare : capture.compact;
+    result = {
+        .complete = true,
+        .sequence = sequence,
+        .gather_seen = gather_seen,
+        .store_seen = store_seen,
+        .matched = matched,
+        .mismatched = mismatched,
+        .unknown = unknown,
+    };
+    capture.consumer_attempts = 0;
+    if (is_prepare) {
+        capture.phase = Phase::WaitingF030;
+    } else {
+        FinalizeDreamsSculptAtlasLineage();
+    }
+    return true;
 }
 
 static void FailDreamsUpstreamLineageCapture(std::string_view reason) {
@@ -19379,59 +19984,10 @@ void Rasterizer::DispatchDirect(
     static bool image_gather_3d_capture_pending{};
     static u64 image_gather_3d_capture_pending_shader{};
     static u32 image_gather_3d_capture_pending_misses{};
+    static bool image_gather_3d_capture_pending_lineage{};
     VideoCore::Buffer* image_gather_3d_capture_gds{};
     bool image_gather_3d_capture_armed{};
-    if (Shader::DreamsCompat::CaptureImageGather3D() && image_gather_3d_capture_pending &&
-        image_gather_3d_capture_pending_shader == cs.pgm_hash) {
-        image_gather_3d_capture_gds = buffer_cache.GetGdsBuffer();
-        image_gather_3d_capture_armed = true;
-    } else if (Shader::DreamsCompat::CaptureImageGather3D() && !image_gather_3d_capture_pending &&
-               cs.has_image_gather && cs_program.dim_x != 0 && cs_program.dim_y != 0 &&
-               cs_program.dim_z != 0 && !image_gather_3d_capture_complete.contains(cs.pgm_hash)) {
-        bool has_3d_image{};
-        for (const auto& image : cs.images) {
-            has_3d_image |=
-                image.GetSharp(cs).GetViewType(image.is_array) == AmdGpu::ImageType::Color3D;
-        }
-        if (has_3d_image) {
-            image_gather_3d_capture_gds = buffer_cache.GetGdsBuffer();
-            if (ImageGather3DCaptureOffset + ImageGather3DCaptureSize <=
-                    image_gather_3d_capture_gds->SizeBytes() &&
-                ImageGather3DCaptureOffset + ImageGather3DCaptureSize <=
-                    image_gather_3d_capture_gds->mapped_data.size() &&
-                ImageGather3DConsumerCaptureOffset + ImageGather3DConsumerCaptureSize <=
-                    image_gather_3d_capture_gds->SizeBytes() &&
-                ImageGather3DConsumerCaptureOffset + ImageGather3DConsumerCaptureSize <=
-                    image_gather_3d_capture_gds->mapped_data.size()) {
-                image_gather_3d_capture_gds->Fill(ImageGather3DCaptureOffset,
-                                                  ImageGather3DCaptureSize, 0);
-                image_gather_3d_capture_gds->Fill(ImageGather3DConsumerCaptureOffset,
-                                                  ImageGather3DConsumerCaptureSize, 0);
-                image_gather_3d_capture_gds->Fill(ImageGather3DCaptureTargetLoOffset, sizeof(u32),
-                                                  static_cast<u32>(cs.pgm_hash));
-                image_gather_3d_capture_gds->Fill(ImageGather3DCaptureTargetHiOffset, sizeof(u32),
-                                                  static_cast<u32>(cs.pgm_hash >> 32));
-                image_gather_3d_capture_gds->Fill(ImageGather3DCaptureArmOffset, sizeof(u32), 1);
-                image_gather_3d_capture_pending = true;
-                image_gather_3d_capture_pending_shader = cs.pgm_hash;
-                image_gather_3d_capture_pending_misses = 0;
-                image_gather_3d_capture_armed = true;
-                LOG_WARNING(Render_Vulkan,
-                            "3D ImageGather capture armed raw_hash={:#x} program_address={:#x} "
-                            "dispatch={}x{}x{}",
-                            cs.pgm_hash, cs.pgm_base, cs_program.dim_x, cs_program.dim_y,
-                            cs_program.dim_z);
-            } else {
-                image_gather_3d_capture_complete[cs.pgm_hash] = true;
-                LOG_ERROR(Render_Vulkan,
-                          "3D ImageGather capture range {:#x}+{:#x} exceeds GDS size {:#x} "
-                          "or mapped size {:#x}",
-                          ImageGather3DCaptureOffset, ImageGather3DCaptureSize,
-                          image_gather_3d_capture_gds->SizeBytes(),
-                          image_gather_3d_capture_gds->mapped_data.size());
-            }
-        }
-    }
+    bool image_gather_3d_capture_lineage_armed{};
     const bool is_dreams_sculpt_surface_compact =
         cs.pgm_hash == Shader::DreamsCompat::SculptSurfaceCompactShader;
     const bool is_dreams_sculpt_surface_finalize =
@@ -19520,6 +20076,7 @@ void Rasterizer::DispatchDirect(
         cs_program.dim_y == 1 && cs_program.dim_z == 1 &&
         cs_program.num_thread_x.full == Shader::DreamsCompat::SculptOrderedLanesPerWorkgroup &&
         cs_program.num_thread_y.full == 1 && cs_program.num_thread_z.full == 1;
+
     const bool is_dreams_b1_seed_writer =
         cs.pgm_hash == Shader::DreamsCompat::B1SeedWriterShader;
     const bool use_dreams_b1_seed_writer_ordered_prefix =
@@ -20272,6 +20829,138 @@ void Rasterizer::DispatchDirect(
         }
         return identity;
     };
+
+    bool capture_sculpt_atlas_lineage{};
+    if (cs.pgm_hash == Shader::DreamsCompat::SculptVolumeWriterShader &&
+        (use_dreams_sculpt_ordered_prefix ||
+         g_dreams_sculpt_atlas_lineage.phase !=
+             DreamsSculptAtlasLineageCapture::Phase::WaitingRequest)) {
+        capture_sculpt_atlas_lineage = BeginDreamsSculptAtlasLineageIfRequested(
+            g_compute_dispatch_sequence, cs_program.dim_x, describe_dreams_image_binding(1));
+    }
+
+    const bool capture_all_image_gather = Shader::DreamsCompat::CaptureAllImageGather3D();
+    bool capture_lineage_consumer{};
+    if (Shader::DreamsCompat::CaptureSculptAtlasLineage() &&
+        Shader::DreamsCompat::IsSculptAtlasGatherConsumer(cs.pgm_hash) &&
+        WantsDreamsSculptAtlasLineageConsumer(cs.pgm_hash, g_compute_dispatch_sequence,
+                                              describe_dreams_image_binding(0))) {
+        bool lineage_eligible = true;
+        if (image_gather_3d_capture_pending) {
+            FailDreamsSculptAtlasLineage(
+                "same-atlas consumer arrived while the shared gather capture slot was occupied");
+            lineage_eligible = false;
+        }
+        if (!cs.has_image_gather) {
+            FailDreamsSculptAtlasLineage(
+                "same-atlas consumer did not contain an instrumentable 3D gather");
+            lineage_eligible = false;
+        }
+        if (is_dreams_sculpt_surface_compact &&
+            (!use_dreams_sculpt_surface_ordered_prefix ||
+             dreams_sculpt_surface_wave_count > DreamsSculptAtlasLineageMaxF030Waves)) {
+            FailDreamsSculptAtlasLineage(fmt::format(
+                "same-atlas f030 was not eligible for bounded exact-DOC replay: exact={} waves={} "
+                "cap={}",
+                use_dreams_sculpt_surface_ordered_prefix, dreams_sculpt_surface_wave_count,
+                DreamsSculptAtlasLineageMaxF030Waves));
+            lineage_eligible = false;
+        }
+
+        constexpr u64 InvocationCap = DreamsSculptAtlasLineageMaxConsumerInvocations;
+        const std::array<u64, 6> factors{
+            cs_program.dim_x,
+            cs_program.dim_y,
+            cs_program.dim_z,
+            cs_program.num_thread_x.full,
+            cs_program.num_thread_y.full,
+            cs_program.num_thread_z.full,
+        };
+        u64 consumer_invocations = 1;
+        for (const u64 factor : factors) {
+            if (factor == 0 || consumer_invocations > InvocationCap / factor) {
+                consumer_invocations = 0;
+                break;
+            }
+            consumer_invocations *= factor;
+        }
+        if (consumer_invocations == 0 || consumer_invocations > InvocationCap) {
+            FailDreamsSculptAtlasLineage(
+                fmt::format("consumer {:#x} dispatch exceeded the bounded invocation cap {}",
+                            cs.pgm_hash, InvocationCap));
+            lineage_eligible = false;
+        }
+        if (lineage_eligible && !AppendDreamsSculptAtlasLineageEvent(
+                                    fmt::format("{:#x}", cs.pgm_hash), g_compute_dispatch_sequence,
+                                    "preflight_bounded", "arm")) {
+            FailDreamsSculptAtlasLineage("failed to append the consumer preflight event");
+            lineage_eligible = false;
+        }
+        capture_lineage_consumer = lineage_eligible;
+    }
+
+    const bool capture_this_image_gather = capture_all_image_gather || capture_lineage_consumer;
+    if (Shader::DreamsCompat::CaptureImageGather3DForShader(cs.pgm_hash) &&
+        image_gather_3d_capture_pending && image_gather_3d_capture_pending_shader == cs.pgm_hash) {
+        image_gather_3d_capture_gds = buffer_cache.GetGdsBuffer();
+        image_gather_3d_capture_armed = true;
+        image_gather_3d_capture_lineage_armed = image_gather_3d_capture_pending_lineage;
+    } else if (capture_this_image_gather && !image_gather_3d_capture_pending &&
+               cs.has_image_gather && cs_program.dim_x != 0 && cs_program.dim_y != 0 &&
+               cs_program.dim_z != 0 &&
+               (capture_lineage_consumer ||
+                !image_gather_3d_capture_complete.contains(cs.pgm_hash))) {
+        bool has_3d_image{};
+        for (const auto& image : cs.images) {
+            has_3d_image |=
+                image.GetSharp(cs).GetViewType(image.is_array) == AmdGpu::ImageType::Color3D;
+        }
+        if (has_3d_image) {
+            image_gather_3d_capture_gds = buffer_cache.GetGdsBuffer();
+            if (ImageGather3DCaptureOffset + ImageGather3DCaptureSize <=
+                    image_gather_3d_capture_gds->SizeBytes() &&
+                ImageGather3DCaptureOffset + ImageGather3DCaptureSize <=
+                    image_gather_3d_capture_gds->mapped_data.size() &&
+                ImageGather3DConsumerCaptureOffset + ImageGather3DConsumerCaptureSize <=
+                    image_gather_3d_capture_gds->SizeBytes() &&
+                ImageGather3DConsumerCaptureOffset + ImageGather3DConsumerCaptureSize <=
+                    image_gather_3d_capture_gds->mapped_data.size()) {
+                image_gather_3d_capture_gds->Fill(ImageGather3DCaptureOffset,
+                                                  ImageGather3DCaptureSize, 0);
+                image_gather_3d_capture_gds->Fill(ImageGather3DConsumerCaptureOffset,
+                                                  ImageGather3DConsumerCaptureSize, 0);
+                image_gather_3d_capture_gds->Fill(ImageGather3DCaptureTargetLoOffset, sizeof(u32),
+                                                  static_cast<u32>(cs.pgm_hash));
+                image_gather_3d_capture_gds->Fill(ImageGather3DCaptureTargetHiOffset, sizeof(u32),
+                                                  static_cast<u32>(cs.pgm_hash >> 32));
+                image_gather_3d_capture_gds->Fill(ImageGather3DCaptureArmOffset, sizeof(u32), 1);
+                image_gather_3d_capture_pending = true;
+                image_gather_3d_capture_pending_shader = cs.pgm_hash;
+                image_gather_3d_capture_pending_misses = 0;
+                image_gather_3d_capture_pending_lineage = capture_lineage_consumer;
+                image_gather_3d_capture_armed = true;
+                image_gather_3d_capture_lineage_armed = capture_lineage_consumer;
+                LOG_WARNING(Render_Vulkan,
+                            "3D ImageGather capture armed raw_hash={:#x} program_address={:#x} "
+                            "dispatch={}x{}x{}",
+                            cs.pgm_hash, cs.pgm_base, cs_program.dim_x, cs_program.dim_y,
+                            cs_program.dim_z);
+            } else {
+                image_gather_3d_capture_complete[cs.pgm_hash] = true;
+                if (capture_lineage_consumer) {
+                    FailDreamsSculptAtlasLineage("consumer capture GDS range was unavailable");
+                }
+                LOG_ERROR(Render_Vulkan,
+                          "3D ImageGather capture range {:#x}+{:#x} exceeds GDS size {:#x} "
+                          "or mapped size {:#x}",
+                          ImageGather3DCaptureOffset, ImageGather3DCaptureSize,
+                          image_gather_3d_capture_gds->SizeBytes(),
+                          image_gather_3d_capture_gds->mapped_data.size());
+            }
+        } else if (capture_lineage_consumer) {
+            FailDreamsSculptAtlasLineage("eligible consumer had no bound 3D image");
+        }
+    }
     const auto describe_dreams_buffer_binding = [&](u32 binding) {
         DreamsBoundBufferIdentity identity{};
         identity.binding = binding;
@@ -20793,6 +21482,7 @@ void Rasterizer::DispatchDirect(
     struct SculptReplayValidation {
         bool ready{};
         bool provenance_capture{};
+        bool lineage_capture{};
         u32 image_binding{};
         VideoCore::ImageId image_id{};
         DreamsAtlasImageIdentity image_identity{};
@@ -21405,19 +22095,30 @@ void Rasterizer::DispatchDirect(
             return value != nullptr ? std::filesystem::path{value} : std::filesystem::path{};
         }();
         static bool captured_f030_count{};
-        bool capture_f030_now = is_dreams_sculpt_surface_compact && capture_f030_count &&
-                                !captured_f030_count;
-        if (capture_f030_now && !capture_f030_trigger.empty()) {
+        bool capture_f030_legacy_now =
+            is_dreams_sculpt_surface_compact && capture_f030_count && !captured_f030_count;
+        if (capture_f030_legacy_now && !capture_f030_trigger.empty()) {
             std::error_code trigger_error;
-            capture_f030_now = std::filesystem::remove(capture_f030_trigger, trigger_error);
+            capture_f030_legacy_now = std::filesystem::remove(capture_f030_trigger, trigger_error);
             if (trigger_error) {
                 LOG_ERROR(Render_Vulkan, "Dreams f030 capture trigger {} failed: {}",
                           capture_f030_trigger.string(), trigger_error.message());
-                capture_f030_now = false;
+                capture_f030_legacy_now = false;
             }
         }
+        bool capture_f030_lineage_now = is_dreams_sculpt_surface_compact &&
+                                        image_gather_3d_capture_lineage_armed &&
+                                        g_dreams_sculpt_atlas_lineage.phase ==
+                                            DreamsSculptAtlasLineageCapture::Phase::WaitingF030;
+        if (capture_f030_lineage_now && wave_count > DreamsSculptAtlasLineageMaxF030Waves) {
+            FailDreamsSculptAtlasLineage(fmt::format("f030 wave count {} exceeded the safe cap {}",
+                                                     wave_count,
+                                                     DreamsSculptAtlasLineageMaxF030Waves));
+            capture_f030_lineage_now = false;
+        }
+        const bool capture_f030_now = capture_f030_legacy_now || capture_f030_lineage_now;
         if (capture_f030_now) {
-            captured_f030_count = true;
+            captured_f030_count |= capture_f030_legacy_now;
             scheduler.Finish();
 
             const u64 scratch_base =
@@ -21501,7 +22202,15 @@ void Rasterizer::DispatchDirect(
             VAddr records_address{};
             u64 records_descriptor_size{};
             std::vector<u32> records;
-            if (published_valid && cs.buffers.size() > 1 && !cs.buffers[1].IsSpecial()) {
+            const bool lineage_records_within_cap =
+                !capture_f030_lineage_now || published <= DreamsSculptAtlasLineageMaxF030Records;
+            if (capture_f030_lineage_now && published_valid && !lineage_records_within_cap) {
+                FailDreamsSculptAtlasLineage(
+                    fmt::format("f030 published record count {} exceeded the safe cap {}",
+                                published, DreamsSculptAtlasLineageMaxF030Records));
+            }
+            if (published_valid && (capture_f030_legacy_now || lineage_records_within_cap) &&
+                cs.buffers.size() > 1 && !cs.buffers[1].IsSpecial()) {
                 const auto output = cs.buffers[1].GetSharp(cs);
                 records_address = output.base_address;
                 records_descriptor_size = output.GetSize();
@@ -21556,6 +22265,53 @@ void Rasterizer::DispatchDirect(
                 if (files_ok) {
                     WriteDreamsCaptureText(capture_f030_directory / "complete.txt", "complete\n");
                 }
+            }
+            if (capture_f030_lineage_now) {
+                const auto lineage_directory =
+                    g_dreams_sculpt_atlas_lineage.directory / "f030" / "records";
+                std::error_code lineage_error;
+                std::filesystem::create_directories(lineage_directory, lineage_error);
+                bool lineage_files_ok = !lineage_error && scratch_valid && published_valid &&
+                                        lineage_records_within_cap && records_valid &&
+                                        scan_matches && publish_matches;
+                u64 lineage_records_hash{};
+                u64 lineage_scratch_hash{};
+                const auto records_file = lineage_directory / "records.bin";
+                const auto scratch_file = lineage_directory / "scratch.bin";
+                if (lineage_files_ok) {
+                    lineage_files_ok =
+                        WriteDreamsCaptureWords(records_file, records, lineage_records_hash) &&
+                        WriteDreamsCaptureWords(scratch_file, scratch_words, lineage_scratch_hash);
+                }
+                if (lineage_files_ok) {
+                    const std::span<const u8> record_bytes{
+                        reinterpret_cast<const u8*>(records.data()), records.size() * sizeof(u32)};
+                    const std::span<const u8> scratch_bytes{
+                        reinterpret_cast<const u8*>(scratch_words.data()),
+                        scratch_words.size() * sizeof(u32)};
+                    lineage_files_ok =
+                        VerifyDreamsCaptureBytes(records_file, record_bytes,
+                                                 lineage_records_hash) &&
+                        VerifyDreamsCaptureBytes(scratch_file, scratch_bytes, lineage_scratch_hash);
+                }
+                if (lineage_files_ok) {
+                    lineage_files_ok = WriteDreamsCaptureText(
+                        lineage_directory / "manifest.tsv",
+                        fmt::format(
+                            "schema\t1\nshader\t{:#x}\nsequence\t{}\nwave_count\t{}\n"
+                            "dims\t{}x{}x{}\ninitial\t{}\npayload_sum\t{}\ncomputed_final\t{}\n"
+                            "gds_final\t{}\npublished\t{}\nprefix_failures\t{}\n"
+                            "scan_matches\t{}\npublish_matches\t{}\nrecord_stride\t16\n"
+                            "record_count\t{}\nrecord_bytes\t{}\nrecords_fnv1a64\t{:#018x}\n"
+                            "scratch_dwords\t{}\nscratch_fnv1a64\t{:#018x}\n",
+                            Shader::DreamsCompat::SculptSurfaceCompactShader,
+                            g_compute_dispatch_sequence, wave_count, cs_program.dim_x,
+                            cs_program.dim_y, cs_program.dim_z, initial, payload_sum,
+                            computed_final, gds_final, published, prefix_failures, scan_matches,
+                            publish_matches, published, records.size() * sizeof(u32),
+                            lineage_records_hash, scratch_words.size(), lineage_scratch_hash));
+                }
+                MarkDreamsSculptAtlasLineageF030Files(lineage_files_ok);
             }
             LOG_WARNING(Render_Vulkan,
                         "Dreams f030 count capture sequence={} groups={} scratch_valid={} "
@@ -21731,10 +22487,10 @@ void Rasterizer::DispatchDirect(
         const bool capture_7ba_provenance_atlas =
             g_dreams_7ba_provenance_capture.consumer_active &&
             g_dreams_7ba_provenance_capture.consumer_sequence == g_compute_dispatch_sequence;
-        if ((capture_7ba_provenance_atlas || validate_sculpt_replay ||
-             cross_check_sculpt_gather) &&
-            (capture_7ba_provenance_atlas || !sculpt_replay_validation_done ||
-             cross_check_sculpt_gather)) {
+        if ((capture_7ba_provenance_atlas || capture_sculpt_atlas_lineage ||
+             validate_sculpt_replay || cross_check_sculpt_gather) &&
+            (capture_7ba_provenance_atlas || capture_sculpt_atlas_lineage ||
+             !sculpt_replay_validation_done || cross_check_sculpt_gather)) {
             // Prefixes, checkpoints, and the lookup table must all be host-visible before building
             // an independent list of the exact Image #1 bricks replay is expected to overwrite.
             scheduler.Finish();
@@ -21757,6 +22513,10 @@ void Rasterizer::DispatchDirect(
                                          cs.images[1].NumBindings(cs) == 1 &&
                                          image_bindings.size() > 1 && image_infos.size() > 1;
             if (!gds_ranges_valid || !resources_valid) {
+                if (capture_sculpt_atlas_lineage) {
+                    FailDreamsSculptAtlasLineage(
+                        "84aa GDS ranges or required resources were incomplete");
+                }
                 if (sculpt_replay_validation_skips++ < 8) {
                     LOG_ERROR(Render_Vulkan,
                               "Dreams 84aa replay validation skipped: gds_ranges={} resources={} "
@@ -21805,6 +22565,10 @@ void Rasterizer::DispatchDirect(
                                           lookup_bytes <= lookup.GetSize() &&
                                           memory->IsValidMapping(lookup.base_address, lookup_bytes);
                 if (!lookup_valid) {
+                    if (capture_sculpt_atlas_lineage) {
+                        FailDreamsSculptAtlasLineage(
+                            "84aa lookup or destination map was incomplete");
+                    }
                     if (sculpt_replay_validation_skips++ < 8) {
                         LOG_ERROR(Render_Vulkan,
                                   "Dreams 84aa replay validation waiting: groups={} valid={} "
@@ -21820,6 +22584,10 @@ void Rasterizer::DispatchDirect(
                         image_id &&
                         image_desc.type == VideoCore::TextureCache::BindingType::Storage;
                     if (!image_valid) {
+                        if (capture_sculpt_atlas_lineage) {
+                            FailDreamsSculptAtlasLineage(
+                                "84aa Image #1 was not a bound storage image");
+                        }
                         if (sculpt_replay_validation_skips++ < 8) {
                             LOG_ERROR(Render_Vulkan,
                                       "Dreams 84aa replay validation skipped: Image #1 is not a "
@@ -21832,6 +22600,10 @@ void Rasterizer::DispatchDirect(
                                                        image_desc.view_info.range.base.level == 0 &&
                                                        image_desc.view_info.range.base.layer == 0;
                         if (!image_shape_valid) {
+                            if (capture_sculpt_atlas_lineage) {
+                                FailDreamsSculptAtlasLineage("84aa Image #1 did not have the "
+                                                             "required 8-bit single-layer shape");
+                            }
                             LOG_ERROR(Render_Vulkan,
                                       "Dreams 84aa replay validation skipped: unexpected Image #1 "
                                       "shape id={} {}x{}x{} bits={} layers={} level={} layer={}",
@@ -21844,6 +22616,7 @@ void Rasterizer::DispatchDirect(
                         } else {
                             sculpt_replay_validation.provenance_capture =
                                 capture_7ba_provenance_atlas;
+                            sculpt_replay_validation.lineage_capture = capture_sculpt_atlas_lineage;
                             sculpt_replay_validation.image_binding = 1;
                             sculpt_replay_validation.image_id = image_id;
                             sculpt_replay_validation.image_identity =
@@ -21929,6 +22702,10 @@ void Rasterizer::DispatchDirect(
                                 destination_failures == 0 &&
                                 !sculpt_replay_validation.groups.empty();
                             if (!sculpt_replay_validation.ready) {
+                                if (capture_sculpt_atlas_lineage) {
+                                    FailDreamsSculptAtlasLineage("84aa destination map contained "
+                                                                 "duplicates or invalid entries");
+                                }
                                 LOG_ERROR(Render_Vulkan,
                                           "Dreams 84aa replay validation rejected destination map: "
                                           "valid={} accepted={} failures={}",
@@ -22405,10 +23182,25 @@ void Rasterizer::DispatchDirect(
             LogImageGather3DConsumerCapture(image_gather_3d_capture_pending_shader,
                                             consumer_capture);
         }
-        if (capture_seen && (!cross_check_sculpt_gather || cross_check.Compared())) {
+        if (image_gather_3d_capture_lineage_armed) {
+            if (capture_seen) {
+                RecordDreamsSculptAtlasLineageConsumer(
+                    image_gather_3d_capture_pending_shader, g_compute_dispatch_sequence,
+                    describe_dreams_image_binding(0), capture, consumer_capture);
+            } else {
+                FailDreamsSculptAtlasLineage(
+                    "eligible consumer dispatch did not reach both instrumented gather sites");
+            }
             image_gather_3d_capture_gds->Fill(ImageGather3DCaptureArmOffset, sizeof(u32), 0);
             image_gather_3d_capture_complete[image_gather_3d_capture_pending_shader] = true;
             image_gather_3d_capture_pending = false;
+            image_gather_3d_capture_pending_lineage = false;
+            image_gather_3d_capture_pending_misses = 0;
+        } else if (capture_seen && (!cross_check_sculpt_gather || cross_check.Compared())) {
+            image_gather_3d_capture_gds->Fill(ImageGather3DCaptureArmOffset, sizeof(u32), 0);
+            image_gather_3d_capture_complete[image_gather_3d_capture_pending_shader] = true;
+            image_gather_3d_capture_pending = false;
+            image_gather_3d_capture_pending_lineage = false;
             image_gather_3d_capture_pending_misses = 0;
         } else {
             ++image_gather_3d_capture_pending_misses;
@@ -22449,6 +23241,7 @@ void Rasterizer::DispatchDirect(
                             "moving to the next shader",
                             cs.pgm_hash, cs.pgm_base, image_gather_3d_capture_pending_misses);
                 image_gather_3d_capture_pending = false;
+                image_gather_3d_capture_pending_lineage = false;
                 image_gather_3d_capture_pending_misses = 0;
             }
         }
@@ -22467,6 +23260,10 @@ void Rasterizer::DispatchDirect(
         }
         if (download == nullptr) {
             sculpt_replay_validation_done = true;
+            if (sculpt_replay_validation.lineage_capture) {
+                FailDreamsSculptAtlasLineage(
+                    "84aa atlas readback could not reserve bounded download storage");
+            }
             LOG_ERROR(Render_Vulkan,
                       "Dreams 84aa replay validation failed to reserve {} download bytes",
                       download_size);
@@ -22496,6 +23293,10 @@ void Rasterizer::DispatchDirect(
                 image_bindings[sculpt_replay_validation.image_binding];
             if (bound_image_id != sculpt_replay_validation.image_id) {
                 sculpt_replay_validation_done = true;
+                if (sculpt_replay_validation.lineage_capture) {
+                    FailDreamsSculptAtlasLineage(
+                        "84aa Image #1 binding changed between replay and readback");
+                }
                 LOG_ERROR(Render_Vulkan,
                           "Dreams 84aa replay validation skipped: Image #1 binding changed "
                           "during replay ({} -> {})",
@@ -22507,6 +23308,7 @@ void Rasterizer::DispatchDirect(
                               vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
                               image_desc.view_info.range);
                 scheduler.Finish();
+                download_buffer.InvalidateMappedRange(download_offset, download_size);
 
                 u64 mismatched_bytes{};
                 u32 mismatched_groups{};
@@ -22540,6 +23342,13 @@ void Rasterizer::DispatchDirect(
                         }
                     }
                     mismatched_groups += group_mismatch;
+                }
+                if (sculpt_replay_validation.lineage_capture) {
+                    RecordDreamsSculptAtlasLineageProducer(
+                        sculpt_replay_validation.image_identity, sculpt_replay_validation.groups,
+                        sculpt_replay_validation.destinations, sculpt_replay_validation.offsets,
+                        sculpt_replay_validation.expected,
+                        std::span<const u8>{download, static_cast<size_t>(download_size)});
                 }
                 if (sculpt_replay_validation.provenance_capture) {
                     auto& capture = g_dreams_7ba_provenance_capture;
@@ -22739,6 +23548,11 @@ void Rasterizer::DispatchDirect(
     if (sculpt_replay_validation.provenance_capture &&
         g_dreams_7ba_provenance_capture.consumer_active) {
         FailDreams7baProvenance("84aa atlas image readback did not complete");
+    }
+    if (sculpt_replay_validation.lineage_capture &&
+        g_dreams_sculpt_atlas_lineage.phase ==
+            DreamsSculptAtlasLineageCapture::Phase::Capturing84aa) {
+        FailDreamsSculptAtlasLineage("84aa atlas image readback did not complete");
     }
     if (capture_dreams_1e7_selector_output) {
         // The D25 binding can later be aliased with an image. Preserve the exact selector words

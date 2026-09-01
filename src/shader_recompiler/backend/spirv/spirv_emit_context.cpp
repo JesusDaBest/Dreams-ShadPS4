@@ -32,7 +32,7 @@ u32 ParamStoreMask(const Info& info) {
 }
 
 bool NeedsImageGather3DCapture(const Info& info, Stage stage, LogicalStage l_stage) {
-    if (!DreamsCompat::CaptureImageGather3D() || stage != Stage::Compute ||
+    if (!DreamsCompat::CaptureImageGather3DForShader(info.pgm_hash) || stage != Stage::Compute ||
         l_stage != LogicalStage::Compute || !info.has_image_gather) {
         return false;
     }

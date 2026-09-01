@@ -266,8 +266,8 @@ void EmitImageGather3DCapture(EmitContext& ctx, u32 site, u32 image_binding, u32
                               const std::array<Id, 4>& source_coords,
                               const std::array<Id, 4>& source_texels,
                               const std::array<Id, 4>& selected_components, Id emitted) {
-    if (!DreamsCompat::CaptureImageGather3D() || ctx.stage != Stage::Compute ||
-        ctx.l_stage != LogicalStage::Compute ||
+    if (!DreamsCompat::CaptureImageGather3DForShader(ctx.info.pgm_hash) ||
+        ctx.stage != Stage::Compute || ctx.l_stage != LogicalStage::Compute ||
         site >= DreamsCompat::ImageGather3DCapture::MaxSites) {
         return;
     }
@@ -282,6 +282,43 @@ void EmitImageGather3DCapture(EmitContext& ctx, u32 site, u32 image_binding, u32
         return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
     };
 
+    namespace Window = DreamsCompat::ImageGather3DSampleWindow;
+    Id in_sample_window = ctx.true_value;
+    if (DreamsCompat::CaptureSculptAtlasLineage()) {
+        const Id window_workgroup = ctx.OpLoad(ctx.U32[3], ctx.workgroup_id);
+        const Id window_local = ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id);
+        for (u32 axis = 0; axis < 3; ++axis) {
+            const Id workgroup_in_range =
+                ctx.OpULessThan(ctx.U1[1],
+                                ctx.OpCompositeExtract(ctx.U32[1], window_workgroup, axis),
+                                ctx.ConstU32(Window::WorkgroupsPerAxis));
+            const Id local_in_range =
+                ctx.OpULessThan(ctx.U1[1],
+                                ctx.OpCompositeExtract(ctx.U32[1], window_local, axis),
+                                ctx.ConstU32(Window::LocalInvocationsPerAxis));
+            in_sample_window =
+                ctx.OpLogicalAnd(ctx.U1[1], in_sample_window,
+                                 ctx.OpLogicalAnd(ctx.U1[1], workgroup_in_range, local_in_range));
+        }
+        if (ctx.info.pgm_hash == DreamsCompat::SculptSurfaceCompactShader) {
+            ASSERT_MSG(Sirit::ValidId(ctx.dreams_ordered_phase),
+                       "f030 gather capture has no ordered-phase specialization");
+            const Id is_replay = ctx.OpIEqual(ctx.U1[1], ctx.dreams_ordered_phase,
+                                              ctx.ConstU32(DreamsCompat::OrderedPhaseReplay));
+            in_sample_window = ctx.OpLogicalAnd(ctx.U1[1], in_sample_window, is_replay);
+        }
+    }
+
+    const Id arm_check_label = ctx.OpLabel();
+    const Id claim_label = ctx.OpLabel();
+    const Id capture_label = ctx.OpLabel();
+    const Id claim_done_label = ctx.OpLabel();
+    const Id arm_done_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(in_sample_window, arm_check_label, merge_label);
+
+    ctx.AddLabel(arm_check_label);
     const Id arm = ctx.OpLoad(
         ctx.U32[1], pointer(ctx.ConstU32(DreamsCompat::ImageGather3DCapture::ArmDword)));
     const Id target_hash_lo = ctx.OpLoad(
@@ -298,12 +335,8 @@ void EmitImageGather3DCapture(EmitContext& ctx, u32 site, u32 image_binding, u32
     const Id should_capture = ctx.OpLogicalAnd(
         ctx.U1[1], is_armed,
         ctx.OpLogicalAnd(ctx.U1[1], hash_lo_matches, hash_hi_matches));
-    const Id claim_label = ctx.OpLabel();
-    const Id capture_label = ctx.OpLabel();
-    const Id claim_done_label = ctx.OpLabel();
-    const Id merge_label = ctx.OpLabel();
-    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-    ctx.OpBranchConditional(should_capture, claim_label, merge_label);
+    ctx.OpSelectionMerge(arm_done_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(should_capture, claim_label, arm_done_label);
 
     const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
     const auto memory_semantics = spv::MemorySemanticsMask::AcquireRelease |
@@ -374,6 +407,8 @@ void EmitImageGather3DCapture(EmitContext& ctx, u32 site, u32 image_binding, u32
         semantics, site_bit);
     ctx.OpBranch(claim_done_label);
     ctx.AddLabel(claim_done_label);
+    ctx.OpBranch(arm_done_label);
+    ctx.AddLabel(arm_done_label);
     ctx.OpBranch(merge_label);
     ctx.AddLabel(merge_label);
 }

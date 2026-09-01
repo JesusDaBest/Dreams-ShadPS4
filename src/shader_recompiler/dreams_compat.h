@@ -84,6 +84,10 @@ constexpr u64 SculptVolumeWriterShader = 0x84aa3dc9;
 // Bump when the Dreams-only 84aa lowering changes incompatibly. Keeping this revision targeted
 // avoids invalidating every unrelated shader in a user's cache.
 constexpr u32 SculptVolumeWriterCacheRevision = 10;
+// Reads the sculpt-density atlas immediately before the surface compaction pass. Both this shader
+// and f030 use the 3D ImageGather fallback whose exact producer/consumer boundary can be captured
+// by the trigger-gated atlas-lineage diagnostic.
+constexpr u64 SculptAtlasPrepareShader = 0x2f555c74;
 // Extracts surface records from the sculpt-density volume. Its terminal workgroup publishes the
 // compact count, so the sole DS_ORDERED_COUNT must return prefixes in guest wave-creation order.
 constexpr u64 SculptSurfaceCompactShader = 0xf030fdc4;
@@ -1149,10 +1153,21 @@ constexpr u32 Ce3ReadConstCaptureTupleDwords = 4;
 constexpr u32 Ce3ReadConstCaptureDynamicReads = 4;
 constexpr u32 Ce3ReadConstCaptureDwordCount =
     2 + Ce3ReadConstCaptureDynamicReads * Ce3ReadConstCaptureTupleDwords;
+// A fixed invocation window bounds diagnostic atomics independently of guest dispatch size while
+// still sampling multiple workgroups and lanes in every axis.
+namespace ImageGather3DSampleWindow {
+constexpr u32 WorkgroupsPerAxis = 4;
+constexpr u32 LocalInvocationsPerAxis = 2;
+constexpr u32 MaxCandidatesPerSite = WorkgroupsPerAxis * WorkgroupsPerAxis * WorkgroupsPerAxis *
+                                     LocalInvocationsPerAxis * LocalInvocationsPerAxis *
+                                     LocalInvocationsPerAxis;
+static_assert(MaxCandidatesPerSite == 512);
+} // namespace ImageGather3DSampleWindow
 // Host-private storage for an opt-in diagnostic of the 3D ImageGather fallback. The first compute
-// invocation that actually reaches each static site atomically claims its record, then stores every
-// source coordinate, complete fetched texel, selected component, and final output component. This
-// sits immediately below the ce3 ReadConst range and does not overlap guest-visible storage.
+// invocation inside the fixed sample window that reaches each static site atomically claims its
+// record, then stores every source coordinate, complete fetched texel, selected component, and
+// final output component. This sits immediately below the ce3 ReadConst range and does not overlap
+// guest-visible storage.
 namespace ImageGather3DCapture {
 constexpr u32 BaseDword = 0x1ff000;
 constexpr u32 ArmDword = BaseDword;
@@ -1186,10 +1201,11 @@ constexpr u32 RecordDword(u32 site, u32 field) {
     return RecordBaseDword + site * RecordDwords + field;
 }
 } // namespace ImageGather3DCapture
-// Exact post-consumer boundary capture for compute shaders that use the 3D-gather fallback. Each
-// static StoreBuffer site keeps the first few complete outgoing records, plus an immediate reload
-// from the destination buffer. This distinguishes malformed shader results from corruption in the
-// buffer write or a later consumer without changing any value used by the guest shader.
+// Sampled post-consumer boundary capture for compute shaders that use the 3D-gather fallback. Each
+// static StoreBuffer site keeps the first few complete outgoing records from the fixed sample
+// window, plus an immediate reload from the destination buffer. The reload is observational only:
+// it can be compiler-forwarded or race with another invocation, so it is not host persistence
+// proof.
 namespace ImageGather3DConsumerCapture {
 constexpr u32 BaseDword = 0x1f6000;
 constexpr u32 SeenDword = BaseDword;
@@ -1222,6 +1238,8 @@ constexpr u32 RecordDword(u32 site, u32 record, u32 field) {
            (site * MaxRecordsPerSite + record) * RecordDwords + field;
 }
 } // namespace ImageGather3DConsumerCapture
+static_assert(ImageGather3DConsumerCapture::MaxRecordsPerSite <=
+              ImageGather3DSampleWindow::MaxCandidatesPerSite);
 static_assert(GatherStageTraceBaseDword >= OrderedScratchBaseDword + OrderedScratchDwords);
 static_assert(GatherStageTraceBaseDword + GatherStageTraceCount <= 0x200000);
 static_assert(GatherStageTraceBaseDword + GatherStageTraceCount <= GatherNumericTraceBaseDword);
@@ -1297,7 +1315,7 @@ inline bool CaptureCe3CoverageTrace() {
     return enabled;
 }
 
-inline bool CaptureImageGather3D() {
+inline bool CaptureAllImageGather3D() {
     static const bool enabled = [] {
         const char* value = std::getenv("SHADPS4_DREAMS_3D_GATHER_CAPTURE");
         const char* cross_check = std::getenv("SHADPS4_DREAMS_84AA_GATHER_CROSSCHECK");
@@ -1305,6 +1323,31 @@ inline bool CaptureImageGather3D() {
                (cross_check != nullptr && cross_check[0] == '1' && cross_check[1] == '\0');
     }();
     return enabled;
+}
+
+inline bool CaptureSculptAtlasLineage() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_SCULPT_ATLAS_LINEAGE_CAPTURE_DIR");
+        return value != nullptr && value[0] != '\0';
+    }();
+    return enabled;
+}
+
+constexpr bool IsSculptAtlasGatherConsumer(u64 hash) {
+    return hash == SculptAtlasPrepareShader || hash == SculptSurfaceCompactShader;
+}
+static_assert(IsSculptAtlasGatherConsumer(SculptAtlasPrepareShader));
+static_assert(IsSculptAtlasGatherConsumer(SculptSurfaceCompactShader));
+static_assert(!IsSculptAtlasGatherConsumer(SculptVolumeWriterShader));
+static_assert(!IsSculptAtlasGatherConsumer(Ce3ReadConstCaptureShader));
+
+inline bool CaptureImageGather3DForShader(u64 hash) {
+    return CaptureAllImageGather3D() ||
+           (CaptureSculptAtlasLineage() && IsSculptAtlasGatherConsumer(hash));
+}
+
+inline bool CaptureImageGather3D() {
+    return CaptureAllImageGather3D() || CaptureSculptAtlasLineage();
 }
 
 inline bool CaptureB535Membership() {
@@ -1390,7 +1433,7 @@ inline bool IsCaptureInstrumentedShader(u64 hash) {
            (CaptureA3LookupProducerTrace() && hash == A3LookupProducerShader) ||
            ((CaptureGatherStageTrace() || CaptureGatherFocusTrace()) &&
             hash == GatherVoxelsShader) ||
-           CaptureImageGather3D();
+           CaptureImageGather3DForShader(hash);
 }
 
 constexpr bool IsSpriteCullShader(u64 hash) {

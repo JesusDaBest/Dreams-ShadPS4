@@ -761,9 +761,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
          Shader::DreamsCompat::CaptureCe3CoverageTrace()) &&
         info.pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader &&
         info.stage == Shader::Stage::Fragment;
-    const bool dreams_image_gather_3d_capture = Shader::DreamsCompat::CaptureImageGather3D() &&
-                                                info.stage == Shader::Stage::Compute &&
-                                                info.has_image_gather;
+    const bool dreams_image_gather_3d_capture =
+        Shader::DreamsCompat::CaptureImageGather3DForShader(info.pgm_hash) &&
+        info.stage == Shader::Stage::Compute && info.has_image_gather;
     const bool dreams_ordered_specialized =
         Shader::DreamsCompat::UsesExactOrderedCountReplay(info.pgm_hash);
     const bool is_patched =

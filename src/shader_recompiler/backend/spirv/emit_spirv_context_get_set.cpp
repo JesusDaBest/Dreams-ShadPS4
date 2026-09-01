@@ -601,11 +601,10 @@ static void EmitImageGather3DConsumerStoreCapture(
     EmitContext& ctx, u32 site, u32 handle, BufferType buffer_type, Id raw_address,
     Id resolved_address, const std::array<Id, 4>& values, const std::array<Id, 4>& pointers) {
     namespace Capture = DreamsCompat::ImageGather3DConsumerCapture;
-    const bool is_target_consumer =
-        ctx.info.pgm_hash == 0x2f555c74 || ctx.info.pgm_hash == 0xf030fdc4;
-    if (!DreamsCompat::CaptureImageGather3D() || ctx.stage != Stage::Compute ||
-        ctx.l_stage != LogicalStage::Compute || !is_target_consumer ||
-        site >= Capture::MaxSites) {
+    const bool is_target_consumer = DreamsCompat::IsSculptAtlasGatherConsumer(ctx.info.pgm_hash);
+    if (!DreamsCompat::CaptureImageGather3DForShader(ctx.info.pgm_hash) ||
+        ctx.stage != Stage::Compute || ctx.l_stage != LogicalStage::Compute ||
+        !is_target_consumer || site >= Capture::MaxSites) {
         return;
     }
 
@@ -619,6 +618,43 @@ static void EmitImageGather3DConsumerStoreCapture(
         return ctx.OpAccessChain(gds_pointer_type, gds_id, ctx.u32_zero_value, index);
     };
 
+    namespace Window = DreamsCompat::ImageGather3DSampleWindow;
+    Id in_sample_window = ctx.true_value;
+    if (DreamsCompat::CaptureSculptAtlasLineage()) {
+        const Id window_workgroup = ctx.OpLoad(ctx.U32[3], ctx.workgroup_id);
+        const Id window_local = ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id);
+        for (u32 axis = 0; axis < 3; ++axis) {
+            const Id workgroup_in_range =
+                ctx.OpULessThan(ctx.U1[1],
+                                ctx.OpCompositeExtract(ctx.U32[1], window_workgroup, axis),
+                                ctx.ConstU32(Window::WorkgroupsPerAxis));
+            const Id local_in_range =
+                ctx.OpULessThan(ctx.U1[1],
+                                ctx.OpCompositeExtract(ctx.U32[1], window_local, axis),
+                                ctx.ConstU32(Window::LocalInvocationsPerAxis));
+            in_sample_window =
+                ctx.OpLogicalAnd(ctx.U1[1], in_sample_window,
+                                 ctx.OpLogicalAnd(ctx.U1[1], workgroup_in_range, local_in_range));
+        }
+        if (ctx.info.pgm_hash == DreamsCompat::SculptSurfaceCompactShader) {
+            ASSERT_MSG(Sirit::ValidId(ctx.dreams_ordered_phase),
+                       "f030 store capture has no ordered-phase specialization");
+            const Id is_replay = ctx.OpIEqual(ctx.U1[1], ctx.dreams_ordered_phase,
+                                              ctx.ConstU32(DreamsCompat::OrderedPhaseReplay));
+            in_sample_window = ctx.OpLogicalAnd(ctx.U1[1], in_sample_window, is_replay);
+        }
+    }
+
+    const Id arm_check_label = ctx.OpLabel();
+    const Id claim_label = ctx.OpLabel();
+    const Id record_label = ctx.OpLabel();
+    const Id claim_done_label = ctx.OpLabel();
+    const Id arm_done_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(in_sample_window, arm_check_label, merge_label);
+
+    ctx.AddLabel(arm_check_label);
     namespace Gather = DreamsCompat::ImageGather3DCapture;
     const Id arm =
         ctx.OpLoad(ctx.U32[1], gds_pointer(ctx.ConstU32(Gather::ArmDword)));
@@ -635,12 +671,8 @@ static void EmitImageGather3DConsumerStoreCapture(
         ctx.U1[1], is_armed,
         ctx.OpLogicalAnd(ctx.U1[1], hash_lo_matches, hash_hi_matches));
 
-    const Id claim_label = ctx.OpLabel();
-    const Id record_label = ctx.OpLabel();
-    const Id claim_done_label = ctx.OpLabel();
-    const Id merge_label = ctx.OpLabel();
-    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-    ctx.OpBranchConditional(should_capture, claim_label, merge_label);
+    ctx.OpSelectionMerge(arm_done_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(should_capture, claim_label, arm_done_label);
 
     const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
     const auto memory_semantics = spv::MemorySemanticsMask::AcquireRelease |
@@ -699,6 +731,8 @@ static void EmitImageGather3DConsumerStoreCapture(
                    semantics, ctx.ConstU32(1U << site));
     ctx.OpBranch(claim_done_label);
     ctx.AddLabel(claim_done_label);
+    ctx.OpBranch(arm_done_label);
+    ctx.AddLabel(arm_done_label);
     ctx.OpBranch(merge_label);
     ctx.AddLabel(merge_label);
 }
