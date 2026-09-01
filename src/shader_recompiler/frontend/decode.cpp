@@ -790,13 +790,11 @@ void GcnDecodeContext::decodeInstructionVOP3(uint64_t hexInstruction) {
         }
     }
 
-    if (op >= static_cast<u32>(OpcodeVOP3::V_ADD_I32) &&
-        op <= static_cast<u32>(OpcodeVOP3::V_DIV_SCALE_F64)) {
-        // VOP3B has a sdst operand.
-        m_instruction.dst_count = 2;
-    } else {
-        m_instruction.dst_count = 1;
-    }
+    // VOP3A and VOP3B opcodes are interleaved in this numeric range.  In particular, the
+    // three-input min/max/median instructions are VOP3A and only write vdst.  Use the same
+    // encoding classification that populated sdst above instead of treating the entire range
+    // from V_ADD_I32 through V_DIV_SCALE_F64 as VOP3B.
+    m_instruction.dst_count = IsVop3BEncoding(m_instruction.opcode) ? 2 : 1;
 
     m_instruction.control.vop3 = *reinterpret_cast<InstControlVOP3*>(&hexInstruction);
 

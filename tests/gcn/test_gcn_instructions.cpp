@@ -9,6 +9,7 @@
 #include "gcn_test_runner.hpp"
 #include "instructions.hpp"
 #include "shader_recompiler/dreams_compat.h"
+#include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/opcodes.h"
 #include "translator.hpp"
@@ -47,6 +48,52 @@ TEST(Ce3CoverageTrace, DiagnosticMicroinstructionsSurviveDeadCodeElimination) {
     EXPECT_TRUE((Inst{Opcode::Ce3CoverageDecision, 0}.MayHaveSideEffects()));
     EXPECT_TRUE((Inst{Opcode::Ce3CoverageLoopExit, 0}.MayHaveSideEffects()));
     EXPECT_TRUE((Inst{Opcode::Ce3CoverageTrinary, 0}.MayHaveSideEffects()));
+}
+
+TEST(Ce3CoverageTrace, AuditedTrinaryInstructionsDecodeWithOneVgprDestination) {
+    using namespace Shader::Gcn;
+    struct TrinaryInstruction {
+        std::array<u32, 2> words;
+        Opcode opcode;
+        u32 destination;
+    };
+    // Exact instruction words from Dreams fragment shader 0xce3b8413.
+    constexpr std::array instructions{
+        TrinaryInstruction{{0xd2ae0003, 0x044a2711}, Opcode::V_MED3_F32, 3},
+        TrinaryInstruction{{0xd2a80716, 0x041e0b0e}, Opcode::V_MAX3_F32, 22},
+        TrinaryInstruction{{0xd2a20005, 0x04161b06}, Opcode::V_MIN3_F32, 5},
+        TrinaryInstruction{{0xd2ae0007, 0x044a2706}, Opcode::V_MED3_F32, 7},
+    };
+
+    GcnDecodeContext decoder;
+    for (const auto& expected : instructions) {
+        GcnCodeSlice code{expected.words.data(), expected.words.data() + expected.words.size()};
+        const GcnInst inst = decoder.decodeInstruction(code);
+        EXPECT_EQ(inst.opcode, expected.opcode);
+        EXPECT_EQ(inst.src_count, 3);
+        EXPECT_EQ(inst.dst_count, 1);
+        EXPECT_EQ(inst.dst[0].field, OperandField::VectorGPR);
+        EXPECT_EQ(inst.dst[0].code, expected.destination);
+    }
+}
+
+TEST(GcnDecode, Vop3DestinationCountDistinguishesAFromB) {
+    using namespace Shader::Gcn;
+    const u64 encoded =
+        VOP3A(OpcodeVOP3::V_ADD_I32, VOperand8::V4, SOperand9::V1, SOperand9::V2,
+              SOperand9::V3)
+            .Get();
+    const std::array<u32, 2> words{static_cast<u32>(encoded), static_cast<u32>(encoded >> 32)};
+    GcnCodeSlice code{words.data(), words.data() + words.size()};
+    GcnDecodeContext decoder;
+    const GcnInst inst = decoder.decodeInstruction(code);
+
+    EXPECT_EQ(inst.opcode, Opcode::V_ADD_I32);
+    EXPECT_EQ(inst.dst_count, 2);
+    EXPECT_EQ(inst.dst[0].field, OperandField::VectorGPR);
+    EXPECT_EQ(inst.dst[0].code, 4);
+    EXPECT_EQ(inst.dst[1].field, OperandField::ScalarGPR);
+    EXPECT_EQ(inst.dst[1].code, 0);
 }
 
 struct F32x2 {

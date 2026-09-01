@@ -2443,6 +2443,7 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
         // The values remain SSA references and are consumed only by the opt-in diagnostic after
         // the guest instruction has produced its output.
         u32 ce3_trinary_site = DreamsCompat::Ce3CoverageTrace::TrinarySites;
+        u32 ce3_trinary_output_vgpr{};
         std::array<IR::F32, 3> ce3_trinary_inputs{};
         if (ce3_coverage_trace) {
             Opcode expected_opcode{};
@@ -2470,6 +2471,9 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
                 ASSERT_MSG(inst.opcode == expected_opcode,
                            "ce3 trinary PC {:#x} changed opcode from {} to {}", inst_pc,
                            static_cast<u32>(expected_opcode), static_cast<u32>(inst.opcode));
+                ASSERT_MSG(inst.dst_count >= 1 && inst.dst[0].field == OperandField::VectorGPR,
+                           "ce3 trinary PC {:#x} no longer writes a VGPR destination", inst_pc);
+                ce3_trinary_output_vgpr = inst.dst[0].code;
                 ce3_trinary_inputs = {
                     GetSrc<IR::F32>(inst.src[0]), GetSrc<IR::F32>(inst.src[1]),
                     GetSrc<IR::F32>(inst.src[2])};
@@ -2481,10 +2485,8 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
         if (ce3_coverage_trace) {
             namespace Capture = DreamsCompat::Ce3CoverageTrace;
             if (ce3_trinary_site < Capture::TrinarySites) {
-                ASSERT_MSG(inst.dst_count == 1 && inst.dst[0].field == OperandField::VectorGPR,
-                           "ce3 trinary PC {:#x} no longer has one VGPR destination", inst_pc);
                 const IR::F32 output =
-                    ir.GetVectorReg<IR::F32>(IR::VectorReg(inst.dst[0].code));
+                    ir.GetVectorReg<IR::F32>(IR::VectorReg(ce3_trinary_output_vgpr));
                 ir.Ce3CoverageTrinary(ce3_trinary_site, ce3_trinary_inputs[0],
                                       ce3_trinary_inputs[1], ce3_trinary_inputs[2], output);
             }
