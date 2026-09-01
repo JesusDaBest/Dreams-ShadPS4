@@ -2438,6 +2438,48 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
             continue;
         }
 
+        // Preserve the exact post-modifier inputs to each comparison in B535's initial
+        // OBB/frustum conjunction. Translation writes the predicate mask destination, so retain
+        // the SSA inputs here and publish the resulting mask immediately afterward. The existing
+        // fixed membership row and trigger gate keep this bounded to the one requested chain.
+        u32 b535_initial_gate_site = DreamsCompat::B535MembershipCapture::InitialGateSites;
+        std::array<IR::F32, 2> b535_initial_gate_inputs{};
+        if (b535_membership_capture) {
+            switch (inst_pc) {
+            case 0x190:
+                b535_initial_gate_site = 0;
+                break;
+            case 0x218:
+                b535_initial_gate_site = 1;
+                break;
+            case 0x258:
+                b535_initial_gate_site = 2;
+                break;
+            case 0x260:
+                b535_initial_gate_site = 3;
+                break;
+            case 0x28c:
+                b535_initial_gate_site = 4;
+                break;
+            default:
+                break;
+            }
+            if (b535_initial_gate_site <
+                DreamsCompat::B535MembershipCapture::InitialGateSites) {
+                const Opcode expected_opcode = b535_initial_gate_site == 3
+                                                   ? Opcode::V_CMP_LT_F32
+                                                   : Opcode::V_CMP_GT_F32;
+                ASSERT_MSG(inst.opcode == expected_opcode,
+                           "B535 initial gate PC {:#x} changed opcode from {} to {}", inst_pc,
+                           static_cast<u32>(expected_opcode), static_cast<u32>(inst.opcode));
+                ASSERT_MSG(inst.src_count >= 2 && inst.dst_count >= 2,
+                           "B535 initial gate PC {:#x} no longer has two inputs and a mask output",
+                           inst_pc);
+                b535_initial_gate_inputs = {GetSrc<IR::F32>(inst.src[0]),
+                                            GetSrc<IR::F32>(inst.src[1])};
+            }
+        }
+
         // Preserve the exact post-modifier trinary inputs before translation overwrites a
         // destination which can also be one of the sources (PC 0x374 uses V5 as src2 and dst).
         // The values remain SSA references and are consumed only by the opt-in diagnostic after
@@ -2481,6 +2523,22 @@ void Translator::Translate(IR::Block* block, u32 start_pc, std::span<const GcnIn
         }
 
         TranslateInstruction(inst);
+
+        if (b535_initial_gate_site <
+            DreamsCompat::B535MembershipCapture::InitialGateSites) {
+            namespace Capture = DreamsCompat::B535MembershipCapture;
+            const u32 field = Capture::InitialGateCmp0Src0 + b535_initial_gate_site * 3;
+            emit_b535_membership_field(
+                field, ir.BitCast<IR::U32>(b535_initial_gate_inputs[0]), ir.Imm1(true));
+            emit_b535_membership_field(
+                field + 1, ir.BitCast<IR::U32>(b535_initial_gate_inputs[1]), ir.Imm1(true));
+            emit_b535_membership_field(
+                field + 2,
+                IR::U32{ir.Select(GetSrc1(inst.dst[1]), ir.Imm32(1), ir.Imm32(0))},
+                ir.Imm1(true));
+            emit_b535_membership_field(Capture::InitialGateTraceMask,
+                                       ir.Imm32(1u << b535_initial_gate_site), ir.Imm1(true));
+        }
 
         if (ce3_coverage_trace) {
             namespace Capture = DreamsCompat::Ce3CoverageTrace;

@@ -5273,6 +5273,22 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
         "gate1_original_vcc",
         "gate1_force_applied",
         "input_b1",
+        "initial_gate_cmp0_src0",
+        "initial_gate_cmp0_src1",
+        "initial_gate_cmp0_result",
+        "initial_gate_cmp1_src0",
+        "initial_gate_cmp1_src1",
+        "initial_gate_cmp1_result",
+        "initial_gate_cmp2_src0",
+        "initial_gate_cmp2_src1",
+        "initial_gate_cmp2_result",
+        "initial_gate_cmp3_src0",
+        "initial_gate_cmp3_src1",
+        "initial_gate_cmp3_result",
+        "initial_gate_cmp4_src0",
+        "initial_gate_cmp4_src1",
+        "initial_gate_cmp4_result",
+        "initial_gate_trace_mask",
     };
     static_assert(FieldNames.size() == B535Capture::RecordDwords);
 
@@ -5288,6 +5304,8 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
              "\tscore_scale_f32\tscore_slope_f32\tscore_product_f32\trole_name\n";
 
     std::array<u32, B535Capture::MaxPasses> valid_rows{};
+    u32 initial_gate_input_rows{};
+    u32 initial_gate_incomplete_rows{};
     std::string provenance_table =
         "pass\tworkgroup\tlane\tidentity\trow\tconsumer_b1\twriter_mask\ta3_flags\t"
         "a3_lookup_probe_mask\ta3_lookup_hit_mask\ta3_focus_invocations\t"
@@ -5333,6 +5351,11 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
                     });
                 }
                 if ((record[B535Capture::Flags] & B535Capture::InputValid) != 0) {
+                    ++initial_gate_input_rows;
+                    if (record[B535Capture::InitialGateTraceMask] !=
+                        B535Capture::InitialGateCompleteMask) {
+                        ++initial_gate_incomplete_rows;
+                    }
                     const std::array<u32, 2> input{record[B535Capture::Identity],
                                                    record[B535Capture::Record]};
                     if (std::ranges::find(capture.input_records, input) ==
@@ -5504,16 +5527,20 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
 
     const u32 overflow = words[B535Capture::OverflowDword - B535Capture::BaseDword];
     std::string manifest =
-        fmt::format("shader=0x{:08x}\nraw_hash=0x{:016x}\nbase_dword=0x{:x}\ndword_count=0x{:x}\n"
+        fmt::format("shader=0x{:08x}\nschema={}\nraw_hash=0x{:016x}\nbase_dword=0x{:x}\ndword_count=0x{:x}\n"
                     "record_dwords={}\nmax_passes={}\nmax_workgroups_per_pass={}\npass_count={}\n"
                     "overflow={}\ndropped_records={}\ndropped_records_hash=0x{:016x}\n"
+                    "initial_gate_sites={}\ninitial_gate_complete_mask=0x{:08x}\n"
+                    "initial_gate_input_rows={}\ninitial_gate_incomplete_rows={}\n"
                     "gate1_force_first_failure={}\n"
                     "b1_provenance_schema={}\nb1_provenance_rows={}\n"
                     "b1_provenance_hash=0x{:016x}\n",
-                    Shader::DreamsCompat::TraversalShader, raw_hash, B535Capture::BaseDword,
-                    B535Capture::DwordCount, B535Capture::RecordDwords, B535Capture::MaxPasses,
-                    B535Capture::MaxWorkgroupsPerPass, capture.pass_count, overflow,
-                    capture.dropped_records.size(), dropped_hash,
+                    Shader::DreamsCompat::TraversalShader, B535Capture::Schema, raw_hash,
+                    B535Capture::BaseDword, B535Capture::DwordCount, B535Capture::RecordDwords,
+                    B535Capture::MaxPasses, B535Capture::MaxWorkgroupsPerPass,
+                    capture.pass_count, overflow, capture.dropped_records.size(), dropped_hash,
+                    B535Capture::InitialGateSites, B535Capture::InitialGateCompleteMask,
+                    initial_gate_input_rows, initial_gate_incomplete_rows,
                     Shader::DreamsCompat::ForceB535FirstGateFailure(), B1Provenance::Schema,
                     provenance_identities.size(), provenance_hash);
     for (u32 pass = 0; pass < capture.pass_count; ++pass) {
@@ -5527,10 +5554,19 @@ static bool FinalizeDreamsB535MembershipCapture(VideoCore::Buffer* gds) {
                 "flags=raw bitfield from dreams_compat.h B535MembershipCapture\n";
     success &= WriteDreamsCaptureText(*directory / "manifest.txt", manifest);
 
-    if (!success || overflow != 0) {
+    const bool initial_gate_complete =
+        initial_gate_input_rows != 0 && initial_gate_incomplete_rows == 0;
+    if (!success || overflow != 0 || !initial_gate_complete) {
         FailDreamsB535MembershipCapture(
-            !success ? "one or more capture files could not be written"
-                     : "capture workgroup envelope overflowed; no lanes were silently omitted");
+            !success
+                ? "one or more capture files could not be written"
+                : overflow != 0
+                      ? "capture workgroup envelope overflowed; no lanes were silently omitted"
+                      : initial_gate_input_rows == 0
+                            ? "initial-gate trace contained no active input rows"
+                            : fmt::format("initial-gate trace is incomplete for {} of {} input rows",
+                                          initial_gate_incomplete_rows,
+                                          initial_gate_input_rows));
         return false;
     }
     success &= WriteDreamsCaptureText(*directory / "complete.txt", "complete\n");

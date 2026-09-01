@@ -454,6 +454,9 @@ static_assert(SceneCompactOrderedScratchBaseDword + SceneCompactOrderedScratchDw
 // with a trigger file. Fixed pass/workgroup/lane slots avoid an instrumentation-side allocator or
 // any new ordering dependency in the guest shader.
 namespace B535MembershipCapture {
+// Increment whenever the fixed per-lane record layout changes. This participates in the
+// diagnostic shader cache key, independently of the guest-visible traversal lowering revision.
+constexpr u32 Schema = 2;
 constexpr u32 BaseDword = SculptOrderedStateBaseDword + SculptOrderedStateDwords;
 constexpr u32 HeaderDwords = 0x40;
 constexpr u32 ArmDword = BaseDword;
@@ -466,7 +469,9 @@ constexpr u32 MaxPasses = 10;
 // existing 32 MiB private-GDS allocation. Overflow is explicit; it never silently truncates.
 constexpr u32 MaxWorkgroupsPerPass = 64;
 constexpr u32 LanesPerWorkgroup = 64;
-constexpr u32 RecordDwords = 52;
+constexpr u32 InitialGateSites = 5;
+constexpr u32 InitialGateCompleteMask = (1u << InitialGateSites) - 1;
+constexpr u32 RecordDwords = 68;
 
 enum Field : u32 {
     Valid = 0,
@@ -521,6 +526,22 @@ enum Field : u32 {
     Gate1OriginalVcc = 49,
     Gate1ForceApplied = 50,
     InputB1 = 51,
+    InitialGateCmp0Src0 = 52,
+    InitialGateCmp0Src1 = 53,
+    InitialGateCmp0Result = 54,
+    InitialGateCmp1Src0 = 55,
+    InitialGateCmp1Src1 = 56,
+    InitialGateCmp1Result = 57,
+    InitialGateCmp2Src0 = 58,
+    InitialGateCmp2Src1 = 59,
+    InitialGateCmp2Result = 60,
+    InitialGateCmp3Src0 = 61,
+    InitialGateCmp3Src1 = 62,
+    InitialGateCmp3Result = 63,
+    InitialGateCmp4Src0 = 64,
+    InitialGateCmp4Src1 = 65,
+    InitialGateCmp4Result = 66,
+    InitialGateTraceMask = 67,
 };
 
 constexpr u32 InputValid = 1u << 0;
@@ -566,7 +587,8 @@ constexpr u32 RecordDword(u32 pass, u32 workgroup, u32 lane, u32 field) {
 constexpr u32 RecordCapacity = MaxPasses * MaxWorkgroupsPerPass * LanesPerWorkgroup;
 constexpr u32 DwordCount = HeaderDwords + RecordCapacity * RecordDwords;
 } // namespace B535MembershipCapture
-static_assert(B535MembershipCapture::RecordDwords == B535MembershipCapture::InputB1 + 1);
+static_assert(B535MembershipCapture::RecordDwords ==
+              B535MembershipCapture::InitialGateTraceMask + 1);
 static_assert(B535MembershipCapture::BaseDword >=
               SculptOrderedStateBaseDword + SculptOrderedStateDwords);
 static_assert(B535MembershipCapture::BaseDword + B535MembershipCapture::DwordCount <= 0x800000);

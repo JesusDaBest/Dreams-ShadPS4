@@ -45,11 +45,12 @@ std::string ShaderBinaryCacheKey(const Shader::Info& info,
     if (pgm_hash == Shader::DreamsCompat::TraversalShader) {
         if (Shader::DreamsCompat::CaptureB535Membership()) {
             return fmt::format(
-                "{:#018x}_{}_doc{}_membership_capture{}{}", pgm_hash, perm_idx,
+                "{:#018x}_{}_doc{}_membership_capture{}_schema{}{}", pgm_hash, perm_idx,
                 Shader::DreamsCompat::TraversalCacheRevision,
                 Shader::DreamsCompat::ForceB535FirstGateFailure()
                     ? "_force_first_gate_failure"
                     : "",
+                Shader::DreamsCompat::B535MembershipCapture::Schema,
                 Shader::DreamsCompat::CaptureB535InstructionTrace()
                     ? fmt::format("_microtrace{}",
                                   Shader::DreamsCompat::B535InstructionTraceCacheRevision)
