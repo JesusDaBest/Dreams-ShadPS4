@@ -1016,8 +1016,9 @@ namespace Ce3CoverageTrace {
 constexpr u32 BaseDword =
     (A3LookupProducerTrace::BaseDword + A3LookupProducerTrace::DwordCount + 0xffU) & ~0xffU;
 constexpr u32 ArmDword = BaseDword;
-// The captured fixture has eleven observed Param1.y object labels. Leave ample headroom for other
-// draws; runtime miss counters remain authoritative and make every unresolved collision explicit.
+// The proof-grade edit-mode draw observed eight Param1.y labels; the scene is independently known
+// to contain eleven stamped slots. Leave ample headroom for other draws; runtime miss counters
+// remain authoritative and make every unresolved collision explicit.
 constexpr u32 Slots = 256;
 constexpr u32 SlotBits = 8;
 constexpr u32 Probes = 8;

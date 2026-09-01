@@ -2636,6 +2636,83 @@ static u64 HashDreamsTraceBytes(std::span<const u8> bytes) {
     return hash;
 }
 
+// Host-only inventory of the exact visibility-list slice consumed by VS 0x3706083c. This is
+// deliberately independent of CaptureVs370Interface(): setting this directory must not change
+// shader translation, allocate private GDS, build a diagnostic pipeline, or replay a framebuffer.
+struct DreamsVs370ListSliceProducerSnapshot {
+    bool descriptor_valid{};
+    u64 dispatch_sequence{};
+    u64 shader_hash{};
+    VAddr args_address{};
+    VAddr output_base{};
+    u64 output_size{};
+    u32 output_stride{};
+    u32 output_capacity_records{};
+    u32 dispatch_initiator{};
+    std::array<u32, 3> start{};
+    std::array<u32, 3> threads{};
+    std::array<u32, 4> raw_output_descriptor{};
+};
+
+struct DreamsVs370ListSliceCaptureState {
+    bool armed{};
+    bool complete{};
+    bool failed{};
+    std::filesystem::path directory;
+    std::vector<DreamsVs370ListSliceProducerSnapshot> producers;
+};
+
+static DreamsVs370ListSliceCaptureState g_dreams_vs370_list_slice_capture{};
+
+static std::optional<std::filesystem::path> DreamsVs370ListSliceCaptureDirectory() {
+    const char* value = std::getenv("SHADPS4_DREAMS_VS370_LIST_SLICE_CAPTURE_DIR");
+    if (value == nullptr || value[0] == '\0') {
+        return std::nullopt;
+    }
+    return std::filesystem::path{value};
+}
+
+static bool PollDreamsVs370ListSliceCaptureRequest() {
+    auto& capture = g_dreams_vs370_list_slice_capture;
+    if (Common::ElfInfo::Instance().GameSerial() != "CUSA04301") {
+        return false;
+    }
+    if (capture.armed) {
+        return true;
+    }
+    const auto directory = DreamsVs370ListSliceCaptureDirectory();
+    if (!directory) {
+        return false;
+    }
+    std::error_code error;
+    const auto request = *directory / "capture.request";
+    if (!std::filesystem::is_regular_file(request, error) || error) {
+        return false;
+    }
+    error.clear();
+    std::filesystem::create_directories(*directory, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Dreams VS370 list-slice capture cannot create {}: {}",
+                  directory->string(), error.message());
+        return false;
+    }
+    if (!std::filesystem::remove(request, error) || error) {
+        LOG_ERROR(Render_Vulkan, "Dreams VS370 list-slice request cannot be consumed: {}",
+                  error.message());
+        return false;
+    }
+    error.clear();
+    std::filesystem::remove(*directory / "complete.txt", error);
+    error.clear();
+    std::filesystem::remove(*directory / "failed.txt", error);
+    capture = {};
+    capture.armed = true;
+    capture.directory = *directory;
+    LOG_WARNING(Render_Vulkan,
+                "Dreams VS370 list-slice capture armed for the first matching indexed draw");
+    return true;
+}
+
 // One exact producer/draw pair is sufficient for the isolated one-cube discriminator. Keeping
 // this capture single-shot avoids seven additional GPU fences and duplicate fixture replays.
 constexpr u32 DreamsVs370InterfaceCaptureOccurrences = 1;
@@ -2897,6 +2974,17 @@ static bool WriteDreamsCaptureText(const std::filesystem::path& file, std::strin
         return false;
     }
     return true;
+}
+
+static void FailDreamsVs370ListSliceCapture(std::string_view reason) {
+    auto& capture = g_dreams_vs370_list_slice_capture;
+    capture.armed = false;
+    capture.complete = false;
+    capture.failed = true;
+    LOG_ERROR(Render_Vulkan, "Dreams VS370 list-slice capture failed: {}", reason);
+    if (!capture.directory.empty()) {
+        WriteDreamsCaptureText(capture.directory / "failed.txt", fmt::format("{}\n", reason));
+    }
 }
 
 static std::optional<std::filesystem::path> ConsumeDreams7baProvenanceRequest() {
@@ -7885,6 +7973,265 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const auto& sculpt_count_vertex = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& sculpt_count_fragment = pipeline->GetStage(Shader::LogicalStage::Fragment);
+    const bool dreams_vs370_list_slice_target =
+        g_dreams_vs370_list_slice_capture.armed && is_indexed && max_count == 1 &&
+        stride == sizeof(VkDrawIndexedIndirectCommand) &&
+        sculpt_count_vertex.pgm_hash == Shader::DreamsCompat::Vs370InterfaceCaptureShader &&
+        sculpt_count_fragment.pgm_hash == DreamsSculptFragmentShader;
+    if (dreams_vs370_list_slice_target) {
+        auto& capture = g_dreams_vs370_list_slice_capture;
+        const auto fail = [&](std::string_view reason) {
+            FailDreamsVs370ListSliceCapture(reason);
+        };
+
+        if (sculpt_count_vertex.buffers.size() <= 3 ||
+            sculpt_count_vertex.buffers[3].IsSpecial()) {
+            fail("target VS binding 3 is absent or special");
+        } else {
+            const auto b3 = sculpt_count_vertex.buffers[3].GetSharp(sculpt_count_vertex);
+            if (b3.base_address == 0 || b3.stride != 2 * sizeof(u32)) {
+                fail(fmt::format("target VS binding 3 is not an 8-byte visibility list "
+                                 "(base={:#x}, stride={})",
+                                 b3.base_address, b3.stride));
+            } else {
+                // This is the diagnostic's only GPU fence. It settles the indirect command and
+                // b3 producer writes together; no per-record synchronization is performed.
+                scheduler.Finish();
+
+                VkDrawIndexedIndirectCommand command{};
+                u32 indirect_count = count_address == 0 ? 1 : 0;
+                const VAddr command_address = arg_address + offset;
+                const bool command_mapped =
+                    memory->IsValidMapping(command_address, sizeof(command));
+                const bool count_mapped = count_address == 0 ||
+                                          memory->IsValidMapping(count_address, sizeof(u32));
+                if (command_mapped) {
+                    buffer_cache.ReadMemory(command_address, sizeof(command));
+                    std::memcpy(&command, std::bit_cast<const void*>(command_address),
+                                sizeof(command));
+                }
+                if (count_address != 0 && count_mapped) {
+                    buffer_cache.ReadMemory(count_address, sizeof(indirect_count));
+                    std::memcpy(&indirect_count, std::bit_cast<const void*>(count_address),
+                                sizeof(indirect_count));
+                }
+
+                if (!command_mapped) {
+                    fail("target indexed indirect command is not mapped");
+                } else if (!count_mapped) {
+                    fail("target indexed indirect count is not mapped");
+                } else if (indirect_count == 0 || command.indexCount == 0 ||
+                           command.instanceCount == 0) {
+                    fail("first matching indexed indirect packet is disabled or empty");
+                } else {
+                    const auto decoded_list_start_instance =
+                        DecodeIndirectUserDataLocation(start_instance_location);
+                    const bool start_instance_aliases_list_sgpr3 =
+                        decoded_list_start_instance.has_value() &&
+                        decoded_list_start_instance->stage == sculpt_count_vertex.stage &&
+                        decoded_list_start_instance->register_index == 3;
+                    const bool instance_base_available =
+                        start_instance_aliases_list_sgpr3 || sculpt_count_vertex.user_data.size() > 3;
+                    const u32 raw_instance_base = instance_base_available &&
+                                                          !start_instance_aliases_list_sgpr3
+                                                      ? sculpt_count_vertex.user_data[3]
+                                                      : 0;
+                    const u64 first_record =
+                        u64{command.firstInstance} + static_cast<u64>(raw_instance_base);
+                    const u64 end_record = first_record + command.instanceCount;
+                    const u64 b3_capacity = b3.GetSize() / b3.stride;
+
+                    const DreamsVs370ListSliceProducerSnapshot* producer{};
+                    for (auto candidate = capture.producers.rbegin();
+                         candidate != capture.producers.rend(); ++candidate) {
+                        if (candidate->descriptor_valid &&
+                            candidate->output_base == b3.base_address) {
+                            producer = &*candidate;
+                            break;
+                        }
+                    }
+
+                    if (!instance_base_available) {
+                        fail("VS user SGPR3 is unavailable for the draw's first record");
+                    } else if (end_record < first_record) {
+                        fail("visibility-list draw range overflows");
+                    } else if (producer == nullptr) {
+                        fail(fmt::format("no post-request 7aa925e9 producer snapshot matches b3 "
+                                         "base {:#x}",
+                                         b3.base_address));
+                    } else if (producer->shader_hash !=
+                                   Shader::DreamsCompat::VisibilityListCompactShader &&
+                               producer->shader_hash !=
+                                   Shader::DreamsCompat::VisibilityListCompactShaderAlt) {
+                        fail("matching producer snapshot has the wrong shader hash");
+                    } else if (producer->output_stride != b3.stride) {
+                        fail(fmt::format("producer/b3 stride mismatch ({}/{})",
+                                         producer->output_stride, b3.stride));
+                    } else if (end_record > producer->output_capacity_records) {
+                        fail(fmt::format("producer snapshot does not cover records {}..{} "
+                                         "(capacity={})",
+                                         first_record, end_record,
+                                         producer->output_capacity_records));
+                    } else if (end_record > b3_capacity) {
+                        fail(fmt::format("binding 3 does not cover records {}..{} (capacity={})",
+                                         first_record, end_record, b3_capacity));
+                    } else {
+                        constexpr u64 MaxCaptureBytes = 64_MB;
+                        const u64 slice_bytes = u64{command.instanceCount} * 2 * sizeof(u32);
+                        const u64 slice_offset = first_record * b3.stride;
+                        const VAddr slice_address = b3.base_address + slice_offset;
+                        if (slice_bytes > MaxCaptureBytes) {
+                            fail(fmt::format("visibility-list slice is too large ({:#x} bytes, "
+                                             "limit={:#x})",
+                                             slice_bytes, MaxCaptureBytes));
+                        } else if (slice_address < b3.base_address ||
+                                   !memory->IsValidMapping(slice_address, slice_bytes)) {
+                            fail("settled visibility-list slice is not mapped");
+                        } else {
+                            std::vector<u32> guest_words_before(command.instanceCount * 2ULL);
+                            std::memcpy(guest_words_before.data(),
+                                        std::bit_cast<const void*>(slice_address), slice_bytes);
+                            const u64 guest_hash_before =
+                                HashDreamsTraceWords(guest_words_before);
+                            const bool gpu_modified_before_read =
+                                buffer_cache.IsRegionGpuModified(slice_address, slice_bytes);
+
+                            buffer_cache.ReadMemory(slice_address, slice_bytes);
+                            std::vector<u32> settled_words(command.instanceCount * 2ULL);
+                            std::memcpy(settled_words.data(),
+                                        std::bit_cast<const void*>(slice_address), slice_bytes);
+                            u32 changed_by_readback{};
+                            for (u32 word = 0; word < settled_words.size(); ++word) {
+                                changed_by_readback +=
+                                    settled_words[word] != guest_words_before[word];
+                            }
+
+                            struct Word1Group {
+                                std::vector<u32> word0_draw_order;
+                                std::map<u32, u32> word0_multiplicities;
+                            };
+                            std::map<u32, Word1Group> groups;
+                            std::string records = "draw_index\tproducer_record\tword0\tword1\n";
+                            for (u32 record = 0; record < command.instanceCount; ++record) {
+                                const u32 word0 = settled_words[record * 2];
+                                const u32 word1 = settled_words[record * 2 + 1];
+                                records += fmt::format("{}\t{}\t{:#010x}\t{:#010x}\n", record,
+                                                       first_record + record, word0, word1);
+                                auto& group = groups[word1];
+                                group.word0_draw_order.push_back(word0);
+                                ++group.word0_multiplicities[word0];
+                            }
+
+                            std::string inventory =
+                                "word1\trecords\tunique_word0\tdraw_order_word0_hash\t"
+                                "word0_multiplicity_hash\tword0_multiplicities\n";
+                            for (const auto& [word1, group] : groups) {
+                                std::vector<u32> multiplicity_words;
+                                std::string multiplicities;
+                                for (const auto& [word0, count] : group.word0_multiplicities) {
+                                    multiplicity_words.push_back(word0);
+                                    multiplicity_words.push_back(count);
+                                    if (!multiplicities.empty()) {
+                                        multiplicities += ';';
+                                    }
+                                    multiplicities += fmt::format("{:#010x}:{}", word0, count);
+                                }
+                                inventory += fmt::format(
+                                    "{:#010x}\t{}\t{}\t{:#018x}\t{:#018x}\t{}\n", word1,
+                                    group.word0_draw_order.size(),
+                                    group.word0_multiplicities.size(),
+                                    HashDreamsTraceWords(group.word0_draw_order),
+                                    HashDreamsTraceWords(multiplicity_words), multiplicities);
+                            }
+
+                            u64 slice_hash{};
+                            const u64 settled_hash = HashDreamsTraceWords(settled_words);
+                            std::array<u32, sizeof(command) / sizeof(u32)> command_words{};
+                            static_assert(sizeof(command) == sizeof(command_words));
+                            std::memcpy(command_words.data(), &command, sizeof(command));
+                            const std::string manifest = fmt::format(
+                                "key\tvalue\n"
+                                "capture\tvs370-list-slice-host-only\n"
+                                "vertex_shader\t{:#x}\nfragment_shader\t{:#x}\n"
+                                "command_address\t{:#x}\ncount_address\t{:#x}\n"
+                                "indirect_count\t{}\nindex_count\t{}\ninstance_count\t{}\n"
+                                "first_index\t{}\nvertex_offset\t{}\nfirst_instance\t{}\n"
+                                "shader_instance_base\t{}\nfirst_record\t{}\nend_record\t{}\n"
+                                "producer_sequence\t{}\nproducer_shader\t{:#x}\n"
+                                "producer_args_address\t{:#x}\nproducer_output_base\t{:#x}\n"
+                                "producer_output_size\t{:#x}\nproducer_output_stride\t{}\n"
+                                "producer_output_capacity_records\t{}\n"
+                                "producer_dispatch_initiator\t{:#x}\n"
+                                "producer_start\t{},{},{}\nproducer_threads\t{},{},{}\n"
+                                "producer_raw_descriptor\t{:#010x},{:#010x},{:#010x},{:#010x}\n"
+                                "b3_base\t{:#x}\nb3_size\t{:#x}\nb3_stride\t{}\n"
+                                "b3_capacity_records\t{}\nproducer_snapshot_matches_b3\t1\n"
+                                "producer_snapshot_covers_draw\t1\n"
+                                "compute_sequence_at_draw\t{}\nproducer_to_draw_dispatch_delta\t{}\n"
+                                "gpu_modified_before_read\t{}\nchanged_by_settled_readback_words\t{}\n"
+                                "guest_words_before_hash\t{:#018x}\nsettled_slice_hash\t{:#018x}\n"
+                                "word1_groups\t{}\nreadback\tone draw-side scheduler.Finish followed by "
+                                "BufferCache::ReadMemory\n"
+                                "remaining_caveat\tproducer identity is a descriptor/sequence "
+                                "handoff; reuse of the same base has no immutable guest generation ID\n",
+                                sculpt_count_vertex.pgm_hash, sculpt_count_fragment.pgm_hash,
+                                command_address, count_address, indirect_count, command.indexCount,
+                                command.instanceCount, command.firstIndex, command.vertexOffset,
+                                command.firstInstance, raw_instance_base, first_record, end_record,
+                                producer->dispatch_sequence, producer->shader_hash,
+                                producer->args_address, producer->output_base,
+                                producer->output_size, producer->output_stride,
+                                producer->output_capacity_records, producer->dispatch_initiator,
+                                producer->start[0], producer->start[1], producer->start[2],
+                                producer->threads[0], producer->threads[1], producer->threads[2],
+                                producer->raw_output_descriptor[0],
+                                producer->raw_output_descriptor[1],
+                                producer->raw_output_descriptor[2],
+                                producer->raw_output_descriptor[3], b3.base_address, b3.GetSize(),
+                                b3.stride, b3_capacity, g_compute_dispatch_sequence,
+                                g_compute_dispatch_sequence >= producer->dispatch_sequence
+                                    ? g_compute_dispatch_sequence - producer->dispatch_sequence
+                                    : 0,
+                                gpu_modified_before_read, changed_by_readback, guest_hash_before,
+                                settled_hash, groups.size());
+
+                            bool files_ok = WriteDreamsCaptureWords(
+                                capture.directory / "b3-list-slice.bin", settled_words, slice_hash);
+                            files_ok &= slice_hash == settled_hash;
+                            u64 command_hash{};
+                            files_ok &= WriteDreamsCaptureWords(
+                                capture.directory / "draw-command.bin", command_words,
+                                command_hash);
+                            files_ok &= WriteDreamsCaptureText(capture.directory / "records.tsv",
+                                                               records);
+                            files_ok &= WriteDreamsCaptureText(
+                                capture.directory / "word1-groups.tsv", inventory);
+                            files_ok &= WriteDreamsCaptureText(capture.directory / "manifest.tsv",
+                                                               manifest);
+                            if (files_ok) {
+                                files_ok &= WriteDreamsCaptureText(capture.directory / "complete.txt",
+                                                                   "complete\n");
+                            }
+                            if (!files_ok) {
+                                fail("one or more list-slice output files could not be written");
+                            } else {
+                                capture.armed = false;
+                                capture.complete = true;
+                                capture.failed = false;
+                                LOG_WARNING(
+                                    Render_Vulkan,
+                                    "Dreams VS370 list-slice capture complete instances={} "
+                                    "first_record={} groups={} hash={:#x} changed_by_readback={} "
+                                    "directory={}",
+                                    command.instanceCount, first_record, groups.size(), settled_hash,
+                                    changed_by_readback, capture.directory.string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     constexpr u64 Ce3ReadConstCaptureOffset =
         static_cast<u64>(Shader::DreamsCompat::Ce3ReadConstCaptureBaseDword) * sizeof(u32);
     constexpr u32 Ce3ReadConstCaptureSize =
@@ -24251,6 +24598,46 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size,
     constexpr u64 DreamsVisibilityListShaderAlt = 0x016b9f6a;
     const bool is_dreams_visibility_list =
         cs.pgm_hash == DreamsVisibilityListShader || cs.pgm_hash == DreamsVisibilityListShaderAlt;
+    if (is_dreams_visibility_list && PollDreamsVs370ListSliceCaptureRequest()) {
+        auto& capture = g_dreams_vs370_list_slice_capture;
+        DreamsVs370ListSliceProducerSnapshot producer{
+            .dispatch_sequence = g_compute_dispatch_sequence,
+            .shader_hash = cs.pgm_hash,
+            .args_address = args_address,
+            .dispatch_initiator = cs_program.dispatch_initiator,
+            .start = {cs_program.start_x, cs_program.start_y, cs_program.start_z},
+            .threads = {cs_program.num_thread_x.full, cs_program.num_thread_y.full,
+                        cs_program.num_thread_z.full},
+        };
+        if (!cs.buffers.empty() && !cs.buffers[0].IsSpecial()) {
+            const auto output = cs.buffers[0].GetSharp(cs);
+            producer.descriptor_valid = output.base_address != 0 && output.stride != 0;
+            producer.output_base = output.base_address;
+            producer.output_size = output.GetSize();
+            producer.output_stride = output.stride;
+            producer.output_capacity_records =
+                output.stride != 0
+                    ? static_cast<u32>(std::min<u64>(output.GetSize() / output.stride,
+                                                     std::numeric_limits<u32>::max()))
+                    : 0;
+            static_assert(sizeof(AmdGpu::Buffer) == sizeof(producer.raw_output_descriptor));
+            std::memcpy(producer.raw_output_descriptor.data(), &output, sizeof(output));
+        }
+        // Several visibility-list producers may be submitted before the graphics consumer. Keep
+        // enough descriptor handoffs to identify the newest producer whose output is binding 3,
+        // without reading or synchronizing guest memory at dispatch time.
+        constexpr size_t MaxPendingProducers = 64;
+        if (capture.producers.size() == MaxPendingProducers) {
+            capture.producers.erase(capture.producers.begin());
+        }
+        capture.producers.push_back(producer);
+        LOG_WARNING(Render_Vulkan,
+                    "Dreams VS370 list-slice producer sequence={} valid={} output={:#x}+{:#x} "
+                    "stride={} capacity={} pending={}",
+                    producer.dispatch_sequence, producer.descriptor_valid, producer.output_base,
+                    producer.output_size, producer.output_stride,
+                    producer.output_capacity_records, capture.producers.size());
+    }
     const bool ordered_chain_waiting = cs.pgm_hash == DreamsVisibilityListShader &&
                                        DreamsOrderedChainCaptureEnabled() &&
                                        g_dreams_ordered_chain_capture.phase ==
