@@ -104,10 +104,11 @@ struct DreamsAtlasExpectedImage {
 static std::vector<DreamsAtlasExpectedImage> g_dreams_atlas_expected_images;
 
 // A one-shot, trigger-gated producer/consumer capture for the sculpt density atlas. This is kept
-// separate from the older broad 84aa/gather cross-check: it accepts exactly one 84aa generation,
-// requires the same Vulkan backing and byte-coordinate layout at 2f/f030, and disarms after the
-// aligned boundary has either completed or failed.
+// separate from the older broad 84aa/gather cross-check: it accepts a bounded epoch of consecutive
+// exact-view 84aa writers, requires the same Vulkan backing and byte-coordinate layout at 2f/f030,
+// and disarms after the aligned boundary has either completed or failed.
 constexpr u32 DreamsSculptAtlasLineageMax84aaGroups = 8192;
+constexpr u32 DreamsSculptAtlasLineageMax84aaWriters = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxProducerAttempts = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxConsumerAttempts = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxF030Records = 65536;
@@ -128,6 +129,8 @@ struct DreamsSculptAtlasLineageBrick {
     u32 group{};
     u32 destination{};
     u32 producer_mismatches{};
+    u32 writer_index{};
+    u64 writer_sequence{};
 };
 
 struct DreamsSculptAtlasLineageConsumerResult {
@@ -154,12 +157,20 @@ struct DreamsSculptAtlasLineageCapture {
     std::filesystem::path root;
     std::filesystem::path directory;
     u64 deadline_sequence{};
+    u64 writer_deadline_sequence{};
+    u64 f030_deadline_sequence{};
     u64 producer_sequence{};
+    u64 last_producer_sequence{};
     DreamsAtlasImageIdentity producer_image{};
     std::unordered_map<u64, DreamsSculptAtlasLineageBrick> bricks;
     u32 producer_attempts{};
     u32 producer_groups{};
+    u32 producer_dispatch_groups{};
+    u32 pending_producer_dispatch_groups{};
     u64 producer_mismatched_bytes{};
+    u64 live_producer_mismatched_bytes{};
+    u32 producer_writers{};
+    u64 overwritten_bricks{};
     u32 consumer_attempts{};
     bool f030_files_complete{};
     DreamsSculptAtlasLineageConsumerResult prepare;
@@ -3418,6 +3429,41 @@ static bool RetryDreamsSculptAtlasLineageAfterEmptyProducer(std::string_view rea
     return true;
 }
 
+static bool RecordDreamsSculptAtlasLineageEmptyWriter(std::string_view reason) {
+    auto& capture = g_dreams_sculpt_atlas_lineage;
+    using Phase = DreamsSculptAtlasLineageCapture::Phase;
+    if (capture.phase != Phase::Capturing84aa || capture.producer_writers == 0 ||
+        capture.producer_writers >= DreamsSculptAtlasLineageMax84aaWriters) {
+        return false;
+    }
+    const u32 writer_index = capture.producer_writers;
+    const auto output = capture.directory / "84aa" /
+                        fmt::format("writer-{:02}-seq-{}", writer_index,
+                                    capture.last_producer_sequence);
+    std::error_code error;
+    std::filesystem::create_directories(output, error);
+    const auto manifest = output / "manifest.tsv";
+    const auto manifest_text =
+        fmt::format("schema\t1\nshader\t{:#x}\nsequence\t{}\nwriter_index\t{}\n"
+                    "groups\t0\ndispatch_groups\t{}\nstatus\tempty\nreason\t{}\n",
+                    Shader::DreamsCompat::SculptVolumeWriterShader,
+                    capture.last_producer_sequence, writer_index,
+                    capture.pending_producer_dispatch_groups, reason);
+    const std::span<const u8> manifest_bytes{
+        reinterpret_cast<const u8*>(manifest_text.data()), manifest_text.size()};
+    if (error || !WriteDreamsCaptureText(manifest, manifest_text) ||
+        !VerifyDreamsCaptureBytes(manifest, manifest_bytes,
+                                 HashDreamsTraceBytes(manifest_bytes))) {
+        FailDreamsSculptAtlasLineage("failed to record an empty later 84aa writer");
+        return false;
+    }
+    ++capture.producer_writers;
+    capture.producer_dispatch_groups += capture.pending_producer_dispatch_groups;
+    capture.pending_producer_dispatch_groups = 0;
+    capture.phase = Phase::Waiting2f;
+    return true;
+}
+
 static bool AppendDreamsSculptAtlasLineageEvent(std::string_view stage, u64 sequence,
                                                 std::string_view relation,
                                                 std::string_view decision) {
@@ -3437,16 +3483,58 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
         Common::ElfInfo::Instance().GameSerial() != "CUSA04301") {
         return false;
     }
-    if (capture.phase != Phase::WaitingRequest) {
-        if ((capture.phase == Phase::Waiting2f || capture.phase == Phase::WaitingF030) &&
-            SameDreamsAtlasBacking(capture.producer_image, producer)) {
-            AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas",
-                                                "fail_intervening_writer");
-            FailDreamsSculptAtlasLineage(
-                fmt::format("intervening 84aa sequence {} rewrote the tracked atlas before {}",
-                            sequence, DreamsSculptAtlasLineagePhaseName(capture.phase)));
-        }
+    if (capture.phase == Phase::Complete || capture.phase == Phase::Failed) {
         return false;
+    }
+    if (capture.phase != Phase::WaitingRequest) {
+        if (!SameDreamsAtlasBacking(capture.producer_image, producer)) {
+            if (OverlapDreamsAtlasGuestRange(capture.producer_image, producer)) {
+                AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "ambiguous_alias",
+                                                    "fail_overlapping_backing");
+                FailDreamsSculptAtlasLineage(
+                    "84aa used a different backing overlapping the tracked atlas guest range");
+            }
+            return false;
+        }
+        const bool same_view = SameDreamsAtlasView(capture.producer_image, producer);
+        if (!same_view) {
+            AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "ambiguous_alias",
+                                                "fail_view_mismatch");
+            FailDreamsSculptAtlasLineage(
+                "same-backing 84aa used a different view from the tracked atlas epoch");
+            return false;
+        }
+        if (capture.phase != Phase::Waiting2f) {
+            AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas",
+                                                "fail_out_of_order_writer");
+            FailDreamsSculptAtlasLineage(fmt::format(
+                "84aa sequence {} rewrote the tracked atlas during {}", sequence,
+                DreamsSculptAtlasLineagePhaseName(capture.phase)));
+            return false;
+        }
+        if (!exact_doc || groups == 0 ||
+            groups > DreamsSculptAtlasLineageMax84aaGroups ||
+            capture.producer_writers >= DreamsSculptAtlasLineageMax84aaWriters ||
+            capture.producer_dispatch_groups > DreamsSculptAtlasLineageMax84aaGroups - groups ||
+            sequence <= capture.last_producer_sequence) {
+            AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas",
+                                                "fail_ineligible_writer");
+            FailDreamsSculptAtlasLineage(fmt::format(
+                "same-atlas 84aa writer was not eligible: sequence={} last={} exact={} "
+                "same_view={} groups={} total_groups={} writers={}",
+                sequence, capture.last_producer_sequence, exact_doc,
+                same_view, groups, capture.producer_dispatch_groups, capture.producer_writers));
+            return false;
+        }
+        if (!AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas",
+                                                 "accept_writer")) {
+            FailDreamsSculptAtlasLineage("failed to append the accepted 84aa writer event");
+            return false;
+        }
+        capture.last_producer_sequence = sequence;
+        capture.pending_producer_dispatch_groups = groups;
+        capture.phase = Phase::Capturing84aa;
+        return true;
     }
     if (capture.root.empty()) {
         const char* value = std::getenv("SHADPS4_DREAMS_SCULPT_ATLAS_LINEAGE_CAPTURE_DIR");
@@ -3476,8 +3564,18 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
     }
 
     capture.producer_sequence = sequence;
-    capture.deadline_sequence = sequence + DreamsSculptAtlasLineageMaxDispatchGap;
-    capture.producer_groups = groups;
+    capture.last_producer_sequence = sequence;
+    capture.producer_image = producer;
+    // Stage one is bounded from the first accepted writer through 2f. Continuation writers do not
+    // roll this deadline forward. A successful 2f starts a separate bounded f030 stage.
+    capture.deadline_sequence =
+        sequence > std::numeric_limits<u64>::max() - DreamsSculptAtlasLineageMaxDispatchGap
+            ? std::numeric_limits<u64>::max()
+            : sequence + DreamsSculptAtlasLineageMaxDispatchGap;
+    capture.writer_deadline_sequence = capture.deadline_sequence;
+    capture.producer_groups = 0;
+    capture.producer_dispatch_groups = 0;
+    capture.pending_producer_dispatch_groups = groups;
     const auto nonce = std::chrono::system_clock::now().time_since_epoch().count();
     capture.directory = capture.root / fmt::format("capture-{}-{}", sequence, nonce);
     error.clear();
@@ -3493,15 +3591,24 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
             capture.directory / "started.tsv",
             fmt::format("schema\t1\nproducer_sequence\t{}\n84aa_groups\t{}\n"
                         "producer_attempt\t{}\nmax_producer_attempts\t{}\n"
-                        "max_84aa_groups\t{}\nmax_consumer_attempts\t{}\n"
+                        "max_84aa_writers\t{}\nmax_84aa_total_groups\t{}\n"
+                        "max_consumer_attempts\t{}\n"
+                        "writer_to_2f_max_dispatch_gap\t{}\n"
+                        "2f_to_f030_max_dispatch_gap\t{}\n"
+                        "writer_to_2f_deadline_sequence\t{}\n"
+                        "2f_to_f030_deadline_sequence\tpending_2f\n"
                         "max_f030_records\t{}\nmax_f030_waves\t{}\n"
                         "max_consumer_invocations\t{}\n"
                         "sample_window\twg_xyz_lt_4_local_xyz_lt_2\n"
                         "max_candidates_per_site\t{}\n",
                         sequence, groups, capture.producer_attempts + 1,
                         DreamsSculptAtlasLineageMaxProducerAttempts,
+                        DreamsSculptAtlasLineageMax84aaWriters,
                         DreamsSculptAtlasLineageMax84aaGroups,
                         DreamsSculptAtlasLineageMaxConsumerAttempts,
+                        DreamsSculptAtlasLineageMaxDispatchGap,
+                        DreamsSculptAtlasLineageMaxDispatchGap,
+                        capture.writer_deadline_sequence,
                         DreamsSculptAtlasLineageMaxF030Records,
                         DreamsSculptAtlasLineageMaxF030Waves,
                         DreamsSculptAtlasLineageMaxConsumerInvocations,
@@ -3511,7 +3618,10 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
             "attempt\tshader\tvalid\tbinding\timage_id\timage_uid\tbacking\t"
             "descriptor_base\tguest_base\twidth\theight\tdepth\tview_format\n") &&
         WriteDreamsCaptureText(capture.directory / "events.tsv",
-                               "phase\tstage\tsequence\trelation\tdecision\n");
+                               "phase\tstage\tsequence\trelation\tdecision\n") &&
+        WriteDreamsCaptureText(capture.directory / "84aa-overwrites.tsv",
+                               "brick_key\tprior_writer\tprior_sequence\tnew_writer\t"
+                               "new_sequence\n");
     if (!files_ok) {
         FailDreamsSculptAtlasLineage("failed to write capture-start metadata");
         return false;
@@ -3534,17 +3644,23 @@ static bool RecordDreamsSculptAtlasLineageProducer(const DreamsAtlasImageIdentit
     if (capture.phase != Phase::Capturing84aa) {
         return false;
     }
-    if (!identity.valid || groups.empty() ||
+    if (!identity.valid || !SameDreamsAtlasView(capture.producer_image, identity) || groups.empty() ||
         groups.size() > DreamsSculptAtlasLineageMax84aaGroups ||
+        groups.size() > capture.pending_producer_dispatch_groups ||
+        capture.producer_writers >= DreamsSculptAtlasLineageMax84aaWriters ||
+        capture.producer_groups > DreamsSculptAtlasLineageMax84aaGroups - groups.size() ||
         destinations.size() != groups.size() || offsets.size() != groups.size() ||
         expected.size() != groups.size() * BrickBytes || actual.size() != expected.size()) {
         FailDreamsSculptAtlasLineage("84aa producer capture was incomplete or exceeded its cap");
         return false;
     }
 
-    const auto output = capture.directory / "84aa";
+    const u32 writer_index = capture.producer_writers;
+    const auto output = capture.directory / "84aa" /
+                        fmt::format("writer-{:02}-seq-{}", writer_index,
+                                    capture.last_producer_sequence);
     std::error_code error;
-    std::filesystem::create_directory(output, error);
+    std::filesystem::create_directories(output, error);
     if (error) {
         FailDreamsSculptAtlasLineage("could not create the 84aa output directory");
         return false;
@@ -3558,13 +3674,12 @@ static bool RecordDreamsSculptAtlasLineageProducer(const DreamsAtlasImageIdentit
                     VerifyDreamsCaptureBytes(expected_file, expected, expected_hash) &&
                     VerifyDreamsCaptureBytes(actual_file, actual, actual_hash);
 
-    capture.producer_image = identity;
-    capture.producer_groups = static_cast<u32>(groups.size());
-    capture.bricks.clear();
-    capture.bricks.reserve(groups.size());
-    capture.producer_mismatched_bytes = 0;
+    std::unordered_map<u64, DreamsSculptAtlasLineageBrick> writer_bricks;
+    writer_bricks.reserve(groups.size());
+    u64 writer_mismatched_bytes{};
     std::string rows = "index\tgroup\tdestination\tbrick_x\tbrick_y\tbrick_z\tbrick_key\t"
-                       "expected_hash\tactual_hash\tproducer_mismatches\n";
+                       "expected_hash\tactual_hash\tproducer_mismatches\twriter_index\t"
+                       "writer_sequence\n";
     for (u32 index = 0; index < groups.size(); ++index) {
         const auto& offset = offsets[index];
         const auto key = PackDreamsAtlasBrick(offset.x, offset.y, offset.z);
@@ -3575,6 +3690,8 @@ static bool RecordDreamsSculptAtlasLineageProducer(const DreamsAtlasImageIdentit
         DreamsSculptAtlasLineageBrick brick{
             .group = groups[index],
             .destination = destinations[index],
+            .writer_index = writer_index,
+            .writer_sequence = capture.last_producer_sequence,
         };
         const u64 base = static_cast<u64>(index) * BrickBytes;
         std::copy_n(expected.data() + base, BrickBytes, brick.expected.data());
@@ -3582,15 +3699,17 @@ static bool RecordDreamsSculptAtlasLineageProducer(const DreamsAtlasImageIdentit
         for (u32 byte = 0; byte < BrickBytes; ++byte) {
             brick.producer_mismatches += brick.expected[byte] != brick.actual[byte];
         }
-        capture.producer_mismatched_bytes += brick.producer_mismatches;
-        if (!capture.bricks.emplace(*key, brick).second) {
+        writer_mismatched_bytes += brick.producer_mismatches;
+        if (!writer_bricks.emplace(*key, brick).second) {
             FailDreamsSculptAtlasLineage("84aa emitted duplicate atlas brick coordinates");
             return false;
         }
-        rows += fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{:#018x}\t{:#018x}\t{}\n", index,
-                            groups[index], destinations[index], offset.x / 8, offset.y / 8,
-                            offset.z / 8, *key, HashDreamsTraceBytes(brick.expected),
-                            HashDreamsTraceBytes(brick.actual), brick.producer_mismatches);
+        rows += fmt::format(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:#018x}\t{:#018x}\t{:#018x}\t{}\t{}\t{}\n",
+            index, groups[index], destinations[index], offset.x / 8, offset.y / 8,
+            offset.z / 8, *key, HashDreamsTraceBytes(brick.expected),
+            HashDreamsTraceBytes(brick.actual), brick.producer_mismatches, writer_index,
+            capture.last_producer_sequence);
     }
     files_ok &= WriteDreamsCaptureText(output / "bricks.tsv", rows);
     files_ok &= WriteDreamsCaptureText(
@@ -3602,27 +3721,67 @@ static bool RecordDreamsSculptAtlasLineageProducer(const DreamsAtlasImageIdentit
                     "descriptor_base\t{:#x}\nguest_base\t{:#x}\nguest_size\t{}\n"
                     "descriptor_shape\t{}x{}x{}\ndescriptor_pitch\t{}\n"
                     "cached_shape\t{}x{}x{}\ncached_pitch\t{}\nview_type\t{}\n"
-                    "view_format\t{}\nbase_level\t{}\nlevels\t{}\nbase_layer\t{}\nlayers\t{}\n",
-                    Shader::DreamsCompat::SculptVolumeWriterShader, capture.producer_sequence,
+                    "view_format\t{}\nbase_level\t{}\nlevels\t{}\nbase_layer\t{}\nlayers\t{}\n"
+                    "writer_index\t{}\n",
+                    Shader::DreamsCompat::SculptVolumeWriterShader,
+                    capture.last_producer_sequence,
                     groups.size(), BrickBytes, expected.size(), actual.size(), expected_hash,
-                    actual_hash, capture.producer_mismatched_bytes, identity.binding,
+                    actual_hash, writer_mismatched_bytes, identity.binding,
                     identity.image_id, identity.image_uid, identity.backing_handle,
                     identity.descriptor_base, identity.guest_base, identity.guest_size,
                     identity.descriptor_width, identity.descriptor_height,
                     identity.descriptor_depth, identity.descriptor_pitch, identity.cached_width,
                     identity.cached_height, identity.cached_depth, identity.cached_pitch,
                     identity.view_type, identity.view_format, identity.base_level, identity.levels,
-                    identity.base_layer, identity.layers));
+                    identity.base_layer, identity.layers, writer_index));
     if (!files_ok) {
         FailDreamsSculptAtlasLineage("failed to write or verify the 84aa producer files");
         return false;
     }
+
+    std::string overwrite_rows;
+    u64 writer_overwrites{};
+    u64 replaced_mismatched_bytes{};
+    u32 new_bricks{};
+    for (const auto& [key, brick] : writer_bricks) {
+        const auto prior = capture.bricks.find(key);
+        if (prior != capture.bricks.end()) {
+            overwrite_rows += fmt::format("{:#018x}\t{}\t{}\t{}\t{}\n", key,
+                                          prior->second.writer_index,
+                                          prior->second.writer_sequence, writer_index,
+                                          capture.last_producer_sequence);
+            ++writer_overwrites;
+            replaced_mismatched_bytes += prior->second.producer_mismatches;
+        } else {
+            ++new_bricks;
+        }
+    }
+    if (capture.bricks.size() > DreamsSculptAtlasLineageMax84aaGroups - new_bricks) {
+        FailDreamsSculptAtlasLineage("84aa live brick map exceeded its bounded capacity");
+        return false;
+    }
+    if (!overwrite_rows.empty() &&
+        !AppendDreamsCaptureText(capture.directory / "84aa-overwrites.tsv", overwrite_rows)) {
+        FailDreamsSculptAtlasLineage("failed to record 84aa ownership overwrites");
+        return false;
+    }
+    for (auto& [key, brick] : writer_bricks) {
+        capture.bricks.insert_or_assign(key, std::move(brick));
+    }
+    capture.overwritten_bricks += writer_overwrites;
+    capture.producer_groups += static_cast<u32>(groups.size());
+    capture.producer_dispatch_groups += capture.pending_producer_dispatch_groups;
+    capture.pending_producer_dispatch_groups = 0;
+    capture.producer_mismatched_bytes += writer_mismatched_bytes;
+    capture.live_producer_mismatched_bytes -= replaced_mismatched_bytes;
+    capture.live_producer_mismatched_bytes += writer_mismatched_bytes;
+    ++capture.producer_writers;
     capture.phase = Phase::Waiting2f;
     LOG_WARNING(Render_Vulkan,
-                "Dreams sculpt-atlas lineage captured 84aa sequence={} groups={} bricks={} "
-                "producer_mismatched_bytes={}",
-                capture.producer_sequence, capture.producer_groups, capture.bricks.size(),
-                capture.producer_mismatched_bytes);
+                "Dreams sculpt-atlas lineage captured 84aa writer={} sequence={} groups={} "
+                "total_groups={} final_bricks={} producer_mismatched_bytes={}",
+                writer_index, capture.last_producer_sequence, groups.size(),
+                capture.producer_groups, capture.bricks.size(), capture.producer_mismatched_bytes);
     return true;
 }
 
@@ -3646,7 +3805,7 @@ static bool WantsDreamsSculptAtlasLineageConsumer(u64 shader, u64 sequence,
             return false;
         }
         const u64 predecessor_sequence = capture.phase == Phase::Waiting2f
-                                             ? capture.producer_sequence
+                                             ? capture.last_producer_sequence
                                              : capture.prepare.sequence;
         if (sequence <= predecessor_sequence) {
             AppendDreamsSculptAtlasLineageEvent(fmt::format("{:#x}", shader), sequence,
@@ -3711,16 +3870,25 @@ static bool FinalizeDreamsSculptAtlasLineage() {
                     "store_scope\tfirst_16_claimants_per_static_site_within_sample_window\n"
                     "gather_store_pairing\tindependent_claimants_no_per_invocation_join\n"
                     "store_reload_evidence\timmediate_shader_observation_not_host_persistence\n"
-                    "producer_shader\t{:#x}\nproducer_sequence\t{}\n"
-                    "producer_groups\t{}\nproducer_bricks\t{}\nproducer_mismatched_bytes\t{}\n"
+                    "producer_shader\t{:#x}\nfirst_producer_sequence\t{}\n"
+                    "last_producer_sequence\t{}\nproducer_writers\t{}\n"
+                    "writer_to_2f_deadline_sequence\t{}\n"
+                    "2f_to_f030_deadline_sequence\t{}\n"
+                    "producer_dispatch_groups\t{}\nproducer_emitted_groups\t{}\n"
+                    "producer_bricks\t{}\noverwritten_bricks\t{}\n"
+                    "cumulative_producer_mismatched_bytes\t{}\n"
+                    "live_producer_mismatched_bytes\t{}\n"
                     "prepare_shader\t{:#x}\nprepare_sequence\t{}\nprepare_match\t{}\n"
                     "prepare_mismatch\t{}\nprepare_unknown\t{}\ncompact_shader\t{:#x}\n"
                     "compact_sequence\t{}\ncompact_match\t{}\ncompact_mismatch\t{}\n"
                     "compact_unknown\t{}\nf030_files_complete\t{}\nce3_join\tnot_captured\n",
                     Shader::DreamsCompat::ImageGather3DSampleWindow::MaxCandidatesPerSite,
                     Shader::DreamsCompat::SculptVolumeWriterShader, capture.producer_sequence,
-                    capture.producer_groups, capture.bricks.size(),
-                    capture.producer_mismatched_bytes,
+                    capture.last_producer_sequence, capture.producer_writers,
+                    capture.writer_deadline_sequence, capture.f030_deadline_sequence,
+                    capture.producer_dispatch_groups, capture.producer_groups,
+                    capture.bricks.size(), capture.overwritten_bricks,
+                    capture.producer_mismatched_bytes, capture.live_producer_mismatched_bytes,
                     Shader::DreamsCompat::SculptAtlasPrepareShader, capture.prepare.sequence,
                     capture.prepare.matched, capture.prepare.mismatched, capture.prepare.unknown,
                     Shader::DreamsCompat::SculptSurfaceCompactShader, capture.compact.sequence,
@@ -3802,7 +3970,8 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
     u32 unknown{};
     std::string gather_rows =
         "site\tsource\tx\ty\tz\tbinding\tcomponent\tsampled_raw\tsampled_byte\t"
-        "producer_actual\tproducer_expected\tproducer_mismatches\tstatus\n";
+        "producer_actual\tproducer_expected\tproducer_mismatches\twriter_index\t"
+        "writer_sequence\tstatus\n";
     for (u32 site = 0; site < Gather3DCapture::MaxSites; ++site) {
         if ((gather_seen & (1U << site)) == 0) {
             continue;
@@ -3837,6 +4006,8 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
             u32 producer_actual = std::numeric_limits<u32>::max();
             u32 producer_expected = std::numeric_limits<u32>::max();
             u32 producer_mismatches{};
+            u32 writer_index = std::numeric_limits<u32>::max();
+            u64 writer_sequence{};
             std::string_view status = "UNKNOWN";
             if (brick_it != capture.bricks.end()) {
                 const u32 lane = (static_cast<u32>(y) & 7U) * 8U + (static_cast<u32>(x) & 7U);
@@ -3845,6 +4016,8 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
                 producer_actual = brick_it->second.actual[offset];
                 producer_expected = brick_it->second.expected[offset];
                 producer_mismatches = brick_it->second.producer_mismatches;
+                writer_index = brick_it->second.writer_index;
+                writer_sequence = brick_it->second.writer_sequence;
                 if (sampled_valid && sampled_byte == producer_actual) {
                     status = "MATCH";
                     ++matched;
@@ -3856,9 +4029,10 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
                 ++unknown;
             }
             gather_rows +=
-                fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\n",
+                fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\n",
                             site, source, x, y, z, binding, component, sampled_raw, sampled_byte,
-                            producer_actual, producer_expected, producer_mismatches, status);
+                            producer_actual, producer_expected, producer_mismatches, writer_index,
+                            writer_sequence, status);
         }
     }
 
@@ -3926,7 +4100,11 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
     capture.consumer_attempts = 0;
     if (is_prepare) {
         capture.phase = Phase::WaitingF030;
-        capture.deadline_sequence = sequence + DreamsSculptAtlasLineageMaxDispatchGap;
+        capture.deadline_sequence =
+            sequence > std::numeric_limits<u64>::max() - DreamsSculptAtlasLineageMaxDispatchGap
+                ? std::numeric_limits<u64>::max()
+                : sequence + DreamsSculptAtlasLineageMaxDispatchGap;
+        capture.f030_deadline_sequence = capture.deadline_sequence;
     } else {
         FinalizeDreamsSculptAtlasLineage();
     }
@@ -22701,8 +22879,13 @@ void Rasterizer::DispatchDirect(
                     if (capture_sculpt_atlas_lineage) {
                         if (valid_groups == 0 && destination_failures == 0 && lookup_bytes == 0 &&
                             doc_validation_failures == 0) {
-                            RetryDreamsSculptAtlasLineageAfterEmptyProducer(
-                                "84aa emitted no atlas bricks");
+                            if (g_dreams_sculpt_atlas_lineage.producer_writers == 0) {
+                                RetryDreamsSculptAtlasLineageAfterEmptyProducer(
+                                    "84aa emitted no atlas bricks");
+                            } else {
+                                RecordDreamsSculptAtlasLineageEmptyWriter(
+                                    "84aa emitted no atlas bricks");
+                            }
                         } else {
                             FailDreamsSculptAtlasLineage(
                                 "84aa lookup or destination map was incomplete");
