@@ -14,6 +14,7 @@ constexpr u32 PendingModelStatus = 0xffffffffu;
 struct ModelBuildSnapshot {
     bool valid{};
     bool returned{};
+    bool submission_fallback{};
     u32 epoch{};
     u32 thread_id{};
     u32 arg_rcx{};
@@ -128,6 +129,26 @@ inline ModelBuildSnapshot ReadModelBuild() noexcept {
         }
     }
     return {};
+}
+
+// GPU submissions may be emitted by a worker other than the guest thread that entered the model
+// builder. Prefer that thread's exact snapshot when available, then fall back to the seqlock's
+// current in-progress build so the diagnostic tag crosses the submission-thread handoff. A
+// completed build is never attached to later, unrelated submissions.
+inline ModelBuildSnapshot ReadModelBuildForSubmission() noexcept {
+    const ModelBuildSnapshot active = ReadActiveModelBuild();
+    if (active.valid && !active.returned && active.epoch != 0) {
+        return active;
+    }
+    if (!model_valid.load(std::memory_order_acquire)) {
+        return {};
+    }
+    ModelBuildSnapshot current = ReadModelBuild();
+    if (!current.valid || current.returned || current.epoch == 0) {
+        return {};
+    }
+    current.submission_fallback = true;
+    return current;
 }
 
 } // namespace Core::DreamsTrace

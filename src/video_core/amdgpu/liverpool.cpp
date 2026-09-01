@@ -1522,7 +1522,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
-    auto task = ProcessGraphics(dcb, ccb, Core::DreamsTrace::ReadActiveModelBuild());
+    auto task = ProcessGraphics(dcb, ccb, Core::DreamsTrace::ReadModelBuildForSubmission());
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
@@ -1538,7 +1538,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
-    const auto& task = ProcessCompute(acb, vqid, Core::DreamsTrace::ReadActiveModelBuild());
+    const auto& task = ProcessCompute(acb, vqid, Core::DreamsTrace::ReadModelBuildForSubmission());
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
