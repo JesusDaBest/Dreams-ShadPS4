@@ -212,12 +212,17 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
     const Id sample = ctx.OpImageSampleExplicitLod(result_type, sampled_image, coords,
                                                    operands.mask, operands.operands);
     const Id emitted = texture.is_integer ? ctx.OpBitcast(ctx.F32[4], sample) : sample;
-    if (DreamsCompat::CaptureCe3FleckTrace() &&
+    if ((DreamsCompat::CaptureCe3FleckTrace() || DreamsCompat::CaptureCe3CoverageTrace()) &&
         ctx.info.pgm_hash == DreamsCompat::Ce3ReadConstCaptureShader &&
         ctx.stage == Stage::Fragment && ctx.l_stage == LogicalStage::Fragment &&
         (handle & 0xffff) == 0) {
         const u32 site = ctx.dreams_ce3_fleck_sample_ordinal++;
-        EmitCe3FleckSampleCapture(ctx, site, coords, emitted);
+        if (DreamsCompat::CaptureCe3FleckTrace()) {
+            EmitCe3FleckSampleCapture(ctx, site, coords, emitted);
+        }
+        if (DreamsCompat::CaptureCe3CoverageTrace() && site == 0) {
+            EmitCe3CoverageInitial(ctx);
+        }
     }
     return emitted;
 }

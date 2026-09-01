@@ -431,7 +431,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
             infos[FragmentStage]->pgm_hash == DreamsSculptFragmentShader;
         const bool dreams_ce3_capture_pipeline =
             (Shader::DreamsCompat::CaptureCe3ReadConst() ||
-             Shader::DreamsCompat::CaptureCe3FleckTrace()) &&
+             Shader::DreamsCompat::CaptureCe3FleckTrace() ||
+             Shader::DreamsCompat::CaptureCe3CoverageTrace()) &&
             infos[FragmentStage] != nullptr &&
             infos[FragmentStage]->pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader;
 
@@ -756,7 +757,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         info.stage == Shader::Stage::Vertex;
     const bool dreams_ce3_readconst_capture =
         (Shader::DreamsCompat::CaptureCe3ReadConst() ||
-         Shader::DreamsCompat::CaptureCe3FleckTrace()) &&
+         Shader::DreamsCompat::CaptureCe3FleckTrace() ||
+         Shader::DreamsCompat::CaptureCe3CoverageTrace()) &&
         info.pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader &&
         info.stage == Shader::Stage::Fragment;
     const bool dreams_image_gather_3d_capture = Shader::DreamsCompat::CaptureImageGather3D() &&

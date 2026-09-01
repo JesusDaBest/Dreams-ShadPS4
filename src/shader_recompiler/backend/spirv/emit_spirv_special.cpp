@@ -77,6 +77,130 @@ void EmitEpilogue(EmitContext& ctx) {
     }
 }
 
+static bool IsCe3CoverageTarget(const EmitContext& ctx) {
+    return DreamsCompat::CaptureCe3CoverageTrace() &&
+           ctx.info.pgm_hash == DreamsCompat::Ce3ReadConstCaptureShader &&
+           ctx.stage == Stage::Fragment && ctx.l_stage == LogicalStage::Fragment;
+}
+
+static void EmitCe3CoverageCounter(EmitContext& ctx, Id counter_base, Id miss_counter) {
+    namespace Capture = DreamsCompat::Ce3CoverageTrace;
+    const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                       &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds != ctx.buffers.end(), "ce3 coverage trace has no GDS descriptor");
+    const auto [buffer_id, pointer_type] = gds->Alias(EmitContext::PointerType::U32);
+    const auto pointer = [&](Id index) {
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+    };
+
+    const Id arm = ctx.OpLoad(ctx.U32[1], pointer(ctx.ConstU32(Capture::ArmDword)));
+    const Id armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+    const Id armed_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(armed, armed_label, merge_label);
+
+    ctx.AddLabel(armed_label);
+    const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const auto acquire_release = spv::MemorySemanticsMask::AcquireRelease |
+                                 spv::MemorySemanticsMask::UniformMemory;
+    const auto acquire =
+        spv::MemorySemanticsMask::Acquire | spv::MemorySemanticsMask::UniformMemory;
+    const Id acquire_release_semantics = ctx.ConstU32(static_cast<u32>(acquire_release));
+    const Id acquire_semantics = ctx.ConstU32(static_cast<u32>(acquire));
+    const Id candidate = ctx.OpBitcast(
+        ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param1, 0, 0));
+    const Id valid = ctx.OpINotEqual(ctx.U1[1], candidate, ctx.ConstU32(Capture::ClaimSentinel));
+
+    Id hash = ctx.OpBitwiseXor(
+        ctx.U32[1], candidate,
+        ctx.OpShiftRightLogical(ctx.U32[1], candidate, ctx.ConstU32(16U)));
+    hash = ctx.OpIMul(ctx.U32[1], hash, ctx.ConstU32(0x7feb352dU));
+    hash = ctx.OpBitwiseXor(
+        ctx.U32[1], hash,
+        ctx.OpShiftRightLogical(ctx.U32[1], hash, ctx.ConstU32(15U)));
+    hash = ctx.OpIMul(ctx.U32[1], hash, ctx.ConstU32(0x846ca68bU));
+    hash = ctx.OpBitwiseXor(
+        ctx.U32[1], hash,
+        ctx.OpShiftRightLogical(ctx.U32[1], hash, ctx.ConstU32(16U)));
+    const Id slot_mask = ctx.ConstU32(Capture::Slots - 1);
+    const Id slot0 = ctx.OpBitwiseAnd(ctx.U32[1], hash, slot_mask);
+    const Id step = ctx.OpBitwiseAnd(
+        ctx.U32[1],
+        ctx.OpBitwiseOr(
+            ctx.U32[1],
+            ctx.OpShiftRightLogical(ctx.U32[1], hash, ctx.ConstU32(9U)),
+            ctx.u32_one_value),
+        slot_mask);
+    const Id slot1 = ctx.OpBitwiseAnd(
+        ctx.U32[1], ctx.OpIAdd(ctx.U32[1], slot0, step), slot_mask);
+    const auto key_index = [&](Id slot) {
+        return ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(Capture::KeysBaseDword), slot);
+    };
+    const Id previous0 = ctx.OpAtomicCompareExchange(
+        ctx.U32[1], pointer(key_index(slot0)), device_scope, acquire_release_semantics,
+        acquire_semantics, candidate, ctx.ConstU32(Capture::ClaimSentinel));
+    const Id available0 = ctx.OpLogicalOr(
+        ctx.U1[1],
+        ctx.OpIEqual(ctx.U1[1], previous0, ctx.ConstU32(Capture::ClaimSentinel)),
+        ctx.OpIEqual(ctx.U1[1], previous0, candidate));
+    const Id accepted0 = ctx.OpLogicalAnd(ctx.U1[1], valid, available0);
+    const Id compare1 = ctx.OpSelect(ctx.U32[1], accepted0, candidate,
+                                     ctx.ConstU32(Capture::ClaimSentinel));
+    const Id previous1 = ctx.OpAtomicCompareExchange(
+        ctx.U32[1], pointer(key_index(slot1)), device_scope, acquire_release_semantics,
+        acquire_semantics, candidate, compare1);
+    const Id available1 = ctx.OpLogicalOr(
+        ctx.U1[1],
+        ctx.OpIEqual(ctx.U1[1], previous1, ctx.ConstU32(Capture::ClaimSentinel)),
+        ctx.OpIEqual(ctx.U1[1], previous1, candidate));
+    const Id accepted1 = ctx.OpLogicalAnd(
+        ctx.U1[1], valid,
+        ctx.OpLogicalAnd(ctx.U1[1], ctx.OpLogicalNot(ctx.U1[1], accepted0), available1));
+    const Id accepted = ctx.OpLogicalOr(ctx.U1[1], accepted0, accepted1);
+    const Id selected_slot = ctx.OpSelect(ctx.U32[1], accepted0, slot0, slot1);
+    const Id counter_index = ctx.OpIAdd(ctx.U32[1], counter_base, selected_slot);
+    const Id target = ctx.OpSelect(ctx.U32[1], accepted, counter_index, miss_counter);
+    ctx.OpAtomicIAdd(ctx.U32[1], pointer(target), device_scope, acquire_release_semantics,
+                     ctx.u32_one_value);
+
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
+void EmitCe3CoverageInitial(EmitContext& ctx) {
+    if (!IsCe3CoverageTarget(ctx)) {
+        return;
+    }
+    namespace Capture = DreamsCompat::Ce3CoverageTrace;
+    EmitCe3CoverageCounter(ctx, ctx.ConstU32(Capture::InitialSampleBaseDword),
+                           ctx.ConstU32(Capture::MissInitialDword));
+}
+
+void EmitCe3CoverageConditional(EmitContext& ctx, Id condition) {
+    if (!IsCe3CoverageTarget(ctx)) {
+        return;
+    }
+    namespace Capture = DreamsCompat::Ce3CoverageTrace;
+    const Id counter = ctx.OpSelect(
+        ctx.U32[1], condition, ctx.ConstU32(Capture::ConditionalTrueBaseDword),
+        ctx.ConstU32(Capture::ConditionalFalseBaseDword));
+    const Id miss =
+        ctx.OpSelect(ctx.U32[1], condition,
+                     ctx.ConstU32(Capture::MissConditionalTrueDword),
+                     ctx.ConstU32(Capture::MissConditionalFalseDword));
+    EmitCe3CoverageCounter(ctx, counter, miss);
+}
+
+void EmitCe3CoverageUnconditional(EmitContext& ctx) {
+    if (!IsCe3CoverageTarget(ctx)) {
+        return;
+    }
+    namespace Capture = DreamsCompat::Ce3CoverageTrace;
+    EmitCe3CoverageCounter(ctx, ctx.ConstU32(Capture::UnconditionalBaseDword),
+                           ctx.ConstU32(Capture::MissUnconditionalDword));
+}
+
 static void EmitCe3FleckUnconditionalDiscardCapture(EmitContext& ctx) {
     namespace Capture = DreamsCompat::Ce3FleckTrace;
     if (!DreamsCompat::CaptureCe3FleckTrace() ||
@@ -130,6 +254,7 @@ static void EmitCe3FleckUnconditionalDiscardCapture(EmitContext& ctx) {
 }
 
 void EmitDiscard(EmitContext& ctx) {
+    EmitCe3CoverageUnconditional(ctx);
     EmitCe3FleckUnconditionalDiscardCapture(ctx);
     ctx.OpDemoteToHelperInvocationEXT();
 }
@@ -211,6 +336,7 @@ static void EmitCe3FleckDiscardCapture(EmitContext& ctx, Id condition) {
 }
 
 void EmitDiscardCond(EmitContext& ctx, Id condition) {
+    EmitCe3CoverageConditional(ctx, condition);
     EmitCe3FleckDiscardCapture(ctx, condition);
     const Id kill_label{ctx.OpLabel()};
     const Id merge_label{ctx.OpLabel()};

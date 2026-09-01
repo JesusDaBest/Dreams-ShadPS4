@@ -1002,7 +1002,30 @@ constexpr u32 DwordCount = HeaderDwords + StaticSampleSites * RecordDwords;
 constexpr u32 RecordDword(u32 site, u32 field) {
     return RecordBaseDword + site * RecordDwords + field;
 }
+
 } // namespace Ce3FleckTrace
+// Separate whole-draw coverage inventory for ce3b8413. Keeping this mode independent from the
+// coordinate/sample trace avoids candidate-dependent capture branches before the guest's final
+// ballot. Each event uses two branchless direct-map probes; any unresolved collision invalidates
+// completeness rather than being attributed to the resident key.
+namespace Ce3CoverageTrace {
+constexpr u32 BaseDword =
+    (Ce3FleckTrace::BaseDword + Ce3FleckTrace::DwordCount + 0xffU) & ~0xffU;
+constexpr u32 ArmDword = BaseDword;
+constexpr u32 Slots = 512;
+constexpr u32 KeysBaseDword = BaseDword + 1;
+constexpr u32 InitialSampleBaseDword = KeysBaseDword + Slots;
+constexpr u32 ConditionalTrueBaseDword = InitialSampleBaseDword + Slots;
+constexpr u32 ConditionalFalseBaseDword = ConditionalTrueBaseDword + Slots;
+constexpr u32 UnconditionalBaseDword = ConditionalFalseBaseDword + Slots;
+constexpr u32 MissInitialDword = UnconditionalBaseDword + Slots;
+constexpr u32 MissConditionalTrueDword = MissInitialDword + 1;
+constexpr u32 MissConditionalFalseDword = MissInitialDword + 2;
+constexpr u32 MissUnconditionalDword = MissInitialDword + 3;
+constexpr u32 DwordCount = MissUnconditionalDword - BaseDword + 1;
+constexpr u32 ClaimSentinel = 0xffffffffU;
+static_assert((Slots & (Slots - 1)) == 0);
+} // namespace Ce3CoverageTrace
 // Host-private storage for a diagnostic capture of the four dynamic ReadConst results consumed by
 // ce3b8413. The shader writes exactly what its BDA path returned; the host never reads or registers
 // the guest constant page before the draw. Keep this range separate from the VS370 fixture so the
@@ -1107,6 +1130,8 @@ static_assert(Vs370InterfaceCaptureBaseDword + Vs370InterfaceCaptureDwordCount <
 static_assert(Vs370InterfaceCaptureBaseDword + Vs370InterfaceCaptureDwordCount <=
               Ce3FleckTrace::BaseDword);
 static_assert(Ce3FleckTrace::BaseDword + Ce3FleckTrace::DwordCount <=
+              Ce3CoverageTrace::BaseDword);
+static_assert(Ce3CoverageTrace::BaseDword + Ce3CoverageTrace::DwordCount <=
               ImageGather3DConsumerCapture::BaseDword);
 static_assert(ImageGather3DConsumerCapture::BaseDword + ImageGather3DConsumerCapture::DwordCount <=
               ImageGather3DCapture::BaseDword);
@@ -1135,6 +1160,14 @@ inline bool CaptureCe3ReadConst() {
 inline bool CaptureCe3FleckTrace() {
     static const bool enabled = [] {
         const char* value = std::getenv("SHADPS4_DREAMS_CE3_FLECK_CAPTURE_DIR");
+        return value != nullptr && value[0] != '\0';
+    }();
+    return enabled;
+}
+
+inline bool CaptureCe3CoverageTrace() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_CE3_COVERAGE_CAPTURE_DIR");
         return value != nullptr && value[0] != '\0';
     }();
     return enabled;
@@ -1225,6 +1258,7 @@ inline bool IsCaptureInstrumentedShader(u64 hash) {
     return (CaptureVs370Interface() && hash == Vs370InterfaceCaptureShader) ||
            (CaptureCe3ReadConst() && hash == Ce3ReadConstCaptureShader) ||
            (CaptureCe3FleckTrace() && hash == Ce3ReadConstCaptureShader) ||
+           (CaptureCe3CoverageTrace() && hash == Ce3ReadConstCaptureShader) ||
            (CaptureB535Membership() && hash == TraversalShader) ||
            (CaptureOrderedChain() && hash == QueueProducerShader) ||
            (CaptureB1WriterProvenance() && IsB1WriterProvenanceShader(hash)) ||

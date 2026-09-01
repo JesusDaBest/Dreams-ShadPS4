@@ -918,7 +918,8 @@ void EmitContext::DefineBuffers() {
         }
     }
 
-    if ((DreamsCompat::CaptureCe3ReadConst() || DreamsCompat::CaptureCe3FleckTrace()) &&
+    if ((DreamsCompat::CaptureCe3ReadConst() || DreamsCompat::CaptureCe3FleckTrace() ||
+         DreamsCompat::CaptureCe3CoverageTrace()) &&
         info.pgm_hash == DreamsCompat::Ce3ReadConstCaptureShader && stage == Stage::Fragment &&
         l_stage == LogicalStage::Fragment) {
         auto gds =

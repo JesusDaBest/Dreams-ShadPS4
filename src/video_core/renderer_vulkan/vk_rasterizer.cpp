@@ -2786,6 +2786,31 @@ static bool DreamsCe3FleckTraceRequested() {
     return std::filesystem::is_regular_file(*directory / "capture.request", error) && !error;
 }
 
+static std::optional<std::filesystem::path> DreamsCe3CoverageTraceDirectory() {
+    const char* value = std::getenv("SHADPS4_DREAMS_CE3_COVERAGE_CAPTURE_DIR");
+    if (value == nullptr || value[0] == '\0') {
+        return std::nullopt;
+    }
+    std::filesystem::path output{value};
+    std::error_code error;
+    std::filesystem::create_directories(output, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Failed to create ce3 coverage trace directory {}: {}",
+                  output.string(), error.message());
+        return std::nullopt;
+    }
+    return output;
+}
+
+static bool DreamsCe3CoverageTraceRequested() {
+    const auto directory = DreamsCe3CoverageTraceDirectory();
+    if (!directory) {
+        return false;
+    }
+    std::error_code error;
+    return std::filesystem::is_regular_file(*directory / "capture.request", error) && !error;
+}
+
 static bool PollDreamsVs370InterfaceCaptureTrigger(bool matched_ordered_chain_producer = false) {
     auto& capture = g_dreams_vs370_interface_capture;
     if (!Shader::DreamsCompat::CaptureVs370Interface() || capture.complete || capture.failed ||
@@ -7890,6 +7915,25 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         sculpt_count_fragment.pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader;
     VideoCore::Buffer* dreams_ce3_fleck_trace_gds{};
     bool dreams_ce3_fleck_trace_armed{};
+    constexpr u64 Ce3CoverageTraceOffset =
+        static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::BaseDword) * sizeof(u32);
+    constexpr u32 Ce3CoverageTraceSize =
+        Shader::DreamsCompat::Ce3CoverageTrace::DwordCount * sizeof(u32);
+    constexpr u64 Ce3CoverageTraceArmOffset =
+        static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::ArmDword) * sizeof(u32);
+    constexpr u64 Ce3CoverageTraceKeysOffset =
+        static_cast<u64>(Shader::DreamsCompat::Ce3CoverageTrace::KeysBaseDword) * sizeof(u32);
+    constexpr u32 Ce3CoverageTraceKeysSize =
+        Shader::DreamsCompat::Ce3CoverageTrace::Slots * sizeof(u32);
+    static bool dreams_ce3_coverage_trace_complete{};
+    static u32 dreams_ce3_coverage_trace_misses{};
+    const bool dreams_ce3_coverage_trace_target =
+        Shader::DreamsCompat::CaptureCe3CoverageTrace() &&
+        !dreams_ce3_coverage_trace_complete && DreamsCe3CoverageTraceRequested() &&
+        sculpt_count_vertex.pgm_hash == Shader::DreamsCompat::Vs370InterfaceCaptureShader &&
+        sculpt_count_fragment.pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader;
+    VideoCore::Buffer* dreams_ce3_coverage_trace_gds{};
+    bool dreams_ce3_coverage_trace_armed{};
     const bool dreams_d25_direct_target =
         is_indexed && sculpt_count_vertex.pgm_hash == DreamsSpriteGeometryVertexShader &&
         sculpt_count_fragment.pgm_hash == DreamsSpriteGeometryFragmentShader;
@@ -9944,6 +9988,30 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                       Ce3FleckTraceOffset, Ce3FleckTraceSize,
                       dreams_ce3_fleck_trace_gds->SizeBytes(),
                       dreams_ce3_fleck_trace_gds->mapped_data.size());
+        }
+    }
+
+    if (dreams_ce3_coverage_trace_target) {
+        dreams_ce3_coverage_trace_gds = buffer_cache.GetGdsBuffer();
+        if (Ce3CoverageTraceOffset + Ce3CoverageTraceSize <=
+                dreams_ce3_coverage_trace_gds->SizeBytes() &&
+            Ce3CoverageTraceOffset + Ce3CoverageTraceSize <=
+                dreams_ce3_coverage_trace_gds->mapped_data.size()) {
+            dreams_ce3_coverage_trace_gds->Fill(Ce3CoverageTraceOffset,
+                                                 Ce3CoverageTraceSize, 0);
+            dreams_ce3_coverage_trace_gds->Fill(
+                Ce3CoverageTraceKeysOffset, Ce3CoverageTraceKeysSize,
+                Shader::DreamsCompat::Ce3CoverageTrace::ClaimSentinel);
+            dreams_ce3_coverage_trace_gds->Fill(Ce3CoverageTraceArmOffset, sizeof(u32), 1);
+            dreams_ce3_coverage_trace_armed = true;
+        } else {
+            dreams_ce3_coverage_trace_complete = true;
+            LOG_ERROR(Render_Vulkan,
+                      "ce3 coverage trace range {:#x}+{:#x} exceeds GDS size {:#x} "
+                      "or mapped size {:#x}",
+                      Ce3CoverageTraceOffset, Ce3CoverageTraceSize,
+                      dreams_ce3_coverage_trace_gds->SizeBytes(),
+                      dreams_ce3_coverage_trace_gds->mapped_data.size());
         }
     }
 
@@ -13691,6 +13759,129 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                       "Dreams ce3 fleck trace failed after {} target draws; seen={:#x} "
                       "claimed={:#010x} files_ok={}",
                       dreams_ce3_fleck_trace_misses, seen, claimed, files_ok);
+        }
+    }
+
+    if (dreams_ce3_coverage_trace_armed) {
+        namespace Capture = Shader::DreamsCompat::Ce3CoverageTrace;
+        scheduler.EndRendering();
+        const vk::BufferMemoryBarrier2 capture_readback_barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+            .buffer = dreams_ce3_coverage_trace_gds->Handle(),
+            .offset = Ce3CoverageTraceOffset,
+            .size = Ce3CoverageTraceSize,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &capture_readback_barrier,
+        });
+        scheduler.Finish();
+        dreams_ce3_coverage_trace_gds->InvalidateMappedRange(Ce3CoverageTraceOffset,
+                                                              Ce3CoverageTraceSize);
+
+        std::array<u32, Capture::DwordCount> capture{};
+        std::memcpy(capture.data(),
+                    dreams_ce3_coverage_trace_gds->mapped_data.data() +
+                        Ce3CoverageTraceOffset,
+                    sizeof(capture));
+        dreams_ce3_coverage_trace_gds->Fill(Ce3CoverageTraceArmOffset, sizeof(u32), 0);
+        const auto word = [&](u32 absolute_dword) {
+            return capture[absolute_dword - Capture::BaseDword];
+        };
+        const u32 miss_initial = word(Capture::MissInitialDword);
+        const u32 miss_conditional_true = word(Capture::MissConditionalTrueDword);
+        const u32 miss_conditional_false = word(Capture::MissConditionalFalseDword);
+        const u32 miss_unconditional = word(Capture::MissUnconditionalDword);
+        const u64 misses = static_cast<u64>(miss_initial) + miss_conditional_true +
+                           miss_conditional_false + miss_unconditional;
+        u32 occupied{};
+        u64 initial_total{};
+        u64 conditional_true_total{};
+        u64 conditional_false_total{};
+        u64 unconditional_total{};
+        std::string coverage =
+            "slot\tparam1\tatlas_id\tinitial\tconditional_total\tconditional_true\t"
+            "conditional_false\tunconditional\tterminal_total\n";
+        for (u32 slot = 0; slot < Capture::Slots; ++slot) {
+            const u32 key = word(Capture::KeysBaseDword + slot);
+            if (key == Capture::ClaimSentinel) {
+                continue;
+            }
+            const u32 initial = word(Capture::InitialSampleBaseDword + slot);
+            const u32 conditional_true = word(Capture::ConditionalTrueBaseDword + slot);
+            const u32 conditional_false = word(Capture::ConditionalFalseBaseDword + slot);
+            const u32 unconditional = word(Capture::UnconditionalBaseDword + slot);
+            const u64 conditional_total =
+                static_cast<u64>(conditional_true) + conditional_false;
+            const u64 terminal_total = conditional_total + unconditional;
+            coverage += fmt::format(
+                "{}\t{:#010x}\t{:#08x}\t{}\t{}\t{}\t{}\t{}\t{}\n", slot, key,
+                key & 0x00ffffff, initial, conditional_total, conditional_true,
+                conditional_false, unconditional, terminal_total);
+            ++occupied;
+            initial_total += initial;
+            conditional_true_total += conditional_true;
+            conditional_false_total += conditional_false;
+            unconditional_total += unconditional;
+        }
+
+        bool files_ok{};
+        if (const auto directory = DreamsCe3CoverageTraceDirectory()) {
+            u64 raw_hash{};
+            files_ok = WriteDreamsCaptureWords(*directory / "ce3-coverage-trace.bin", capture,
+                                                raw_hash);
+            files_ok &=
+                WriteDreamsCaptureText(*directory / "ce3-coverage.tsv", coverage);
+            files_ok &= WriteDreamsCaptureText(
+                *directory / "manifest.tsv",
+                fmt::format(
+                    "field\tvalue\nshader\t{:#x}\nslots\t{}\noccupied\t{}\n"
+                    "miss_initial\t{}\nmiss_conditional_true\t{}\n"
+                    "miss_conditional_false\t{}\nmiss_unconditional\t{}\nmiss_total\t{}\n"
+                    "initial_total\t{}\nconditional_true_total\t{}\n"
+                    "conditional_false_total\t{}\nunconditional_total\t{}\n"
+                    "terminal_total\t{}\nraw_hash\t{:#x}\ncomplete\t{}\n",
+                    Shader::DreamsCompat::Ce3ReadConstCaptureShader, Capture::Slots, occupied,
+                    miss_initial, miss_conditional_true, miss_conditional_false,
+                    miss_unconditional, misses, initial_total, conditional_true_total,
+                    conditional_false_total, unconditional_total,
+                    conditional_true_total + conditional_false_total + unconditional_total,
+                    raw_hash, occupied != 0 && misses == 0));
+            if (files_ok && occupied != 0 && misses == 0) {
+                files_ok &= WriteDreamsCaptureText(*directory / "complete.txt", "complete\n");
+            } else if (files_ok && occupied != 0) {
+                files_ok &= WriteDreamsCaptureText(
+                    *directory / "incomplete.txt",
+                    "Coverage table had unresolved two-probe collisions; rows are partial.\n");
+            }
+        }
+
+        if (occupied != 0) {
+            dreams_ce3_coverage_trace_complete = true;
+            if (const auto directory = DreamsCe3CoverageTraceDirectory()) {
+                std::error_code error;
+                std::filesystem::remove(*directory / "capture.request", error);
+            }
+            LOG_WARNING(
+                Render_Vulkan,
+                "Dreams ce3 coverage trace {} occupied={} misses={} initial={} conditional="
+                "{}/{} unconditional={} files_ok={} directory={}",
+                misses == 0 ? "complete" : "incomplete", occupied, misses, initial_total,
+                conditional_true_total, conditional_false_total, unconditional_total, files_ok,
+                DreamsCe3CoverageTraceDirectory()->string());
+        } else if (++dreams_ce3_coverage_trace_misses >= 8) {
+            dreams_ce3_coverage_trace_complete = true;
+            if (const auto directory = DreamsCe3CoverageTraceDirectory()) {
+                WriteDreamsCaptureText(*directory / "failed.txt",
+                                       "No ce3 coverage rows after eight target draws.\n");
+                std::error_code error;
+                std::filesystem::remove(*directory / "capture.request", error);
+            }
+            LOG_ERROR(Render_Vulkan, "Dreams ce3 coverage trace failed after {} target draws",
+                      dreams_ce3_coverage_trace_misses);
         }
     }
 

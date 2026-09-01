@@ -334,7 +334,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     if (Shader::DreamsCompat::CaptureVs370Interface() ||
         Shader::DreamsCompat::CaptureCe3ReadConst() ||
-        Shader::DreamsCompat::CaptureCe3FleckTrace()) {
+        Shader::DreamsCompat::CaptureCe3FleckTrace() ||
+        Shader::DreamsCompat::CaptureCe3CoverageTrace()) {
         // Reject target-containing pipelines before LoadPipelineStage mutates the program cache,
         // stage arrays, or fetch-shader state. All unrelated cached graphics pipelines still warm
         // normally; the instrumented VS and its pipelines compile on demand.
@@ -365,7 +366,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
                 info.l_stage == Shader::LogicalStage::Vertex;
             const bool target_ce3 =
                 (Shader::DreamsCompat::CaptureCe3ReadConst() ||
-                 Shader::DreamsCompat::CaptureCe3FleckTrace()) &&
+                 Shader::DreamsCompat::CaptureCe3FleckTrace() ||
+                 Shader::DreamsCompat::CaptureCe3CoverageTrace()) &&
                 info.pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader &&
                 info.stage == Shader::Stage::Fragment &&
                 info.l_stage == Shader::LogicalStage::Fragment;
