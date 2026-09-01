@@ -113,7 +113,6 @@ constexpr u32 DreamsSculptAtlasLineageMaxF030Records = 65536;
 constexpr u32 DreamsSculptAtlasLineageMaxF030Waves = 65536;
 constexpr u64 DreamsSculptAtlasLineageMaxConsumerInvocations = 4ULL * 1024 * 1024;
 constexpr u64 DreamsSculptAtlasLineageMaxDispatchGap = 8192;
-constexpr u64 DreamsSculptAtlasLineageRequestPollInterval = 256;
 static_assert(static_cast<u64>(DreamsSculptAtlasLineageMaxF030Waves) *
                   Shader::DreamsCompat::OrderedEntryDwords * sizeof(u32) <=
               1_MB);
@@ -153,7 +152,6 @@ struct DreamsSculptAtlasLineageCapture {
     Phase phase{Phase::WaitingRequest};
     std::filesystem::path root;
     std::filesystem::path directory;
-    u64 request_seen_sequence{};
     u64 deadline_sequence{};
     u64 producer_sequence{};
     DreamsAtlasImageIdentity producer_image{};
@@ -3336,37 +3334,9 @@ static void CheckDreamsSculptAtlasLineageDeadline(u64 sequence) {
         capture.phase == Phase::Complete || capture.phase == Phase::Failed) {
         return;
     }
-    if (capture.phase == Phase::WaitingRequest) {
-        if (sequence % DreamsSculptAtlasLineageRequestPollInterval != 0) {
-            return;
-        }
-        if (capture.root.empty()) {
-            const char* value = std::getenv("SHADPS4_DREAMS_SCULPT_ATLAS_LINEAGE_CAPTURE_DIR");
-            if (value == nullptr || value[0] == '\0') {
-                return;
-            }
-            capture.root = std::filesystem::path{value};
-        }
-        std::error_code error;
-        const bool requested =
-            std::filesystem::is_regular_file(capture.root / "capture.request", error) && !error;
-        if (!requested) {
-            capture.request_seen_sequence = 0;
-            return;
-        }
-        if (capture.request_seen_sequence == 0) {
-            capture.request_seen_sequence = sequence;
-            return;
-        }
-        if (sequence - capture.request_seen_sequence < DreamsSculptAtlasLineageMaxDispatchGap) {
-            return;
-        }
-        error.clear();
-        std::filesystem::remove(capture.root / "capture.request", error);
-        FailDreamsSculptAtlasLineage(
-            "no eligible bounded 84aa producer arrived before the dispatch deadline");
-        return;
-    }
+    // WaitingRequest owns no GPU resources and is bounded by the external one-shot runner. Dreams
+    // can execute well over 8192 compute dispatches during bootstrap before its first eligible
+    // 84aa, so a GPU-sequence deadline here would discard a correctly pre-armed request.
     if ((capture.phase == Phase::Waiting2f || capture.phase == Phase::WaitingF030) &&
         capture.deadline_sequence != 0 && sequence > capture.deadline_sequence) {
         FailDreamsSculptAtlasLineage(fmt::format(
@@ -3425,7 +3395,6 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
     if (!std::filesystem::is_regular_file(trigger, error) || error) {
         return false;
     }
-    capture.request_seen_sequence = sequence;
     error.clear();
     if (!std::filesystem::remove(trigger, error) || error) {
         LOG_ERROR(Render_Vulkan, "Dreams sculpt-atlas lineage trigger {} could not be consumed: {}",
