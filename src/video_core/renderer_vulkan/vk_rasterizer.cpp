@@ -13515,6 +13515,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             word(Capture::ConditionalDiscardInvocationsDword);
         const u32 conditional_discard_true = word(Capture::ConditionalDiscardTrueDword);
         const u32 conditional_discard_false = word(Capture::ConditionalDiscardFalseDword);
+        const u32 unconditional_discard_invocations =
+            word(Capture::UnconditionalDiscardInvocationsDword);
+        const u32 initial_sample_invocations = word(Capture::InitialSampleInvocationsDword);
         const bool sample_complete =
             (seen & ((1U << Capture::StaticSampleSites) - 1)) ==
             (1U << Capture::StaticSampleSites) - 1;
@@ -13640,7 +13643,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                             "claimed_atlas_id\t{:#08x}\nseen\t{:#x}\ndiscard_seen\t{}\n"
                             "discard_condition\t{}\nconditional_discard_invocations\t{}\n"
                             "conditional_discard_true\t{}\nconditional_discard_false\t{}\n"
-                            "conditional_discard_count_consistent\t{}\nsample_complete\t{}\n"
+                            "conditional_discard_count_consistent\t{}\n"
+                            "unconditional_discard_invocations\t{}\n"
+                            "initial_sample_invocations\t{}\nsample_complete\t{}\n"
                             "raw_hash\t{:#x}\n"
                             "atlas_neighborhood_ok\t{}\natlas_neighborhood_hash\t{:#x}\n",
                             Shader::DreamsCompat::Ce3ReadConstCaptureShader, claimed,
@@ -13650,6 +13655,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                             conditional_discard_true, conditional_discard_false,
                             conditional_discard_invocations ==
                                 conditional_discard_true + conditional_discard_false,
+                            unconditional_discard_invocations, initial_sample_invocations,
                             sample_complete, raw_hash,
                             atlas_neighborhood_ok, atlas_neighborhood_hash));
             if (files_ok && sample_complete) {
@@ -13665,11 +13671,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             }
             LOG_WARNING(Render_Vulkan,
                         "Dreams ce3 fleck trace complete param1={:#010x} atlas_id={:#08x} "
-                        "seen={:#x} discard={} conditional={}/{}+{} directory={}",
+                        "seen={:#x} discard={} conditional={}/{}+{} unconditional={} "
+                        "initial_samples={} directory={}",
                         claimed, claimed & 0x00ffffff, seen,
                         word(Capture::DiscardConditionDword),
                         conditional_discard_invocations, conditional_discard_true,
-                        conditional_discard_false,
+                        conditional_discard_false, unconditional_discard_invocations,
+                        initial_sample_invocations,
                         DreamsCe3FleckTraceDirectory()->string());
         } else if (++dreams_ce3_fleck_trace_misses >= 8) {
             dreams_ce3_fleck_trace_complete = true;

@@ -77,7 +77,60 @@ void EmitEpilogue(EmitContext& ctx) {
     }
 }
 
+static void EmitCe3FleckUnconditionalDiscardCapture(EmitContext& ctx) {
+    namespace Capture = DreamsCompat::Ce3FleckTrace;
+    if (!DreamsCompat::CaptureCe3FleckTrace() ||
+        ctx.info.pgm_hash != DreamsCompat::Ce3ReadConstCaptureShader ||
+        ctx.stage != Stage::Fragment || ctx.l_stage != LogicalStage::Fragment) {
+        return;
+    }
+
+    const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                       &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds != ctx.buffers.end(), "ce3 fleck discard trace has no GDS descriptor");
+    const auto [buffer_id, pointer_type] = gds->Alias(EmitContext::PointerType::U32);
+    const auto pointer = [&](Id index) {
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+    };
+
+    const Id arm = ctx.OpLoad(ctx.U32[1], pointer(ctx.ConstU32(Capture::ArmDword)));
+    const Id armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+    const Id armed_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(armed, armed_label, merge_label);
+
+    ctx.AddLabel(armed_label);
+    const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const auto acquire_release = spv::MemorySemanticsMask::AcquireRelease |
+                                 spv::MemorySemanticsMask::UniformMemory;
+    const auto acquire =
+        spv::MemorySemanticsMask::Acquire | spv::MemorySemanticsMask::UniformMemory;
+    const Id acquire_release_semantics = ctx.ConstU32(static_cast<u32>(acquire_release));
+    const Id acquire_semantics = ctx.ConstU32(static_cast<u32>(acquire));
+    const Id candidate = ctx.OpBitcast(
+        ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param1, 0, 0));
+    const Id claimed = ctx.OpAtomicLoad(
+        ctx.U32[1], pointer(ctx.ConstU32(Capture::ClaimedParam1Dword)), device_scope,
+        acquire_semantics);
+    const Id id_matches = ctx.OpIEqual(ctx.U1[1], claimed, candidate);
+    const Id match_label = ctx.OpLabel();
+    const Id match_merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(match_merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(id_matches, match_label, match_merge_label);
+
+    ctx.AddLabel(match_label);
+    ctx.OpAtomicIAdd(
+        ctx.U32[1], pointer(ctx.ConstU32(Capture::UnconditionalDiscardInvocationsDword)),
+        device_scope, acquire_release_semantics, ctx.u32_one_value);
+    ctx.OpBranch(match_merge_label);
+    ctx.AddLabel(match_merge_label);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 void EmitDiscard(EmitContext& ctx) {
+    EmitCe3FleckUnconditionalDiscardCapture(ctx);
     ctx.OpDemoteToHelperInvocationEXT();
 }
 

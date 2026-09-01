@@ -979,7 +979,7 @@ constexpr u32 Vs370InterfaceCaptureDwordCount = Vs370InterfaceCaptureValueCount 
 namespace Ce3FleckTrace {
 constexpr u32 BaseDword =
     (Vs370InterfaceCaptureBaseDword + Vs370InterfaceCaptureDwordCount + 0xffU) & ~0xffU;
-constexpr u32 HeaderDwords = 8;
+constexpr u32 HeaderDwords = 10;
 constexpr u32 ArmDword = BaseDword;
 constexpr u32 ClaimedParam1Dword = BaseDword + 1;
 constexpr u32 SeenDword = BaseDword + 2;
@@ -987,6 +987,8 @@ constexpr u32 DiscardConditionDword = BaseDword + 3;
 constexpr u32 ConditionalDiscardInvocationsDword = BaseDword + 4;
 constexpr u32 ConditionalDiscardTrueDword = BaseDword + 5;
 constexpr u32 ConditionalDiscardFalseDword = BaseDword + 6;
+constexpr u32 UnconditionalDiscardInvocationsDword = BaseDword + 7;
+constexpr u32 InitialSampleInvocationsDword = BaseDword + 8;
 constexpr u32 RecordBaseDword = BaseDword + HeaderDwords;
 constexpr u32 StaticSampleSites = 2;
 constexpr u32 RecordDwords = 15;

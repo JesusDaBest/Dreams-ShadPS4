@@ -152,6 +152,11 @@ static void EmitCe3FleckSampleCapture(EmitContext& ctx, u32 site, Id coords, Id 
     ctx.OpBranchConditional(id_matches, match_label, match_merge_label);
 
     ctx.AddLabel(match_label);
+    if (site == 0) {
+        ctx.OpAtomicIAdd(
+            ctx.U32[1], pointer(ctx.ConstU32(Capture::InitialSampleInvocationsDword)),
+            device_scope, acquire_release_semantics, ctx.u32_one_value);
+    }
     const Id site_bit = ctx.ConstU32(1U << site);
     const Id previous_sites = ctx.OpAtomicOr(
         ctx.U32[1], pointer(ctx.ConstU32(Capture::SeenDword)), device_scope,
