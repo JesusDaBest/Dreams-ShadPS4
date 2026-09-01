@@ -945,6 +945,7 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
         u32 model_id{};
         u32 target{};
         u32 csg_sequence{};
+        u32 model_trace_epoch{};
         u64 csg_request_address{};
         bool first_csg_input_pending{};
         bool active{};
@@ -1029,17 +1030,25 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
         state.model_id = static_cast<u32>(context->R8);
         state.target = static_cast<u32>(context->Rcx);
         state.csg_sequence = 0;
+        state.model_trace_epoch = 0;
         state.csg_request_address = 0;
         state.first_csg_input_pending = false;
         state.active = DreamsModelBoundaryCaptureEnabled();
         if (state.active) {
+            state.model_trace_epoch = DreamsTrace::BeginModelBuild(
+                GetCurrentThreadId(), static_cast<u32>(context->Rcx),
+                static_cast<u32>(context->Rdi), static_cast<u32>(context->Rdx),
+                static_cast<u32>(context->R8), static_cast<u32>(context->R9));
+        }
+        if (state.active) {
             char buffer[384]{};
             const int length = _snprintf_s(
                 buffer, sizeof(buffer), _TRUNCATE,
-                "model_boundary kind=build tick=%llu thread=%lu build=%u model=%u target=%u "
+                "model_boundary kind=build tick=%llu thread=%lu build=%u epoch=%u model=%u "
+                "target=%u "
                 "args=%u,%u,%u,%u source=0x%016llx caller=0x%016llx\r\n",
                 static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
-                state.build_sequence, state.model_id, state.target,
+                state.build_sequence, state.model_trace_epoch, state.model_id, state.target,
                 static_cast<u32>(context->Rdi), static_cast<u32>(context->Rdx),
                 static_cast<u32>(context->R8), static_cast<u32>(context->R9),
                 static_cast<unsigned long long>(context->Rsi),
@@ -1056,15 +1065,22 @@ static bool HandleDreamsModelBoundaryTrace(EXCEPTION_POINTERS* exception) noexce
     }
 
     if (guest_offset == DreamsModelBuildReturnOffset) {
+        const u32 completed_epoch = state.model_trace_epoch;
+        const bool model_trace_matched =
+            completed_epoch != 0 &&
+            DreamsTrace::CompleteModelBuild(completed_epoch, GetCurrentThreadId(),
+                                            static_cast<u32>(context->Rax));
+        state.model_trace_epoch = 0;
         if (state.active) {
             char buffer[320]{};
             const int length = _snprintf_s(
                 buffer, sizeof(buffer), _TRUNCATE,
-                "model_boundary kind=return tick=%llu thread=%lu build=%u model=%u target=%u "
-                "csg=%u status=%u frame_target=%u\r\n",
+                "model_boundary kind=return tick=%llu thread=%lu build=%u epoch=%u matched=%u "
+                "model=%u target=%u csg=%u status=%u frame_target=%u\r\n",
                 static_cast<unsigned long long>(GetTickCount64()), GetCurrentThreadId(),
-                state.build_sequence, state.model_id, state.target, state.csg_sequence,
-                static_cast<u32>(context->Rax), ReadDreamsU32(process, context->Rsp + 0x9c));
+                state.build_sequence, completed_epoch, model_trace_matched, state.model_id,
+                state.target, state.csg_sequence, static_cast<u32>(context->Rax),
+                ReadDreamsU32(process, context->Rsp + 0x9c));
             AppendDreamsModelBoundaryTrace(buffer, length);
         }
         state.active = false;

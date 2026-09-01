@@ -814,10 +814,10 @@ Liverpool::Task Liverpool::ProcessGraphics(
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DispatchDirect", cmd_address));
-                        rasterizer->DispatchDirect();
+                        rasterizer->DispatchDirect(model);
                         rasterizer->ScopeMarkerEnd();
                     } else {
-                        rasterizer->DispatchDirect();
+                        rasterizer->DispatchDirect(model);
                     }
                 }
                 break;
@@ -1362,10 +1362,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                 if (host_markers_enabled) {
                     rasterizer->ScopeMarkerBegin(
                         fmt::format("asc[{}]:{}:DispatchDirect", vqid, cmd_address));
-                    rasterizer->DispatchDirect();
+                    rasterizer->DispatchDirect(model);
                     rasterizer->ScopeMarkerEnd();
                 } else {
-                    rasterizer->DispatchDirect();
+                    rasterizer->DispatchDirect(model);
                 }
             }
             break;

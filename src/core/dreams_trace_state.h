@@ -26,8 +26,8 @@ struct ModelBuildSnapshot {
 
 // The CPU model builder and GPU command processor run on different host threads. The seqlock
 // preserves the latest diagnostic state for logging, while the thread-local snapshot is copied
-// into GPU submissions made by the same guest thread. It is written only when the opt-in
-// model-input trace has installed its two guest breakpoints.
+// into GPU submissions made by the same guest thread. It is written only when an opt-in model
+// boundary trace has installed its build/return breakpoints.
 inline std::atomic<u32> model_sequence{};
 inline std::atomic_flag model_writer = ATOMIC_FLAG_INIT;
 inline std::atomic<u32> model_epoch{};
@@ -84,21 +84,20 @@ inline u32 BeginModelBuild(const u32 thread_id, const u32 arg_rcx, const u32 arg
 
 inline bool CompleteModelBuild(const u32 epoch, const u32 thread_id, const u32 status) noexcept {
     LockModelWriter();
-    if (!model_valid.load(std::memory_order_relaxed) ||
-        model_epoch.load(std::memory_order_relaxed) != epoch ||
-        model_thread_id.load(std::memory_order_relaxed) != thread_id) {
-        UnlockModelWriter();
-        return false;
+    const bool matched = model_valid.load(std::memory_order_relaxed) &&
+                         model_epoch.load(std::memory_order_relaxed) == epoch &&
+                         model_thread_id.load(std::memory_order_relaxed) == thread_id;
+    if (matched) {
+        model_sequence.fetch_add(1, std::memory_order_acq_rel);
+        model_status.store(status, std::memory_order_relaxed);
+        model_returned.store(true, std::memory_order_relaxed);
+        model_sequence.fetch_add(1, std::memory_order_release);
     }
-    model_sequence.fetch_add(1, std::memory_order_acq_rel);
-    model_status.store(status, std::memory_order_relaxed);
-    model_returned.store(true, std::memory_order_relaxed);
-    model_sequence.fetch_add(1, std::memory_order_release);
     UnlockModelWriter();
     if (active_model_build.epoch == epoch && active_model_build.thread_id == thread_id) {
         active_model_build = {};
     }
-    return true;
+    return matched;
 }
 
 inline ModelBuildSnapshot ReadActiveModelBuild() noexcept {

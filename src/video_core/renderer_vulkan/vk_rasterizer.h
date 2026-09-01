@@ -54,7 +54,7 @@ public:
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address, u32 base_vertex_location, u32 start_instance_location);
 
-    void DispatchDirect();
+    void DispatchDirect(const Core::DreamsTrace::ModelBuildSnapshot& model);
     void DispatchIndirect(VAddr address, u32 offset, u32 size,
                           const Core::DreamsTrace::ModelBuildSnapshot& model);
 

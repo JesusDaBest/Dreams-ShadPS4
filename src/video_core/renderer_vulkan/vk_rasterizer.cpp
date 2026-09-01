@@ -2267,6 +2267,33 @@ static bool TraceDreamsModelInput() {
     return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
 }
 
+static bool TraceDreamsModelBuilder() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_DREAMS_MODEL_BOUNDARY_TRACE");
+        return value != nullptr && std::string_view{value} == "1";
+    }();
+    return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+}
+
+static const std::optional<std::filesystem::path>& DreamsModelBuilderTraceDirectory() {
+    static const std::optional<std::filesystem::path> directory = [] {
+        const char* configured = std::getenv("SHADPS4_DREAMS_MODEL_BUILDER_TRACE_DIR");
+        std::filesystem::path path =
+            configured != nullptr && configured[0] != '\0'
+                ? std::filesystem::path{configured}
+                : std::filesystem::path{"dreams-model-builder-capture"};
+        std::error_code error;
+        std::filesystem::create_directories(path, error);
+        if (error) {
+            LOG_ERROR(Render_Vulkan, "Failed to create Dreams model-builder directory {}: {}",
+                      path.string(), error.message());
+            return std::optional<std::filesystem::path>{};
+        }
+        return std::optional<std::filesystem::path>{std::move(path)};
+    }();
+    return directory;
+}
+
 static const DreamsModelInputSourceRange& GetDreamsModelInputSourceRange() {
     static const DreamsModelInputSourceRange range = [] {
         DreamsModelInputSourceRange parsed{};
@@ -14163,7 +14190,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ResetBindings();
 }
 
-void Rasterizer::DispatchDirect() {
+void Rasterizer::DispatchDirect(
+    const Core::DreamsTrace::ModelBuildSnapshot& submitted_model) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -14490,6 +14518,31 @@ void Rasterizer::DispatchDirect() {
         VAddr srt_base{};
         std::array<u32, 2> gds_before{};
     } dreams_csg_builder_trace{};
+    struct DreamsCsgBuilderBoundBuffer {
+        bool valid{};
+        vk::DescriptorBufferInfo descriptor{};
+        u64 logical_base_offset{};
+        u64 size{};
+        u32 stride{};
+    };
+    struct DreamsTaggedCsgBuilderCapture {
+        bool enabled{};
+        bool input_truncated{};
+        bool pre_complete{};
+        u32 ordinal{};
+        u32 input_count{};
+        Core::DreamsTrace::ModelBuildSnapshot model{};
+        std::filesystem::path directory;
+        std::array<DreamsCsgBuilderBoundBuffer, 5> buffers{};
+        std::array<u32, 2> gds_pre{};
+        std::array<u32, 2> gds_post{};
+        std::vector<u32> b4_pre;
+        std::vector<u32> b2_indices;
+        std::vector<u32> b2_pre;
+        std::vector<u32> b3_pre;
+        std::vector<u32> b0_post;
+        std::vector<u32> b1_post;
+    } dreams_tagged_csg_builder{};
     static u32 dreams_csg_builder_trace_count{};
     static u64 dreams_csg_builder_dispatch_count{};
     static u32 dreams_csg_builder_last_input_count = std::numeric_limits<u32>::max();
@@ -14532,10 +14585,11 @@ void Rasterizer::DispatchDirect() {
                         sizeof(raw_srt));
         }
         auto* gds = buffer_cache.GetGdsBuffer();
+        gds->InvalidateMappedRange(576 * sizeof(u32), 5 * sizeof(u32));
         std::memcpy(&dreams_csg_builder_trace.gds_before[0],
-                    gds->mapped_data.data() + 14 * sizeof(u32), sizeof(u32));
+                    gds->mapped_data.data() + 576 * sizeof(u32), sizeof(u32));
         std::memcpy(&dreams_csg_builder_trace.gds_before[1],
-                    gds->mapped_data.data() + 18 * sizeof(u32), sizeof(u32));
+                    gds->mapped_data.data() + 580 * sizeof(u32), sizeof(u32));
         LOG_WARNING(
             Render_Vulkan,
             "Dreams CSG builder pre #{} dispatch={} sequence={} dims={}x{}x{} threads={} "
@@ -14544,7 +14598,7 @@ void Rasterizer::DispatchDirect() {
             "raw4-15={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x} "
             "raw24-27={:#x},{:#x},{:#x},{:#x} "
             "flat16-25={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x} "
-            "flat36-37={},{} gds14={} gds18={}",
+            "flat36-37={},{} gds576={} gds580={}",
             dreams_csg_builder_trace.ordinal, dreams_csg_builder_trace.dispatch_ordinal,
             g_compute_dispatch_sequence, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z,
             cs_program.num_thread_x.full, dreams_csg_builder_trace.srt_base, user_data(0),
@@ -16618,6 +16672,168 @@ void Rasterizer::DispatchDirect() {
         {cs_program.dim_x, cs_program.dim_y, cs_program.dim_z});
     if (!BindResources(pipeline)) {
         return;
+    }
+    if (TraceDreamsModelBuilder() && is_dreams_csg_builder &&
+        IsDreamsModelInputSourceSelected(submitted_model) && dreams_csg_builder_input_count != 0) {
+        constexpr u32 MaxCapturedDispatches = 32;
+        constexpr u32 MaxCapturesPerEpoch = 2;
+        constexpr u32 MaxInputRecords = 4096;
+        constexpr u64 MaxB2CaptureBytes = 8_MB;
+        constexpr std::array<u32, 5> ExpectedStrides{8, 92, 168, 56, 200};
+        static u32 captured_dispatches{};
+        static std::unordered_map<u32, u32> captures_per_epoch;
+        if (captured_dispatches < MaxCapturedDispatches &&
+            captures_per_epoch[submitted_model.epoch] < MaxCapturesPerEpoch) {
+            const auto resolve_binding = [&](const u32 binding) {
+                DreamsCsgBuilderBoundBuffer result{};
+                if (binding >= cs.buffers.size() || binding >= buffer_infos.size() ||
+                    cs.buffers[binding].IsSpecial()) {
+                    return result;
+                }
+                const auto sharp = cs.buffers[binding].GetSharp(cs);
+                const u64 binding_size = ResolveGuestBufferBindingSize(
+                    memory, cs, binding, cs.buffers[binding], sharp);
+                const auto& descriptor = buffer_infos[binding];
+                if (sharp.base_address == 0 || binding_size == 0 ||
+                    descriptor.range == VK_WHOLE_SIZE || descriptor.range < binding_size ||
+                    static_cast<VkBuffer>(descriptor.buffer) == VK_NULL_HANDLE) {
+                    return result;
+                }
+                result.valid = sharp.stride == ExpectedStrides[binding];
+                result.descriptor = descriptor;
+                result.logical_base_offset = descriptor.range - binding_size;
+                result.size = binding_size;
+                result.stride = sharp.stride;
+                return result;
+            };
+            const auto range_valid = [](const DreamsCsgBuilderBoundBuffer& buffer,
+                                        const u64 offset, const u64 size) {
+                return buffer.valid && offset <= buffer.size && size <= buffer.size - offset &&
+                       offset <= std::numeric_limits<u64>::max() - buffer.logical_base_offset;
+            };
+
+            for (u32 binding = 0; binding < dreams_tagged_csg_builder.buffers.size(); ++binding) {
+                dreams_tagged_csg_builder.buffers[binding] = resolve_binding(binding);
+            }
+            const auto& b0 = dreams_tagged_csg_builder.buffers[0];
+            const auto& b1 = dreams_tagged_csg_builder.buffers[1];
+            const auto& b2 = dreams_tagged_csg_builder.buffers[2];
+            const auto& b3 = dreams_tagged_csg_builder.buffers[3];
+            const auto& b4 = dreams_tagged_csg_builder.buffers[4];
+            const u32 captured_input_count =
+                std::min(dreams_csg_builder_input_count, MaxInputRecords);
+            const u64 b4_capture_bytes = static_cast<u64>(captured_input_count) * 200;
+            const u64 b2_capture_bytes = std::min(b2.size, MaxB2CaptureBytes) & ~u64{3};
+            if (captured_input_count != 0 && b0.valid && b1.valid &&
+                range_valid(b4, 0, b4_capture_bytes) &&
+                range_valid(b2, 0, b2_capture_bytes) && b2_capture_bytes == b2.size &&
+                range_valid(b3, 0, b3.size)) {
+                dreams_tagged_csg_builder.enabled = true;
+                dreams_tagged_csg_builder.input_truncated =
+                    captured_input_count != dreams_csg_builder_input_count;
+                dreams_tagged_csg_builder.ordinal = ++captured_dispatches;
+                dreams_tagged_csg_builder.input_count = captured_input_count;
+                dreams_tagged_csg_builder.model = submitted_model;
+                ++captures_per_epoch[submitted_model.epoch];
+                if (const auto& root = DreamsModelBuilderTraceDirectory()) {
+                    dreams_tagged_csg_builder.directory =
+                        *root / fmt::format("capture-{:03}-epoch-{}-model-{}-dispatch-{}",
+                                            dreams_tagged_csg_builder.ordinal,
+                                            submitted_model.epoch, submitted_model.model_id,
+                                            dreams_csg_builder_dispatch_ordinal);
+                    std::error_code error;
+                    std::filesystem::create_directories(dreams_tagged_csg_builder.directory,
+                                                        error);
+                }
+
+                dreams_tagged_csg_builder.b4_pre.resize(
+                    static_cast<u64>(captured_input_count) * 50);
+                std::vector<u32> b2_all(b2_capture_bytes / sizeof(u32));
+                dreams_tagged_csg_builder.b3_pre.resize(b3.size / sizeof(u32));
+                std::array<DreamsBoundBufferCaptureRegion, 3> input_regions{{
+                    {
+                        .source = b4.descriptor,
+                        .relative_offset = b4.logical_base_offset,
+                        .destination = std::span<u8>{
+                            reinterpret_cast<u8*>(dreams_tagged_csg_builder.b4_pre.data()),
+                            dreams_tagged_csg_builder.b4_pre.size() * sizeof(u32)},
+                    },
+                    {
+                        .source = b2.descriptor,
+                        .relative_offset = b2.logical_base_offset,
+                        .destination = std::span<u8>{reinterpret_cast<u8*>(b2_all.data()),
+                                                     b2_all.size() * sizeof(u32)},
+                    },
+                    {
+                        .source = b3.descriptor,
+                        .relative_offset = b3.logical_base_offset,
+                        .destination = std::span<u8>{
+                            reinterpret_cast<u8*>(dreams_tagged_csg_builder.b3_pre.data()),
+                            dreams_tagged_csg_builder.b3_pre.size() * sizeof(u32)},
+                    },
+                }};
+                const bool inputs_read = ReadDreamsBoundBufferRegionsForCapture(
+                    scheduler, buffer_cache, input_regions);
+
+                auto* gds = buffer_cache.GetGdsBuffer();
+                constexpr u64 GdsOffset = 576 * sizeof(u32);
+                constexpr u64 GdsSize = 5 * sizeof(u32);
+                const bool gds_valid = GdsOffset + GdsSize <= gds->mapped_data.size();
+                if (gds_valid) {
+                    gds->InvalidateMappedRange(GdsOffset, GdsSize);
+                    std::memcpy(&dreams_tagged_csg_builder.gds_pre[0],
+                                gds->mapped_data.data() + 576 * sizeof(u32), sizeof(u32));
+                    std::memcpy(&dreams_tagged_csg_builder.gds_pre[1],
+                                gds->mapped_data.data() + 580 * sizeof(u32), sizeof(u32));
+                }
+
+                u32 invalid_b2_indices{};
+                dreams_tagged_csg_builder.b2_indices.resize(captured_input_count);
+                dreams_tagged_csg_builder.b2_pre.resize(
+                    static_cast<u64>(captured_input_count) * 42);
+                if (inputs_read) {
+                    for (u32 record = 0; record < captured_input_count; ++record) {
+                        const u32 b2_index =
+                            dreams_tagged_csg_builder.b4_pre[record * 50 + 25] & 0xffffu;
+                        dreams_tagged_csg_builder.b2_indices[record] = b2_index;
+                        const u64 b2_word = static_cast<u64>(b2_index) * 42;
+                        if (b2_word + 42 > b2_all.size()) {
+                            ++invalid_b2_indices;
+                            continue;
+                        }
+                        std::memcpy(dreams_tagged_csg_builder.b2_pre.data() + record * 42,
+                                    b2_all.data() + b2_word, 42 * sizeof(u32));
+                    }
+                }
+                dreams_tagged_csg_builder.pre_complete =
+                    inputs_read && gds_valid && invalid_b2_indices == 0 &&
+                    !dreams_tagged_csg_builder.input_truncated;
+
+                const u64 b0_available_records =
+                    dreams_tagged_csg_builder.gds_pre[1] <= b0.size / 8
+                        ? b0.size / 8 - dreams_tagged_csg_builder.gds_pre[1]
+                        : 0;
+                const u64 b1_available_records =
+                    dreams_tagged_csg_builder.gds_pre[0] <= b1.size / 92
+                        ? b1.size / 92 - dreams_tagged_csg_builder.gds_pre[0]
+                        : 0;
+                dreams_tagged_csg_builder.b0_post.resize(
+                    static_cast<u64>(std::min<u64>(captured_input_count, b0_available_records)) *
+                    2);
+                dreams_tagged_csg_builder.b1_post.resize(
+                    static_cast<u64>(std::min<u64>(captured_input_count, b1_available_records)) *
+                    23);
+                LOG_WARNING(Render_Vulkan,
+                            "Dreams tagged CSG builder pre #{} epoch={} model={} dispatch={} "
+                            "inputs={}/{} GDS576={} GDS580={} complete={} invalid_b2={}",
+                            dreams_tagged_csg_builder.ordinal, submitted_model.epoch,
+                            submitted_model.model_id, dreams_csg_builder_dispatch_ordinal,
+                            captured_input_count, dreams_csg_builder_input_count,
+                            dreams_tagged_csg_builder.gds_pre[0],
+                            dreams_tagged_csg_builder.gds_pre[1],
+                            dreams_tagged_csg_builder.pre_complete, invalid_b2_indices);
+            }
+        }
     }
     if (TraceDreamsGatherFocus() &&
         cs.pgm_hash == Shader::DreamsCompat::A3LookupProducerShader &&
@@ -21747,13 +21963,218 @@ void Rasterizer::DispatchDirect() {
                     state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
                     state[8], state[9], state[10]);
     }
+    if (dreams_tagged_csg_builder.enabled) {
+        const auto& b0 = dreams_tagged_csg_builder.buffers[0];
+        const auto& b1 = dreams_tagged_csg_builder.buffers[1];
+        std::vector<DreamsBoundBufferCaptureRegion> output_regions;
+        output_regions.reserve(2);
+        if (!dreams_tagged_csg_builder.b0_post.empty()) {
+            output_regions.push_back({
+                .source = b0.descriptor,
+                .relative_offset =
+                    b0.logical_base_offset +
+                    static_cast<u64>(dreams_tagged_csg_builder.gds_pre[1]) * 8,
+                .destination = std::span<u8>{
+                    reinterpret_cast<u8*>(dreams_tagged_csg_builder.b0_post.data()),
+                    dreams_tagged_csg_builder.b0_post.size() * sizeof(u32)},
+            });
+        }
+        if (!dreams_tagged_csg_builder.b1_post.empty()) {
+            output_regions.push_back({
+                .source = b1.descriptor,
+                .relative_offset =
+                    b1.logical_base_offset +
+                    static_cast<u64>(dreams_tagged_csg_builder.gds_pre[0]) * 92,
+                .destination = std::span<u8>{
+                    reinterpret_cast<u8*>(dreams_tagged_csg_builder.b1_post.data()),
+                    dreams_tagged_csg_builder.b1_post.size() * sizeof(u32)},
+            });
+        }
+        const bool outputs_read = output_regions.empty()
+                                      ? (scheduler.Finish(), false)
+                                      : ReadDreamsBoundBufferRegionsForCapture(
+                                            scheduler, buffer_cache, output_regions);
+
+        auto* gds = buffer_cache.GetGdsBuffer();
+        constexpr u64 GdsOffset = 576 * sizeof(u32);
+        constexpr u64 GdsSize = 5 * sizeof(u32);
+        const bool gds_valid = GdsOffset + GdsSize <= gds->mapped_data.size();
+        if (gds_valid) {
+            gds->InvalidateMappedRange(GdsOffset, GdsSize);
+            std::memcpy(&dreams_tagged_csg_builder.gds_post[0],
+                        gds->mapped_data.data() + 576 * sizeof(u32), sizeof(u32));
+            std::memcpy(&dreams_tagged_csg_builder.gds_post[1],
+                        gds->mapped_data.data() + 580 * sizeof(u32), sizeof(u32));
+        }
+        const bool b1_counter_reset =
+            dreams_tagged_csg_builder.gds_post[0] < dreams_tagged_csg_builder.gds_pre[0];
+        const bool b0_counter_reset =
+            dreams_tagged_csg_builder.gds_post[1] < dreams_tagged_csg_builder.gds_pre[1];
+        const u32 b1_delta = b1_counter_reset
+                                 ? 0
+                                 : dreams_tagged_csg_builder.gds_post[0] -
+                                       dreams_tagged_csg_builder.gds_pre[0];
+        const u32 b0_delta = b0_counter_reset
+                                 ? 0
+                                 : dreams_tagged_csg_builder.gds_post[1] -
+                                       dreams_tagged_csg_builder.gds_pre[1];
+        const u32 captured_b1_records = static_cast<u32>(
+            std::min<u64>(b1_delta, dreams_tagged_csg_builder.b1_post.size() / 23));
+        const u32 captured_b0_records = static_cast<u32>(
+            std::min<u64>(b0_delta, dreams_tagged_csg_builder.b0_post.size() / 2));
+        const bool outputs_truncated =
+            captured_b1_records != b1_delta || captured_b0_records != b0_delta;
+        dreams_tagged_csg_builder.b1_post.resize(static_cast<u64>(captured_b1_records) * 23);
+        dreams_tagged_csg_builder.b0_post.resize(static_cast<u64>(captured_b0_records) * 2);
+
+        u32 mapped_queue_records{};
+        u32 low24_matches{};
+        u32 full_metadata_matches{};
+        std::string identity =
+            "kind\tordinal\trecord\tabs_index\tb2_index\tword20\tword17\tword22\t"
+            "queue0\tqueue1\tlow24_match\tfull_match\trecord_hash\n";
+        for (u32 record = 0; record < dreams_tagged_csg_builder.input_count; ++record) {
+            const auto b2_record = std::span<const u32>{
+                dreams_tagged_csg_builder.b2_pre.data() + static_cast<u64>(record) * 42, 42};
+            identity += fmt::format("input\t{}\t{}\t{}\t{}\t{:#010x}\t0\t0\t0\t0\t0\t0\t{:#018x}\n",
+                                    dreams_tagged_csg_builder.ordinal, record, record,
+                                    dreams_tagged_csg_builder.b2_indices[record], b2_record[20],
+                                    HashDreamsTraceWords(b2_record));
+        }
+        for (u32 record = 0; record < captured_b0_records; ++record) {
+            const u32 queue0 = dreams_tagged_csg_builder.b0_post[record * 2];
+            const u32 queue1 = dreams_tagged_csg_builder.b0_post[record * 2 + 1];
+            const u32 output_index = queue1 & 0x00ffffffu;
+            const u32 output_relative =
+                output_index >= dreams_tagged_csg_builder.gds_pre[0]
+                    ? output_index - dreams_tagged_csg_builder.gds_pre[0]
+                    : std::numeric_limits<u32>::max();
+            const bool output_mapped = output_relative < captured_b1_records;
+            const u32 word17 = output_mapped
+                                   ? dreams_tagged_csg_builder.b1_post[output_relative * 23 + 17]
+                                   : 0;
+            const u32 word22 = output_mapped
+                                   ? dreams_tagged_csg_builder.b1_post[output_relative * 23 + 22]
+                                   : 0;
+            u32 source_record = std::numeric_limits<u32>::max();
+            u32 source_word20{};
+            bool exact_source_match{};
+            for (u32 input = 0; input < dreams_tagged_csg_builder.input_count; ++input) {
+                const u32 candidate =
+                    dreams_tagged_csg_builder.b2_pre[static_cast<u64>(input) * 42 + 20];
+                if ((candidate & 0x00ffffffu) == queue0) {
+                    if (source_record == std::numeric_limits<u32>::max()) {
+                        source_record = input;
+                        source_word20 = candidate;
+                    }
+                    if (output_mapped && candidate == word17) {
+                        source_record = input;
+                        source_word20 = candidate;
+                        exact_source_match = true;
+                        break;
+                    }
+                }
+            }
+            const bool low24_match = output_mapped && (word17 & 0x00ffffffu) == queue0;
+            const bool full_match = low24_match && exact_source_match;
+            mapped_queue_records += output_mapped;
+            low24_matches += low24_match;
+            full_metadata_matches += full_match;
+            const u64 record_hash =
+                output_mapped
+                    ? HashDreamsTraceWords(std::span<const u32>{
+                          dreams_tagged_csg_builder.b1_post.data() +
+                              static_cast<u64>(output_relative) * 23,
+                          23})
+                    : 0;
+            identity += fmt::format(
+                "queue\t{}\t{}\t{}\t{}\t{:#010x}\t{:#010x}\t{:#010x}\t{:#010x}\t"
+                "{:#010x}\t{}\t{}\t{:#018x}\n",
+                dreams_tagged_csg_builder.ordinal, record, output_index, source_record,
+                source_word20, word17, word22, queue0, queue1, low24_match, full_match,
+                record_hash);
+        }
+
+        u64 b4_hash{};
+        u64 b2_hash{};
+        u64 b3_hash{};
+        u64 b0_hash{};
+        u64 b1_hash{};
+        bool files_ok = !dreams_tagged_csg_builder.directory.empty();
+        if (files_ok) {
+            files_ok &= WriteDreamsCaptureWords(
+                dreams_tagged_csg_builder.directory / "b4-primary-pre.bin",
+                dreams_tagged_csg_builder.b4_pre, b4_hash);
+            files_ok &= WriteDreamsCaptureWords(
+                dreams_tagged_csg_builder.directory / "b2-referenced-pre.bin",
+                dreams_tagged_csg_builder.b2_pre, b2_hash);
+            files_ok &= WriteDreamsCaptureWords(
+                dreams_tagged_csg_builder.directory / "b3-constants-pre.bin",
+                dreams_tagged_csg_builder.b3_pre, b3_hash);
+            files_ok &= WriteDreamsCaptureWords(
+                dreams_tagged_csg_builder.directory / "b0-queue-post.bin",
+                dreams_tagged_csg_builder.b0_post, b0_hash);
+            files_ok &= WriteDreamsCaptureWords(
+                dreams_tagged_csg_builder.directory / "b1-spatial-post.bin",
+                dreams_tagged_csg_builder.b1_post, b1_hash);
+            files_ok &= WriteDreamsCaptureText(
+                dreams_tagged_csg_builder.directory / "identity.tsv", identity);
+            const std::string metadata = fmt::format(
+                "ordinal\tepoch\tmodel\tdispatch\tinput_count\tinput_truncated\tpre_complete\t"
+                "gds576_pre\tgds576_post\tb1_delta\tgds580_pre\tgds580_post\tb0_delta\t"
+                "counter_reset\toutputs_read\toutputs_truncated\tmapped_queue\tlow24_matches\t"
+                "full_matches\tb4_hash\tb2_hash\tb3_hash\tb0_hash\tb1_hash\n"
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t"
+                "{}\t{}\t{}\t{:#018x}\t{:#018x}\t{:#018x}\t{:#018x}\t{:#018x}\n",
+                dreams_tagged_csg_builder.ordinal, dreams_tagged_csg_builder.model.epoch,
+                dreams_tagged_csg_builder.model.model_id, dreams_csg_builder_dispatch_ordinal,
+                dreams_tagged_csg_builder.input_count,
+                dreams_tagged_csg_builder.input_truncated,
+                dreams_tagged_csg_builder.pre_complete, dreams_tagged_csg_builder.gds_pre[0],
+                dreams_tagged_csg_builder.gds_post[0], b1_delta,
+                dreams_tagged_csg_builder.gds_pre[1], dreams_tagged_csg_builder.gds_post[1],
+                b0_delta, b1_counter_reset || b0_counter_reset, outputs_read,
+                outputs_truncated, mapped_queue_records, low24_matches, full_metadata_matches,
+                b4_hash, b2_hash, b3_hash, b0_hash, b1_hash);
+            files_ok &= WriteDreamsCaptureText(
+                dreams_tagged_csg_builder.directory / "metadata.tsv", metadata);
+            if (const auto& root = DreamsModelBuilderTraceDirectory()) {
+                files_ok &= AppendDreamsCaptureText(
+                    *root / "manifest.tsv",
+                    fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                dreams_tagged_csg_builder.ordinal,
+                                dreams_tagged_csg_builder.model.epoch,
+                                dreams_tagged_csg_builder.model.model_id,
+                                dreams_csg_builder_dispatch_ordinal,
+                                dreams_tagged_csg_builder.input_count, b1_delta, b0_delta,
+                                low24_matches, full_metadata_matches,
+                                dreams_tagged_csg_builder.pre_complete,
+                                !outputs_truncated && outputs_read,
+                                dreams_tagged_csg_builder.directory.filename().string()));
+            }
+        }
+        LOG_WARNING(
+            Render_Vulkan,
+            "Dreams tagged CSG builder post #{} epoch={} model={} dispatch={} "
+            "GDS576={}->{} b1={} GDS580={}->{} b0={} mapped={} low24={} full={} "
+            "complete={} files_ok={}",
+            dreams_tagged_csg_builder.ordinal, dreams_tagged_csg_builder.model.epoch,
+            dreams_tagged_csg_builder.model.model_id, dreams_csg_builder_dispatch_ordinal,
+            dreams_tagged_csg_builder.gds_pre[0], dreams_tagged_csg_builder.gds_post[0], b1_delta,
+            dreams_tagged_csg_builder.gds_pre[1], dreams_tagged_csg_builder.gds_post[1], b0_delta,
+            mapped_queue_records, low24_matches, full_metadata_matches,
+            dreams_tagged_csg_builder.pre_complete && outputs_read && gds_valid &&
+                !outputs_truncated && !b1_counter_reset && !b0_counter_reset,
+            files_ok);
+    }
     if (dreams_csg_builder_trace.enabled) {
         scheduler.Finish();
-        const auto* gds = buffer_cache.GetGdsBuffer();
+        auto* gds = buffer_cache.GetGdsBuffer();
+        gds->InvalidateMappedRange(576 * sizeof(u32), 5 * sizeof(u32));
         std::array<u32, 2> gds_after{};
-        std::memcpy(&gds_after[0], gds->mapped_data.data() + 14 * sizeof(u32), sizeof(u32));
-        std::memcpy(&gds_after[1], gds->mapped_data.data() + 18 * sizeof(u32), sizeof(u32));
-        LOG_WARNING(Render_Vulkan, "Dreams CSG builder post #{} gds14={}->{} gds18={}->{}",
+        std::memcpy(&gds_after[0], gds->mapped_data.data() + 576 * sizeof(u32), sizeof(u32));
+        std::memcpy(&gds_after[1], gds->mapped_data.data() + 580 * sizeof(u32), sizeof(u32));
+        LOG_WARNING(Render_Vulkan, "Dreams CSG builder post #{} gds576={}->{} gds580={}->{}",
                     dreams_csg_builder_trace.ordinal, dreams_csg_builder_trace.gds_before[0],
                     gds_after[0], dreams_csg_builder_trace.gds_before[1], gds_after[1]);
         for (u32 index = 0; index < std::min<u32>(2, cs.buffers.size()); ++index) {
