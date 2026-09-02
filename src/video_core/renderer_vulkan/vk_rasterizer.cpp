@@ -109,6 +109,8 @@ static std::vector<DreamsAtlasExpectedImage> g_dreams_atlas_expected_images;
 // and disarms after the aligned boundary has either completed or failed.
 constexpr u32 DreamsSculptAtlasLineageMax84aaGroups = 8192;
 constexpr u32 DreamsSculptAtlasLineageMax84aaWriters = 8;
+constexpr u32 DreamsSculptAtlasLineageMax2fCaptures = 8;
+constexpr u32 DreamsSculptAtlasLineageMaxUnknownTexels = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxProducerAttempts = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxConsumerAttempts = 8;
 constexpr u32 DreamsSculptAtlasLineageMaxF030Records = 65536;
@@ -171,10 +173,23 @@ struct DreamsSculptAtlasLineageCapture {
     u64 live_producer_mismatched_bytes{};
     u32 producer_writers{};
     u64 overwritten_bricks{};
+    bool writers_frozen{};
     u32 consumer_attempts{};
     bool f030_files_complete{};
     DreamsSculptAtlasLineageConsumerResult prepare;
+    std::vector<DreamsSculptAtlasLineageConsumerResult> prepares;
+    u64 first_prepare_sequence{};
     DreamsSculptAtlasLineageConsumerResult compact;
+};
+
+struct DreamsSculptAtlasUnknownObservation {
+    u32 site{};
+    u32 source{};
+    s32 x{};
+    s32 y{};
+    s32 z{};
+    bool eligible{};
+    u32 readback_index{std::numeric_limits<u32>::max()};
 };
 
 static DreamsSculptAtlasLineageCapture g_dreams_sculpt_atlas_lineage{};
@@ -3475,6 +3490,70 @@ static bool AppendDreamsSculptAtlasLineageEvent(std::string_view stage, u64 sequ
                                                stage, sequence, relation, decision));
 }
 
+static std::optional<std::vector<DreamsSculptAtlasUnknownObservation>>
+CollectDreamsSculptAtlasUnknownObservations(
+    const std::array<u32, Gather3DCapture::DwordCount>& gather) {
+    const auto& capture = g_dreams_sculpt_atlas_lineage;
+    const auto word = [&](u32 absolute_dword) {
+        return gather[absolute_dword - Gather3DCapture::BaseDword];
+    };
+    const auto record = [&](u32 site, u32 field) {
+        return word(Gather3DCapture::RecordDword(site, field));
+    };
+    const u32 seen = word(Gather3DCapture::SeenDword);
+    std::vector<DreamsSculptAtlasUnknownObservation> observations;
+    observations.reserve(DreamsSculptAtlasLineageMaxUnknownTexels);
+    std::vector<std::array<s32, 3>> unique;
+    unique.reserve(DreamsSculptAtlasLineageMaxUnknownTexels);
+    for (u32 site = 0; site < Gather3DCapture::MaxSites; ++site) {
+        if ((seen & (1U << site)) == 0) {
+            continue;
+        }
+        for (u32 source = 0; source < 4; ++source) {
+            const s32 x =
+                std::bit_cast<s32>(record(site, Gather3DCapture::SourceCoordinates + source * 3));
+            const s32 y = std::bit_cast<s32>(
+                record(site, Gather3DCapture::SourceCoordinates + source * 3 + 1));
+            const s32 z = std::bit_cast<s32>(
+                record(site, Gather3DCapture::SourceCoordinates + source * 3 + 2));
+            const auto key = PackDreamsAtlasBrick(x, y, z);
+            if (key.has_value() && capture.bricks.contains(*key)) {
+                continue;
+            }
+            if (!key.has_value()) {
+                observations.push_back({.site = site, .source = source, .x = x, .y = y, .z = z});
+                continue;
+            }
+            const std::array coordinate{x, y, z};
+            auto existing = std::find(unique.begin(), unique.end(), coordinate);
+            if (existing == unique.end()) {
+                if (unique.size() >= DreamsSculptAtlasLineageMaxUnknownTexels) {
+                    return std::nullopt;
+                }
+                existing = unique.insert(unique.end(), coordinate);
+            }
+            observations.push_back({
+                .site = site,
+                .source = source,
+                .x = x,
+                .y = y,
+                .z = z,
+                .eligible = true,
+                .readback_index = static_cast<u32>(std::distance(unique.begin(), existing)),
+            });
+        }
+    }
+    return observations;
+}
+
+static std::filesystem::path DreamsSculptAtlasLineageConsumerOutput(u64 shader, u64 sequence) {
+    const auto& capture = g_dreams_sculpt_atlas_lineage;
+    const bool prepare = shader == Shader::DreamsCompat::SculptAtlasPrepareShader;
+    const u32 index = prepare ? static_cast<u32>(capture.prepares.size()) : 0;
+    return capture.directory / (prepare ? "2f" : "f030") /
+           fmt::format("capture-{:02}-seq-{}", index, sequence) / "gather";
+}
+
 static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, bool exact_doc,
                                                       const DreamsAtlasImageIdentity& producer) {
     auto& capture = g_dreams_sculpt_atlas_lineage;
@@ -3504,30 +3583,28 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
                 "same-backing 84aa used a different view from the tracked atlas epoch");
             return false;
         }
-        if (capture.phase != Phase::Waiting2f) {
+        if (capture.phase != Phase::Waiting2f || capture.writers_frozen) {
             AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas",
                                                 "fail_out_of_order_writer");
-            FailDreamsSculptAtlasLineage(fmt::format(
-                "84aa sequence {} rewrote the tracked atlas during {}", sequence,
+            FailDreamsSculptAtlasLineage(
+                fmt::format("84aa sequence {} rewrote the tracked atlas during {}", sequence,
                 DreamsSculptAtlasLineagePhaseName(capture.phase)));
             return false;
         }
-        if (!exact_doc || groups == 0 ||
-            groups > DreamsSculptAtlasLineageMax84aaGroups ||
+        if (!exact_doc || groups == 0 || groups > DreamsSculptAtlasLineageMax84aaGroups ||
             capture.producer_writers >= DreamsSculptAtlasLineageMax84aaWriters ||
             capture.producer_dispatch_groups > DreamsSculptAtlasLineageMax84aaGroups - groups ||
             sequence <= capture.last_producer_sequence) {
             AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas",
                                                 "fail_ineligible_writer");
-            FailDreamsSculptAtlasLineage(fmt::format(
-                "same-atlas 84aa writer was not eligible: sequence={} last={} exact={} "
+            FailDreamsSculptAtlasLineage(
+                fmt::format("same-atlas 84aa writer was not eligible: sequence={} last={} exact={} "
                 "same_view={} groups={} total_groups={} writers={}",
-                sequence, capture.last_producer_sequence, exact_doc,
-                same_view, groups, capture.producer_dispatch_groups, capture.producer_writers));
+                            sequence, capture.last_producer_sequence, exact_doc, same_view, groups,
+                            capture.producer_dispatch_groups, capture.producer_writers));
             return false;
         }
-        if (!AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas",
-                                                 "accept_writer")) {
+        if (!AppendDreamsSculptAtlasLineageEvent("84aa", sequence, "same_atlas", "accept_writer")) {
             FailDreamsSculptAtlasLineage("failed to append the accepted 84aa writer event");
             return false;
         }
@@ -3621,7 +3698,10 @@ static bool BeginDreamsSculptAtlasLineageIfRequested(u64 sequence, u32 groups, b
                                "phase\tstage\tsequence\trelation\tdecision\n") &&
         WriteDreamsCaptureText(capture.directory / "84aa-overwrites.tsv",
                                "brick_key\tprior_writer\tprior_sequence\tnew_writer\t"
-                               "new_sequence\n");
+                               "new_sequence\n") &&
+        WriteDreamsCaptureText(capture.directory / "2f-captures.tsv",
+                               "index\tsequence\tgather_seen\tstore_seen\tmatched\t"
+                               "mismatched\tunknown\n");
     if (!files_ok) {
         FailDreamsSculptAtlasLineage("failed to write capture-start metadata");
         return false;
@@ -3793,20 +3873,33 @@ static bool WantsDreamsSculptAtlasLineageConsumer(u64 shader, u64 sequence,
         return false;
     }
     if (SameDreamsAtlasByteCoordinates(capture.producer_image, consumer)) {
-        const u64 expected_shader = capture.phase == Phase::Waiting2f
-                                        ? Shader::DreamsCompat::SculptAtlasPrepareShader
-                                        : Shader::DreamsCompat::SculptSurfaceCompactShader;
-        if (shader != expected_shader) {
+        const bool prepare = shader == Shader::DreamsCompat::SculptAtlasPrepareShader;
+        const bool compact = shader == Shader::DreamsCompat::SculptSurfaceCompactShader;
+        const bool prepare_allowed =
+            prepare && (capture.phase == Phase::Waiting2f || capture.phase == Phase::WaitingF030);
+        const bool compact_allowed =
+            compact && capture.phase == Phase::WaitingF030 && !capture.prepares.empty();
+        if (!prepare_allowed && !compact_allowed) {
             AppendDreamsSculptAtlasLineageEvent(fmt::format("{:#x}", shader), sequence,
                                                 "same_atlas", "fail_out_of_order");
-            FailDreamsSculptAtlasLineage(fmt::format(
-                "out-of-order same-atlas consumer {:#x}; expected {:#x} during {}", shader,
-                expected_shader, DreamsSculptAtlasLineagePhaseName(capture.phase)));
+            FailDreamsSculptAtlasLineage(
+                fmt::format("out-of-order same-atlas consumer {:#x} during {}", shader,
+                            DreamsSculptAtlasLineagePhaseName(capture.phase)));
             return false;
         }
-        const u64 predecessor_sequence = capture.phase == Phase::Waiting2f
+        if (prepare && capture.prepares.size() >= DreamsSculptAtlasLineageMax2fCaptures) {
+            FailDreamsSculptAtlasLineage("same-atlas 2f capture count exceeded its bounded cap");
+            return false;
+        }
+        if (capture.phase == Phase::WaitingF030 && capture.deadline_sequence != 0 &&
+            (sequence > capture.deadline_sequence ||
+             (prepare && sequence == capture.deadline_sequence))) {
+            FailDreamsSculptAtlasLineage("same-atlas consumer arrived after the f030 deadline");
+            return false;
+        }
+        const u64 predecessor_sequence = capture.prepares.empty()
                                              ? capture.last_producer_sequence
-                                             : capture.prepare.sequence;
+                                             : capture.prepares.back().sequence;
         if (sequence <= predecessor_sequence) {
             AppendDreamsSculptAtlasLineageEvent(fmt::format("{:#x}", shader), sequence,
                                                 "same_atlas", "fail_non_monotonic");
@@ -3815,8 +3908,11 @@ static bool WantsDreamsSculptAtlasLineageConsumer(u64 shader, u64 sequence,
                             shader, sequence, predecessor_sequence));
             return false;
         }
+        const std::string_view decision = prepare && !capture.prepares.empty() ? "continue_prepare"
+                                          : compact ? "freeze_prepares_and_arm_compact"
+                                                    : "ordering_valid";
         if (!AppendDreamsSculptAtlasLineageEvent(fmt::format("{:#x}", shader), sequence,
-                                                 "same_atlas", "ordering_valid")) {
+                                                 "same_atlas", decision)) {
             FailDreamsSculptAtlasLineage("failed to append the consumer ordering event");
             return false;
         }
@@ -3878,7 +3974,10 @@ static bool FinalizeDreamsSculptAtlasLineage() {
                     "producer_bricks\t{}\noverwritten_bricks\t{}\n"
                     "cumulative_producer_mismatched_bytes\t{}\n"
                     "live_producer_mismatched_bytes\t{}\n"
-                    "prepare_shader\t{:#x}\nprepare_sequence\t{}\nprepare_match\t{}\n"
+            "prepare_shader\t{:#x}\nprepare_max_captures\t{}\n"
+            "prepare_capture_count\t{}\nprepare_first_sequence\t{}\n"
+            "prepare_last_sequence\t{}\nprepare_gather_seen_or\t{:#x}\n"
+            "prepare_store_seen_or\t{:#x}\nprepare_match\t{}\n"
                     "prepare_mismatch\t{}\nprepare_unknown\t{}\ncompact_shader\t{:#x}\n"
                     "compact_sequence\t{}\ncompact_match\t{}\ncompact_mismatch\t{}\n"
                     "compact_unknown\t{}\nf030_files_complete\t{}\nce3_join\tnot_captured\n",
@@ -3886,14 +3985,15 @@ static bool FinalizeDreamsSculptAtlasLineage() {
                     Shader::DreamsCompat::SculptVolumeWriterShader, capture.producer_sequence,
                     capture.last_producer_sequence, capture.producer_writers,
                     capture.writer_deadline_sequence, capture.f030_deadline_sequence,
-                    capture.producer_dispatch_groups, capture.producer_groups,
-                    capture.bricks.size(), capture.overwritten_bricks,
-                    capture.producer_mismatched_bytes, capture.live_producer_mismatched_bytes,
-                    Shader::DreamsCompat::SculptAtlasPrepareShader, capture.prepare.sequence,
-                    capture.prepare.matched, capture.prepare.mismatched, capture.prepare.unknown,
-                    Shader::DreamsCompat::SculptSurfaceCompactShader, capture.compact.sequence,
-                    capture.compact.matched, capture.compact.mismatched, capture.compact.unknown,
-                    capture.f030_files_complete));
+            capture.producer_dispatch_groups, capture.producer_groups, capture.bricks.size(),
+            capture.overwritten_bricks, capture.producer_mismatched_bytes,
+            capture.live_producer_mismatched_bytes, Shader::DreamsCompat::SculptAtlasPrepareShader,
+            DreamsSculptAtlasLineageMax2fCaptures, capture.prepares.size(),
+            capture.first_prepare_sequence, capture.prepare.sequence, capture.prepare.gather_seen,
+            capture.prepare.store_seen, capture.prepare.matched, capture.prepare.mismatched,
+            capture.prepare.unknown, Shader::DreamsCompat::SculptSurfaceCompactShader,
+            capture.compact.sequence, capture.compact.matched, capture.compact.mismatched,
+            capture.compact.unknown, capture.f030_files_complete));
     if (!manifest_ok || !WriteDreamsCaptureCompletionMarker(capture.directory)) {
         FailDreamsSculptAtlasLineage("failed to write the verified completion marker");
         return false;
@@ -3910,11 +4010,14 @@ static bool FinalizeDreamsSculptAtlasLineage() {
 static bool RecordDreamsSculptAtlasLineageConsumer(
     u64 shader, u64 sequence, const DreamsAtlasImageIdentity& consumer,
     const std::array<u32, Gather3DCapture::DwordCount>& gather,
-    const std::array<u32, Gather3DConsumerCapture::DwordCount>& stores) {
+    const std::array<u32, Gather3DConsumerCapture::DwordCount>& stores,
+    std::span<const DreamsSculptAtlasUnknownObservation> unknown_observations,
+    std::span<const u8> unknown_readback, u32 writable_same_backing_bindings) {
     auto& capture = g_dreams_sculpt_atlas_lineage;
     using Phase = DreamsSculptAtlasLineageCapture::Phase;
-    const bool is_prepare = shader == Shader::DreamsCompat::SculptAtlasPrepareShader &&
-                            capture.phase == Phase::Waiting2f;
+    const bool is_prepare =
+        shader == Shader::DreamsCompat::SculptAtlasPrepareShader &&
+        (capture.phase == Phase::Waiting2f || capture.phase == Phase::WaitingF030);
     const bool is_compact = shader == Shader::DreamsCompat::SculptSurfaceCompactShader &&
                             capture.phase == Phase::WaitingF030;
     if (!is_prepare && !is_compact) {
@@ -3947,7 +4050,11 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
         return false;
     }
 
-    const auto output = capture.directory / (is_prepare ? "2f" : "f030") / "gather";
+    if (is_prepare && capture.prepares.size() >= DreamsSculptAtlasLineageMax2fCaptures) {
+        FailDreamsSculptAtlasLineage("2f capture count exceeded its bounded cap at record time");
+        return false;
+    }
+    const auto output = DreamsSculptAtlasLineageConsumerOutput(shader, sequence);
     std::error_code error;
     std::filesystem::create_directories(output, error);
     if (error) {
@@ -3965,13 +4072,47 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
                     WriteDreamsCaptureWords(output / "stores.bin", stores, stores_hash) &&
                     VerifyDreamsCaptureBytes(output / "stores.bin", stores_bytes, stores_hash);
 
+    u32 unique_unknown_texels{};
+    for (const auto& observation : unknown_observations) {
+        if (observation.eligible) {
+            unique_unknown_texels = std::max(unique_unknown_texels, observation.readback_index + 1);
+        }
+    }
+    if (unique_unknown_texels > DreamsSculptAtlasLineageMaxUnknownTexels ||
+        unknown_readback.size() != unique_unknown_texels) {
+        FailDreamsSculptAtlasLineage(
+            "targeted UNKNOWN readback exceeded its cap or was incomplete");
+        return false;
+    }
+    if (!unknown_readback.empty()) {
+        const auto unknown_file = output / "unknown-current-r8.bin";
+        files_ok &= VerifyDreamsCaptureBytes(unknown_file, unknown_readback,
+                                             HashDreamsTraceBytes(unknown_readback));
+    }
+    std::string unknown_rows =
+        "site\tsource\tx\ty\tz\teligible\treadback_index\tpost_consumer_byte\n";
+    for (const auto& observation : unknown_observations) {
+        const u32 post_byte = observation.eligible ? unknown_readback[observation.readback_index]
+                                                   : std::numeric_limits<u32>::max();
+        unknown_rows += fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#x}\n", observation.site,
+                                    observation.source, observation.x, observation.y, observation.z,
+                                    observation.eligible, observation.readback_index, post_byte);
+    }
+    const auto unknown_rows_file = output / "unknown-current.tsv";
+    const std::span<const u8> unknown_rows_bytes{reinterpret_cast<const u8*>(unknown_rows.data()),
+                                                 unknown_rows.size()};
+    files_ok &= WriteDreamsCaptureText(unknown_rows_file, unknown_rows) &&
+                VerifyDreamsCaptureBytes(unknown_rows_file, unknown_rows_bytes,
+                                         HashDreamsTraceBytes(unknown_rows_bytes));
+
     u32 matched{};
     u32 mismatched{};
     u32 unknown{};
     std::string gather_rows =
         "site\tsource\tx\ty\tz\tbinding\tcomponent\tsampled_raw\tsampled_byte\t"
         "producer_actual\tproducer_expected\tproducer_mismatches\twriter_index\t"
-        "writer_sequence\tstatus\n";
+        "writer_sequence\tstatus\tpost_consumer_valid\tpost_consumer_byte\t"
+        "post_consumer_matches_sample\treadback_index\n";
     for (u32 site = 0; site < Gather3DCapture::MaxSites; ++site) {
         if ((gather_seen & (1U << site)) == 0) {
             continue;
@@ -4008,6 +4149,9 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
             u32 producer_mismatches{};
             u32 writer_index = std::numeric_limits<u32>::max();
             u64 writer_sequence{};
+            bool post_consumer_valid{};
+            u32 post_consumer_byte = std::numeric_limits<u32>::max();
+            u32 readback_index = std::numeric_limits<u32>::max();
             std::string_view status = "UNKNOWN";
             if (brick_it != capture.bricks.end()) {
                 const u32 lane = (static_cast<u32>(y) & 7U) * 8U + (static_cast<u32>(x) & 7U);
@@ -4027,12 +4171,23 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
                 }
             } else {
                 ++unknown;
+                const auto observation = std::find_if(
+                    unknown_observations.begin(), unknown_observations.end(),
+                    [&](const auto& item) { return item.site == site && item.source == source; });
+                if (observation != unknown_observations.end() && observation->eligible) {
+                    readback_index = observation->readback_index;
+                    post_consumer_byte = unknown_readback[readback_index];
+                    post_consumer_valid = true;
+                }
             }
-            gather_rows +=
-                fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\n",
+            gather_rows += fmt::format(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:#010x}\t{:#x}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{}"
+                "\t{}\t{}\n",
                             site, source, x, y, z, binding, component, sampled_raw, sampled_byte,
                             producer_actual, producer_expected, producer_mismatches, writer_index,
-                            writer_sequence, status);
+                writer_sequence, status, post_consumer_valid, post_consumer_byte,
+                post_consumer_valid && sampled_valid && post_consumer_byte == sampled_byte,
+                readback_index);
         }
     }
 
@@ -4079,16 +4234,19 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
             "gather_seen\t{:#x}\n"
             "store_seen\t{:#x}\nmatched\t{}\nmismatched\t{}\nunknown\t{}\n"
             "gather_fnv1a64\t{:#018x}\nstores_fnv1a64\t{:#018x}\n"
+            "unknown_current_scope\tpost_consumer_not_value_at_gather_time\n"
+            "unknown_observations\t{}\nunknown_unique_texels\t{}\n"
+            "post_consumer_writable_same_backing_bindings\t{}\n"
             "resource_identity\texact_same_backing_and_byte_coordinates\n",
             shader, sequence, Shader::DreamsCompat::ImageGather3DSampleWindow::MaxCandidatesPerSite,
-            gather_seen, store_seen, matched, mismatched, unknown, gather_hash, stores_hash));
+            gather_seen, store_seen, matched, mismatched, unknown, gather_hash, stores_hash,
+            unknown_observations.size(), unique_unknown_texels, writable_same_backing_bindings));
     if (!files_ok) {
         FailDreamsSculptAtlasLineage("failed to write the consumer gather/store files");
         return false;
     }
 
-    auto& result = is_prepare ? capture.prepare : capture.compact;
-    result = {
+    const DreamsSculptAtlasLineageConsumerResult result{
         .complete = true,
         .sequence = sequence,
         .gather_seen = gather_seen,
@@ -4099,13 +4257,53 @@ static bool RecordDreamsSculptAtlasLineageConsumer(
     };
     capture.consumer_attempts = 0;
     if (is_prepare) {
-        capture.phase = Phase::WaitingF030;
+        auto aggregate = capture.prepare;
+        aggregate.complete = true;
+        aggregate.sequence = sequence;
+        aggregate.gather_seen |= gather_seen;
+        aggregate.store_seen |= store_seen;
+        aggregate.matched += matched;
+        aggregate.mismatched += mismatched;
+        aggregate.unknown += unknown;
+        const u64 first_sequence =
+            capture.prepares.empty() ? sequence : capture.first_prepare_sequence;
+        const auto aggregate_text = fmt::format(
+            "schema\t1\nmax_captures\t{}\ncapture_count\t{}\n"
+            "captured_dispatch_count\t{}\nfirst_sequence\t{}\n"
+            "last_sequence\t{}\ngather_seen_or\t{:#x}\nstore_seen_or\t{:#x}\n"
+            "matched\t{}\nmismatched\t{}\nunknown\t{}\n",
+            DreamsSculptAtlasLineageMax2fCaptures, capture.prepares.size() + 1,
+            capture.prepares.size() + 1, first_sequence, sequence, aggregate.gather_seen,
+            aggregate.store_seen, aggregate.matched, aggregate.mismatched, aggregate.unknown);
+        const auto aggregate_file = capture.directory / "2f" / "aggregate.tsv";
+        const std::span<const u8> aggregate_bytes{
+            reinterpret_cast<const u8*>(aggregate_text.data()), aggregate_text.size()};
+        if (!WriteDreamsCaptureText(aggregate_file, aggregate_text) ||
+            !VerifyDreamsCaptureBytes(aggregate_file, aggregate_bytes,
+                                      HashDreamsTraceBytes(aggregate_bytes))) {
+            FailDreamsSculptAtlasLineage("failed to write or verify the 2f aggregate");
+            return false;
+        }
+        if (!AppendDreamsCaptureText(capture.directory / "2f-captures.tsv",
+                                     fmt::format("{}\t{}\t{:#x}\t{:#x}\t{}\t{}\t{}\n",
+                                                 capture.prepares.size(), sequence, gather_seen,
+                                                 store_seen, matched, mismatched, unknown))) {
+            FailDreamsSculptAtlasLineage("failed to append the 2f attempt summary");
+            return false;
+        }
+        if (capture.prepares.empty()) {
+            capture.first_prepare_sequence = sequence;
         capture.deadline_sequence =
             sequence > std::numeric_limits<u64>::max() - DreamsSculptAtlasLineageMaxDispatchGap
                 ? std::numeric_limits<u64>::max()
                 : sequence + DreamsSculptAtlasLineageMaxDispatchGap;
         capture.f030_deadline_sequence = capture.deadline_sequence;
+        }
+        capture.prepares.push_back(result);
+        capture.prepare = aggregate;
+        capture.phase = Phase::WaitingF030;
     } else {
+        capture.compact = result;
         FinalizeDreamsSculptAtlasLineage();
     }
     return true;
@@ -21193,6 +21391,11 @@ void Rasterizer::DispatchDirect(
             lineage_eligible = false;
         }
         capture_lineage_consumer = lineage_eligible;
+        if (capture_lineage_consumer &&
+            cs.pgm_hash == Shader::DreamsCompat::SculptAtlasPrepareShader &&
+            g_dreams_sculpt_atlas_lineage.prepares.empty()) {
+            g_dreams_sculpt_atlas_lineage.writers_frozen = true;
+        }
     }
 
     const bool capture_this_image_gather = capture_all_image_gather || capture_lineage_consumer;
@@ -23507,9 +23710,186 @@ void Rasterizer::DispatchDirect(
         }
         if (image_gather_3d_capture_lineage_armed) {
             if (capture_seen) {
+                auto collected_unknown_observations =
+                    CollectDreamsSculptAtlasUnknownObservations(capture);
+                std::vector<DreamsSculptAtlasUnknownObservation> unknown_observations;
+                std::vector<u8> unknown_readback;
+                u32 writable_same_backing_bindings{};
+                bool unknown_capture_ok = collected_unknown_observations.has_value();
+                if (!unknown_capture_ok) {
+                    FailDreamsSculptAtlasLineage(
+                        "consumer exposed more than eight unique producer-UNKNOWN texels");
+                } else {
+                    unknown_observations = std::move(*collected_unknown_observations);
+                    const auto consumer_identity = describe_dreams_image_binding(0);
+                    for (u32 binding = 0; binding < image_bindings.size(); ++binding) {
+                        const auto& desc = image_bindings[binding].second;
+                        writable_same_backing_bindings +=
+                            desc.type == VideoCore::TextureCache::BindingType::Storage &&
+                            SameDreamsAtlasBacking(consumer_identity,
+                                                   describe_dreams_image_binding(binding));
+                    }
+                    bool readback_ok = SameDreamsAtlasByteCoordinates(
+                        g_dreams_sculpt_atlas_lineage.producer_image, consumer_identity);
+                    std::vector<std::array<s32, 3>> unique_coordinates;
+                    std::vector<vk::BufferImageCopy> copies;
+                    VideoCore::ImageId consumer_image_id{};
+                    if (readback_ok && !image_bindings.empty()) {
+                        consumer_image_id = image_bindings[0].first;
+                        const auto& image = texture_cache.GetImage(consumer_image_id);
+                        const auto& desc = image_bindings[0].second;
+                        readback_ok = consumer_image_id && image.info.num_bits == 8 &&
+                                      image.info.resources.layers == 1 &&
+                                      desc.view_info.range.base.level == 0 &&
+                                      desc.view_info.range.base.layer == 0;
+                        for (auto& observation : unknown_observations) {
+                            if (!observation.eligible) {
+                                continue;
+                            }
+                            const bool in_bounds =
+                                observation.x >= 0 && observation.y >= 0 && observation.z >= 0 &&
+                                static_cast<u32>(observation.x) < image.info.size.width &&
+                                static_cast<u32>(observation.x) <
+                                    consumer_identity.descriptor_width &&
+                                static_cast<u32>(observation.y) < image.info.size.height &&
+                                static_cast<u32>(observation.y) <
+                                    consumer_identity.descriptor_height &&
+                                static_cast<u32>(observation.z) < image.info.size.depth &&
+                                static_cast<u32>(observation.z) <
+                                    consumer_identity.descriptor_depth;
+                            if (!in_bounds) {
+                                observation.eligible = false;
+                                observation.readback_index = std::numeric_limits<u32>::max();
+                                continue;
+                            }
+                            const std::array coordinate{observation.x, observation.y,
+                                                        observation.z};
+                            auto existing = std::find(unique_coordinates.begin(),
+                                                      unique_coordinates.end(), coordinate);
+                            if (existing == unique_coordinates.end()) {
+                                if (unique_coordinates.size() >=
+                                    DreamsSculptAtlasLineageMaxUnknownTexels) {
+                                    readback_ok = false;
+                                    break;
+                                }
+                                const u32 index = static_cast<u32>(unique_coordinates.size());
+                                unique_coordinates.push_back(coordinate);
+                                copies.push_back(vk::BufferImageCopy{
+                                    .bufferOffset = static_cast<u64>(index) * 4,
+                                    .bufferRowLength = 1,
+                                    .bufferImageHeight = 1,
+                                    .imageSubresource =
+                                        {
+                                            .aspectMask = vk::ImageAspectFlagBits::eColor,
+                                            .mipLevel = 0,
+                                            .baseArrayLayer = 0,
+                                            .layerCount = 1,
+                                        },
+                                    .imageOffset = {observation.x, observation.y, observation.z},
+                                    .imageExtent = {1, 1, 1},
+                                });
+                                existing = unique_coordinates.begin() + index;
+                            }
+                            observation.readback_index = static_cast<u32>(
+                                std::distance(unique_coordinates.begin(), existing));
+                        }
+                    } else if (!unknown_observations.empty()) {
+                        readback_ok = false;
+                    }
+
+                    if (readback_ok && !copies.empty()) {
+                        const auto output = DreamsSculptAtlasLineageConsumerOutput(
+                            image_gather_3d_capture_pending_shader, g_compute_dispatch_sequence);
+                        std::error_code directory_error;
+                        std::filesystem::create_directories(output, directory_error);
+                        const u64 slots_size = static_cast<u64>(copies.size()) * 4;
+                        auto& image = texture_cache.GetImage(consumer_image_id);
+                        const auto saved_state = image.backing->state;
+                        const auto saved_subresource_states = image.backing->subresource_states;
+                        auto& unknown_download_buffer =
+                            buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download);
+                        auto [slots, slots_offset] =
+                            unknown_download_buffer.Map(slots_size, 4, false);
+                        if (slots == nullptr) {
+                            scheduler.Finish();
+                            std::tie(slots, slots_offset) =
+                                unknown_download_buffer.Map(slots_size, 4);
+                        }
+                        readback_ok = !directory_error && slots != nullptr &&
+                                      SameDreamsAtlasView(consumer_identity,
+                                                          describe_dreams_image_binding(0));
+                        if (readback_ok) {
+                            unknown_download_buffer.Commit();
+                            for (auto& copy : copies) {
+                                copy.bufferOffset += slots_offset;
+                            }
+                            image.Download(copies, unknown_download_buffer.Handle(), slots_offset,
+                                           slots_size);
+                            const auto restore_cmdbuf = scheduler.CommandBuffer();
+                            if (saved_subresource_states.empty()) {
+                                const auto barriers =
+                                    image.GetBarriers(saved_state.layout, saved_state.access_mask,
+                                                      saved_state.pl_stage, std::nullopt);
+                                if (!barriers.empty()) {
+                                    restore_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                                        .imageMemoryBarrierCount =
+                                            static_cast<u32>(barriers.size()),
+                                        .pImageMemoryBarriers = barriers.data(),
+                                    });
+                                }
+                            } else {
+                                for (u32 level = 0; level < image.info.resources.levels; ++level) {
+                                    for (u32 layer = 0; layer < image.info.resources.layers;
+                                         ++layer) {
+                                        const u32 index =
+                                            level * image.info.resources.layers + layer;
+                                        const auto& state = saved_subresource_states[index];
+                                        const VideoCore::SubresourceRange range{
+                                            .base = {.level = level, .layer = layer},
+                                            .extent = {.levels = 1, .layers = 1},
+                                        };
+                                        const auto barriers = image.GetBarriers(
+                                            state.layout, state.access_mask, state.pl_stage, range);
+                                        if (!barriers.empty()) {
+                                            restore_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                                                .imageMemoryBarrierCount =
+                                                    static_cast<u32>(barriers.size()),
+                                                .pImageMemoryBarriers = barriers.data(),
+                                            });
+                                        }
+                                    }
+                                }
+                                image.backing->state = saved_state;
+                                image.backing->subresource_states = saved_subresource_states;
+                            }
+                            scheduler.Finish();
+                            unknown_download_buffer.InvalidateMappedRange(slots_offset, slots_size);
+                        }
+                        if (readback_ok) {
+                            unknown_readback.resize(copies.size());
+                            for (u32 index = 0; index < copies.size(); ++index) {
+                                unknown_readback[index] = slots[index * 4];
+                            }
+                            u64 compact_hash{};
+                            readback_ok =
+                                WriteDreamsCaptureBytes(output / "unknown-current-r8.bin",
+                                                        unknown_readback, compact_hash) &&
+                                VerifyDreamsCaptureBytes(output / "unknown-current-r8.bin",
+                                                         unknown_readback, compact_hash);
+                        }
+                    }
+                    if (!readback_ok && !unknown_observations.empty()) {
+                        FailDreamsSculptAtlasLineage(
+                            "eligible targeted producer-UNKNOWN R8 readback failed");
+                        unknown_capture_ok = false;
+                    }
+                }
+                if (unknown_capture_ok) {
                 RecordDreamsSculptAtlasLineageConsumer(
                     image_gather_3d_capture_pending_shader, g_compute_dispatch_sequence,
-                    describe_dreams_image_binding(0), capture, consumer_capture);
+                        describe_dreams_image_binding(0), capture, consumer_capture,
+                        unknown_observations, unknown_readback, writable_same_backing_bindings);
+                }
             } else {
                 FailDreamsSculptAtlasLineage(
                     "eligible consumer dispatch did not reach both instrumented gather sites");
