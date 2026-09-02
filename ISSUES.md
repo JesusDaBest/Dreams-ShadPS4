@@ -1,42 +1,57 @@
 # Open Issues
 
-## 1. Correct the `0xce3b8413` sculpt atlas raymarch/coverage stage
+## 1. Find why the scene-record producer publishes zero or an incomplete prefix
+
+Capture flattened SRT words 41 and 18 immediately before queue producer `0x2bfebd3c`. Refresh word
+41 once through the existing focused readback to distinguish stale host/SRT state from a genuinely
+empty producer. If input is nonzero, capture the producer predicate, ordered payload, returned
+prefix, computed total, and indirect X publication.
+
+## 2. Resolve Liverpool `DS_ORDERED_COUNT` address units
+
+The September 2 x4 address family is not verified and contradicts the committed semantic tests.
+The user experienced severe lag in that build, but the run does not prove address units caused it.
+Restore the better-supported pre-x4 interpretation, then capture both candidate slots and run a
+separate warm-cache performance A/B. Generic lowering and every exact replay path must use the same
+proven unit.
+
+## 3. Correct the `0xce3b8413` sculpt atlas raymarch/coverage stage
 
 The known cube is now a stable, filled volume, but its surface is a regular panel grid. Capture both
 fragment-shader sample sites, exact atlas neighborhoods, and the discard decision for one fixed
 draw. Compare the GPU samples with software interpolation before changing image or shader code.
 
-## 2. Verify the final DCC decoder and materials
+## 4. Verify the final DCC decoder and materials
 
 The fullscreen `0xdcc325c2` pass consumes the CE3 visibility/depth targets and writes the final
 G-buffer. Investigate it after CE3 coverage is proven, especially for color or material errors.
 
-## 3. Expand sculpt, paint, and character regression coverage
+## 5. Expand sculpt, paint, and character regression coverage
 
 Confirm a sculpt preview, placed sculpt, paint stroke, character, and at least one premade scene.
 They must remain visible and selectable while the camera and LOD change.
 
-## 4. Preserve the fixed ordered-count path
+## 6. Preserve the fixed ordered-count path
 
 Keep the exact `0x4ebeffd2` collect/prefix/replay result stable. Add focused regression coverage for
 guest logical group order, final counter publication, cache revision, and repeated launches.
 
-## 5. Measure performance without capture waits
+## 7. Measure performance without capture waits
 
 The validated cube view reached 30 FPS, but other scenes have been much slower. Profile only after
 disabling forced readbacks, capture waits, and diagnostic scheduler finishes.
 
-## 6. Verify startup, lighting, floors, and save behavior
+## 8. Verify startup, lighting, floors, and save behavior
 
 Repeat clean launches and confirm homespace lighting, edit floors, intro presentation, save loading,
 and the corrected false-full save accounting remain stable.
 
-## 7. Investigate remaining crashes independently
+## 9. Investigate remaining crashes independently
 
 Capture a native stack and message for tutorial or gadget-selection crashes before assigning them
 to the sculpt renderer.
 
-## 8. Reduce diagnostics and isolate upstream-quality changes
+## 10. Reduce diagnostics and isolate upstream-quality changes
 
 Separate title-specific investigation code, general GPU-emulation corrections, and one-shot capture
 facilities. Audit generalized changes against other shadPS4 games before upstream review.

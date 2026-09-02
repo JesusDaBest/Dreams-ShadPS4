@@ -1,5 +1,33 @@
 # Fixes Tried
 
+## September 2 ordered-counter address-unit WIP
+
+### Preserved but not accepted as a fix
+
+- Changed generic and title-specific ordered-counter indices to an x4 family so every exact replay
+  path used the same proposed M0 unit.
+- Bumped affected shader-cache revisions and rebuilt successfully.
+- Preserved bounded atlas lineage, GatherVoxels write provenance, f030-to-5ac pair validation,
+  writer history, exact-bound snapshots, and producer-count refresh support.
+
+### Result
+
+- A mixed-unit run used `0x508` inside `0x2bfebd3c` while host replay/capture still sampled the
+  older `/4` counter family. It published indirect X = 0, but its counter table did not observe the
+  slot actually used by the shader.
+- The user experienced severe enough edit-mode lag in the complete x4-family build that they could
+  not type; the exact process was stopped. The capture does not prove x4 caused the lag.
+- Logged dispatch sizes before the stall were modest rather than obviously runaway.
+- The test does not verify the address-unit interpretation and must not replace the August 29
+  checkpoint.
+
+### Required falsifier
+
+Restore the better-supported pre-x4 interpretation first, then capture both `0x142` and `0x508`
+around 2bf together with its predicate, payload, atomic return, indirect X, traversal dimensions,
+and draw instance count. Independently capture flattened SRT word 41 before attributing zero output
+to `DS_ORDERED_COUNT` addressing.
+
 ## August 29 retained checkpoint
 
 ### Confirmed and retained

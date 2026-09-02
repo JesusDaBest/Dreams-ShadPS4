@@ -1,5 +1,33 @@
 # Detailed Discoveries
 
+## September 2 result — empty scene originates before rasterization
+
+A trigger-gated held-state capture produced a fully empty 3D scene while UI still rendered. The
+affected indexed scene draw had `indexCount=14` and `instanceCount=0`. Immediately upstream,
+queue producer `0x2bfebd3c` published indirect X = 0, so traversal shader `0xb535c6c8` dispatched
+`(0,1,1)` and could not produce useful records.
+
+This is direct evidence of an upstream producer/compaction omission. It does not explain every
+dark, jittery, panelled, or cube-like render, but it rules out rasterization as the cause of this
+specific empty-scene state.
+
+The capture did not record flattened SRT words 41 and 18. Word 41 comes from SRT root + `0x64`
+and bounds producer input. The existing focused producer-count refresh is therefore the next
+discriminator: a zero-to-nonzero change identifies stale flattened-SRT/coherency state; a stable
+zero moves the trace to the real count writer; a nonzero input with zero publication moves it to
+the producer predicate and ordered-count payload.
+
+### Ordered-counter address experiment is unresolved
+
+The September 2 WIP changed generic and exact replay counter addresses to an x4 family, including
+`0x142 -> 0x508` and `0x100 -> 0x400`. Its C++ now contradicts the committed semantic model/tests,
+which require the older `/4` family. A mixed-unit run used `0x508` in 2bf but sampled only `/4`
+counters, so its zero table is not decisive. The user also experienced severe lag in the full-x4
+build, but no timing capture attributes that lag to address units. The `/4` interpretation is
+better supported; neither has yet passed the controlled Liverpool discriminator.
+
+The full source state and contradictory evidence are preserved in [HANDOFF_20260902.md](HANDOFF_20260902.md).
+
 ## August 29 result — full volume, remaining panel surface
 
 This section supersedes the August 19 `DS_ORDERED_COUNT` status below while preserving that earlier
@@ -74,6 +102,11 @@ moved, so the records or positions were still wrong. The correction is retained 
 pipeline/command combination was invalid and hid the next failure.
 
 ## `DS_ORDERED_COUNT` is not an ordinary atomic
+
+Address-unit caution: the field summary below records the August 19 interpretation of later RDNA
+documentation. The September 2 investigation reopened whether Liverpool's encoded M0 high-half
+must be divided by four when converted to a host GDS dword index. See the current section above;
+do not use this historical wording alone to choose counter addresses.
 
 AMD's RDNA instruction-set documentation defines `DS_ORDERED_COUNT` as a wave-ordered operation.
 Requests may reach GDS in arbitrary execution order, but are processed in guest wave-creation order.

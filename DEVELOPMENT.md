@@ -1,5 +1,26 @@
 # Continue Development
 
+## September 2 continuation state
+
+Read [HANDOFF_20260902.md](HANDOFF_20260902.md) before using the older checkpoint workflow below.
+The August 29 source and executable remain the last preserved visual checkpoint. The complete
+September 2 experimental source is preserved separately as:
+
+```text
+branch: codex/wip-native-doc-addressing-20260902
+commit: f553e23
+patch:  patches/0001-WIP-preserve-September-2-Dreams-ordered-count-invest.patch
+sha256: BE947C77B4A71BFBA2581BBA877ABC16BE60CCF458355340ABA0AE05D5E68108
+```
+
+That WIP includes valuable bounded diagnostics and exact replay work, but also an unverified x4
+ordered-counter address experiment. The user experienced severe edit-mode lag in that build, but
+causality is unresolved. Do not treat it as the known-good build or merge it wholesale as a fix.
+
+The immediate proof-producing task is to resolve the Liverpool address unit from official AMD
+documentation and capture the producer bound at flattened SRT word 41. Keep the diagnostic source
+while excluding the unverified x4 family for the first safe rerun.
+
 ## Exact source state
 
 Start from upstream shadPS4 commit:
@@ -58,7 +79,10 @@ tools/tests/dreams_ordered_replay
 Run `python -m unittest -v` in each. The checkpoint result was 68 passes plus one optional
 real-capture skip.
 
-## Current root-cause order
+## Historical August 29 downstream root-cause order
+
+Use this order only after the upstream producer count/prefix is proven complete. The September 2
+zero-instance capture makes the producer-count test above the current first task.
 
 1. Capture `0xce3b8413` sample coordinates, both sampled values, exact atlas neighborhoods, and its
    discard decision for the known cube draw.

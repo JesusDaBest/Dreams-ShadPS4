@@ -1,5 +1,25 @@
 # Reproduction Notes
 
+## September 2 focused producer-count test
+
+Do not use the September 2 WIP executable as a baseline performance build. For the next diagnostic
+run, start from a diagnostic-safe build with a warm shader cache and enable only:
+
+```text
+SHADPS4_DREAMS_PRODUCER_COUNT_READBACK=1
+```
+
+Enter the fixed scene and trigger the held/edit state once. Preserve the log before another launch.
+The result is meaningful only if it records flattened SRT word 41 before and after refresh, word 18,
+the producer's final count, and indirect X:
+
+- word 41 changes zero to nonzero: stale flattened-SRT / GPU-to-CPU coherency candidate;
+- word 41 remains zero: trace its writer/publication edge;
+- word 41 is nonzero while the producer publishes zero: capture its predicate and ordered payload.
+
+Do not combine this with broad ordered-counter, image, or atlas traces; those add waits and have
+made the test machine unusable.
+
 ## Exact checkpoint
 
 - Windows

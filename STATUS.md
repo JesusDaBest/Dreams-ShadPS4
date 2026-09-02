@@ -4,7 +4,7 @@
 
 - Title: `Dreams`
 - Serial: `CUSA04301`
-- Status date: August 30, 2026
+- Status date: September 2, 2026
 - Playability: **not playable; major visual defects remain**
 - Source base: `555c458c9fdd33cb4686492374519c7bb112a891`
 - Validated executable SHA-256:
@@ -32,6 +32,11 @@
 - Other scenes and camera distances can still expose culling, LOD, material, or performance issues.
 - In a controlled eleven-primitive scene, sphere and both donuts never reached producer
   `0x2bfebd3c`; several surviving primitives rendered as cube-like proxies.
+- In a later held-state capture, `0x2bfebd3c` published indirect X = 0, traversal dispatched
+  `(0,1,1)`, and an indexed scene draw reached `instanceCount=0` while UI still rendered.
+- The user experienced severe edit-mode lag in the September 2 x4 ordered-counter build. No
+  oversized dispatch was logged, and cache misses/stale pipelines confound the run, so causality
+  remains unresolved.
 - The experimental source contains extensive diagnostics and title-specific paths and is not yet an
   upstream-ready general shadPS4 change.
 - Online community content, historical Dreams servers, and PSN entitlement behavior are not
@@ -44,12 +49,13 @@ than host atomic arrival order. Exact GPU collect/prefix/replay fixed the missin
 symptoms in the known scene.
 
 The current highest-priority loss is upstream of visible rendering. Producer `0x2bfebd3c` received
-only eight of eleven expected primitive records, at x=`0,1,3,6,7,8,9,10`. The next step is to trace
-the CPU-published count, ordered-compaction input/output, release/acquire boundary, and exact
-consumer prefix to find the first edge where eleven becomes eight. The panel pattern and dark
-material state remain separate downstream questions.
+only eight of eleven expected primitive records in one capture, and published zero indirect X in a
+later fully empty held state. The next discriminator is the producer bound at flattened SRT word
+41 (`SRT root + 0x64`): refresh it once to distinguish stale host/SRT state from a genuinely empty
+input, then trace the first incorrect predicate, ordered prefix, or publication edge. The panel
+pattern and dark material state remain separate downstream questions.
 
-See [HANDOFF_20260830.md](HANDOFF_20260830.md) for the complete evidence and continuation order.
+See [HANDOFF_20260902.md](HANDOFF_20260902.md) for the complete evidence and continuation order.
 
 ## Rejected current hypothesis
 
