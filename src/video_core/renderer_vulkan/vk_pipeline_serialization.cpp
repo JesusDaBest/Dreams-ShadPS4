@@ -14,10 +14,10 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-// Liverpool DS_ORDERED_COUNT supplies its ordered-counter base in M0's high half in bytes, and
-// OFFSET0 is byte encoded too. Version 17 incorrectly treated the M0 base as a dword index,
-// aliasing Dreams compaction counters into unrelated guest GDS words.
-static constexpr u32 ShaderBinaryVersion = 18u;
+// DS_ORDERED_COUNT supplies its M0 high-half base in dwords while OFFSET0 is byte encoded.
+// Version 18 incorrectly divided the already-dword base by four, addressing the wrong GDS
+// dwords and corrupting ordered output.
+static constexpr u32 ShaderBinaryVersion = 19u;
 static constexpr u32 ShaderMetaVersion = 6u;
 static constexpr u32 PreviousShaderMetaVersion = 5u;
 static constexpr u32 PipelineKeyVersion = 3u;

@@ -786,12 +786,11 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
         const u32 offset_bytes = (control >> 8) & 0xff;
         const IR::U32 m0{inst.Arg(0)};
 
-        // Liverpool stores the ordered-counter base in M0[31:16] in bytes. OFFSET0 is byte
-        // encoded as well, so combine them before converting to the host buffer's dword index.
-        const IR::U32 base_bytes = ir.BitwiseAnd(
+        // DS_ORDERED_COUNT stores an already dword-indexed base in M0[31:16], unlike normal GDS
+        // addressing. OFFSET0 remains byte encoded, so only OFFSET0 is divided by four.
+        const IR::U32 base_dwords = ir.BitwiseAnd(
             ir.ShiftRightLogical(m0, ir.Imm32(16)), ir.Imm32(0xfffc));
-        const IR::U32 index = ir.ShiftRightLogical(
-            ir.IAdd(base_bytes, ir.Imm32(offset_bytes)), ir.Imm32(2));
+        const IR::U32 index = ir.IAdd(base_dwords, ir.Imm32(offset_bytes >> 2));
         inst.SetArg(0, index);
         inst.SetArg(3, ir.Imm32(control | (binding << 16)));
     } else {

@@ -880,12 +880,16 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_storage, bool is_writte
 };
 
 void EmitContext::DefineBuffers() {
-    if (NeedsImageGather3DCapture(info, stage, l_stage)) {
+    const bool needs_gather_voxels_write_capture =
+        DreamsCompat::CaptureGatherVoxelsImageWrites(info.pgm_hash) &&
+        stage == Stage::Compute && l_stage == LogicalStage::Compute;
+    if (NeedsImageGather3DCapture(info, stage, l_stage) ||
+        needs_gather_voxels_write_capture) {
         auto gds =
             std::ranges::find(info.buffers, BufferType::GdsBuffer, &BufferResource::buffer_type);
         if (gds == info.buffers.end()) {
             ASSERT_MSG(info.buffers.size() < NUM_BUFFERS,
-                       "3D ImageGather capture has no spare buffer descriptor");
+                       "Dreams image capture has no spare buffer descriptor");
             info.buffers.push_back({
                 .used_types = IR::Type::U32,
                 .inline_cbuf = AmdGpu::Buffer::Null(),

@@ -68,7 +68,7 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, u64 write_pc = 0);
-    bool ReadMemory(VAddr addr, u64 size);
+    bool ReadMemory(VAddr addr, u64 size, u64 read_pc = 0);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);

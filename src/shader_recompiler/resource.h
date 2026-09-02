@@ -153,6 +153,8 @@ struct PushData {
     static constexpr u32 HostDataIndex = BufOffsetIndex + (NUM_BUFFERS + 15) / 16;
     // Compute dispatches use this host-only push slot to select an ordered-count phase.
     static constexpr u32 DreamsOrderedPhase = 0;
+    // A one-shot sculpt-lineage trace arms GatherVoxels' passive atlas-write provenance here.
+    static constexpr u32 DreamsGatherVoxelsWriteCapture = 1;
 
     float xoffset;
     float yoffset;

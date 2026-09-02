@@ -10,16 +10,17 @@
 
 namespace Shader::DreamsCompat {
 
-// AMD encodes both the M0 high-half ordered-count base and OFFSET0 in bytes. Keep every Dreams
-// replay path on the same byte-to-dword conversion as the generic shader lowering.
-constexpr u32 OrderedCounterDword(u32 m0_base_bytes, u32 control) {
-    return ((m0_base_bytes & 0xfffc) + ((control >> 8) & 0xff)) >> 2;
+// DS_ORDERED_COUNT is the exception to normal GDS addressing: M0[31:16] already contains a
+// dword-indexed ordered-counter base, while OFFSET0 remains byte encoded. The low two base bits
+// are ignored by the guest hardware.
+constexpr u32 OrderedCounterDword(u32 m0_base_dwords, u32 control) {
+    return (m0_base_dwords & 0xfffc) + (((control >> 8) & 0xff) >> 2);
 }
 
 constexpr u64 TraversalShader = 0xb535c6c8;
-// Bump when b535 traversal lowering changes incompatibly. Revision 6 includes the exact
-// unordered NGE comparison semantics used by its near-detail refinement path.
-constexpr u32 TraversalCacheRevision = 10;
+// Bump when b535 traversal lowering changes incompatibly. Revision 11 uses Liverpool's
+// dword-indexed M0 ordered-counter base instead of the legacy divided addresses.
+constexpr u32 TraversalCacheRevision = 11;
 // The instruction microtrace is a separate, opt-in traversal permutation. Its revision is kept
 // separate from the guest-visible traversal lowering so diagnostics never invalidate or replace
 // the normal Dreams shader.
@@ -27,37 +28,37 @@ constexpr u32 B535InstructionTraceCacheRevision = 5;
 constexpr u64 QueueProducerShader = 0x2bfebd3c;
 constexpr u64 QueueProducerShaderAlt = 0x692f0f7f;
 // Bump when the Dreams-only 692 queue-producer ordered-count lowering changes incompatibly.
-constexpr u32 QueueProducerAltCacheRevision = 5;
+constexpr u32 QueueProducerAltCacheRevision = 6;
 constexpr u64 CompactClassifyShader = 0xcbac06d2;
 constexpr u64 CompactScatterShader = 0xd4532ff4;
 constexpr u64 SceneCompactShader = 0x3937a849;
 // Bump when the Dreams-only 393 SceneCompact ordered-count lowering changes incompatibly.
-constexpr u32 SceneCompactCacheRevision = 2;
+constexpr u32 SceneCompactCacheRevision = 3;
 constexpr u64 SpriteCullShader = 0xfd2a2c3b;
 constexpr u64 SpriteCullShaderAlt = 0xe4dcd599;
 constexpr u64 SpriteCullShaderCusa04301 = 0x0ffa5e6b;
 constexpr u64 IndirectArgsShader = 0x90272fc4;
 // Bump when the Dreams-only 902 ordered-count lowering changes incompatibly.
-constexpr u32 IndirectArgsCacheRevision = 7;
-// 90272fc4 uses one global instance-prefix ordered counter at dword 0xa6 and four per-row
-// command-reservation counters at dwords 0xa7 through 0xaa. Their initial values are
+constexpr u32 IndirectArgsCacheRevision = 8;
+// 90272fc4 uses one global instance-prefix ordered counter at dword 0x298 and four per-row
+// command-reservation counters at dwords 0x29c, 0x2a0, 0x2a4, and 0x2a8. Their initial values are
 // guest GDS state; the exact prefix pass must preserve them rather than inventing a shader-scoped
 // reset.
-constexpr u32 IndirectArgsOrderedGlobalCounterDword = 0xa6;
-constexpr u32 IndirectArgsOrderedRowCounterFirstDword = 0xa7;
-constexpr u32 IndirectArgsOrderedRowCounterStrideDwords = 1;
+constexpr u32 IndirectArgsOrderedGlobalCounterDword = 0x298;
+constexpr u32 IndirectArgsOrderedRowCounterFirstDword = 0x29c;
+constexpr u32 IndirectArgsOrderedRowCounterStrideDwords = 4;
 constexpr u64 VisibilityCandidateCompactShader = 0xd8b4ddb5;
 // Bump when the Dreams-only d8 visibility-candidate ordered-count lowering changes incompatibly.
-constexpr u32 VisibilityCandidateCompactCacheRevision = 7;
+constexpr u32 VisibilityCandidateCompactCacheRevision = 8;
 // Stable radix compactor which publishes the positional key stream consumed by GatherVoxels.
 constexpr u64 GatherInputCompactShader = 0x95c28c88;
-constexpr u32 GatherInputCompactCacheRevision = 6;
+constexpr u32 GatherInputCompactCacheRevision = 7;
 constexpr u64 VisibilityListCompactShader = 0x7aa925e9;
 constexpr u64 VisibilityListCompactShaderAlt = 0x016b9f6a;
 // Bump when the Dreams-only final visibility-list ordered-count lowering changes incompatibly.
-constexpr u32 VisibilityListCompactCacheRevision = 7;
-constexpr std::array<u32, 2> VisibilityListOrderedCounterIndices{0x15f, 0x160};
-constexpr std::array<u32, 2> VisibilityListAltOrderedCounterIndices{0x161, 0x162};
+constexpr u32 VisibilityListCompactCacheRevision = 8;
+constexpr std::array<u32, 2> VisibilityListOrderedCounterIndices{0x57c, 0x57d};
+constexpr std::array<u32, 2> VisibilityListAltOrderedCounterIndices{0x584, 0x585};
 constexpr u32 OrderedChainCaptureGdsDwords =
     VisibilityListAltOrderedCounterIndices.back() + 1;
 constexpr u64 SpatialReconstructionPrepareShader = 0x80aed032;
@@ -76,14 +77,14 @@ constexpr u32 GatherVoxelsCacheRevision = 1;
 // guessing from overlapping buffer descriptors.
 constexpr u64 B1SeedWriterShader = 0x4ebeffd2;
 // Bump when the Dreams-only B1 seed writer ordered-count lowering changes incompatibly.
-constexpr u32 B1SeedWriterCacheRevision = 1;
+constexpr u32 B1SeedWriterCacheRevision = 2;
 constexpr u64 B1TransformWriterShader = 0xa3a9e9ef;
 // Builds the key/payload and per-bucket count tables consumed by A3's child lookup.
 constexpr u64 A3LookupProducerShader = 0x63ddac84;
 constexpr u64 SculptVolumeWriterShader = 0x84aa3dc9;
 // Bump when the Dreams-only 84aa lowering changes incompatibly. Keeping this revision targeted
 // avoids invalidating every unrelated shader in a user's cache.
-constexpr u32 SculptVolumeWriterCacheRevision = 10;
+constexpr u32 SculptVolumeWriterCacheRevision = 11;
 // Reads the sculpt-density atlas immediately before the surface compaction pass. Both this shader
 // and f030 use the 3D ImageGather fallback whose exact producer/consumer boundary can be captured
 // by the trigger-gated atlas-lineage diagnostic.
@@ -91,23 +92,24 @@ constexpr u64 SculptAtlasPrepareShader = 0x2f555c74;
 // Extracts surface records from the sculpt-density volume. Its terminal workgroup publishes the
 // compact count, so the sole DS_ORDERED_COUNT must return prefixes in guest wave-creation order.
 constexpr u64 SculptSurfaceCompactShader = 0xf030fdc4;
-constexpr u32 SculptSurfaceCompactCacheRevision = 6;
-// Appends the final surface records to f030's compact list and republishes its total count.
+constexpr u32 SculptSurfaceCompactCacheRevision = 7;
+// Consumes f030's dense surface data and publishes the final records through the same GDS counter
+// slot. The guest may reset that slot between dispatches, so its live pre-dispatch value is the
+// authoritative prefix seed.
 constexpr u64 SculptSurfaceFinalizeShader = 0x5ac53394;
-constexpr u32 SculptSurfaceFinalizeCacheRevision = 2;
+constexpr u32 SculptSurfaceFinalizeCacheRevision = 3;
 constexpr u64 Vs370InterfaceCaptureShader = 0x3706083c;
 constexpr u64 Ce3ReadConstCaptureShader = 0xce3b8413;
 constexpr u32 TraversalOutputCounterIndex = 2;
 constexpr u32 TraversalCompactCounterIndex = 6;
 constexpr u32 TraversalSecondaryCounterIndex = 4;
-// QueueProducer's compact-list state and byte-addressed DS_ORDERED_COUNT counters converted to
-// guest GDS dword indices.
+// QueueProducer's compact-list state and native DS_ORDERED_COUNT guest GDS dword indices.
 constexpr u32 QueueProducerCompactBaseIndex = 320;
 constexpr u32 QueueProducerCompactCountIndex = 321;
-constexpr u32 QueueProducerPrimaryOrderedCounterIndex = 0x142;
+constexpr u32 QueueProducerPrimaryOrderedCounterIndex = 0x508;
 constexpr u32 QueueProducerPrimaryOrderedControl = 0x000c;
 constexpr u32 QueueProducerPrimaryLanesPerWorkgroup = 64;
-constexpr std::array<u32, 2> QueueProducerAltOrderedCounterIndices{0x143, 0x145};
+constexpr std::array<u32, 2> QueueProducerAltOrderedCounterIndices{0x503, 0x505};
 constexpr u32 TraversalCompletionIndex = 16383;
 
 // 2bf computes its global record index as (WorkgroupId.x << 6) + LocalInvocationId.x. The aligned
@@ -174,7 +176,7 @@ constexpr u32 OrderedScratchDwords =
 // 4eb has one 64-lane guest wave per x workgroup and reaches its sole DS_ORDERED_COUNT before
 // any guest-visible store. Its returned prefix selects the B1 output allocation, so preserve
 // Liverpool's x-fast wave-creation order with collect/prefix/replay on shared scratch stream zero.
-constexpr u32 B1SeedWriterOrderedCounterIndex = 0x79;
+constexpr u32 B1SeedWriterOrderedCounterIndex = 0x1e4;
 constexpr u32 B1SeedWriterOrderedControl = 0x0004000c;
 constexpr u32 B1SeedWriterOrderedLanesPerWorkgroup = 64;
 constexpr u32 B1SeedWriterOrderedScratchStream = 0;
@@ -191,11 +193,11 @@ constexpr u32 TraversalOrderedDocCount = 4;
 constexpr std::array<u32, TraversalOrderedDocCount> TraversalOrderedControls{
     0x0804, 0x1804, 0x0c04, 0x100c};
 constexpr std::array<u32, TraversalOrderedDocCount> TraversalOrderedCounterIndices{
-    0x142, 0x146, 0x143, 0x144};
+    0x502, 0x506, 0x503, 0x504};
 constexpr std::array<u32, TraversalOrderedDocCount> TraversalOrderedScratchStreams{0, 1, 2, 3};
-constexpr u32 TraversalOrderedCounterBaseBytes = 0x500;
+constexpr u32 TraversalOrderedCounterBaseDwords = 0x500;
 constexpr u32 TraversalOrderedCounterFromControl(u32 control) {
-    return OrderedCounterDword(TraversalOrderedCounterBaseBytes, control);
+    return OrderedCounterDword(TraversalOrderedCounterBaseDwords, control);
 }
 constexpr u32 TraversalOrderedScratchBaseDword(u32 doc_index) {
     return OrderedScratchStreamBaseDword(TraversalOrderedScratchStreams[doc_index]);
@@ -222,11 +224,11 @@ constexpr std::array<u32, QueueProducerAltOrderedDocCount> QueueProducerAltOrder
     0x0c04, 0x140c};
 constexpr std::array<u32, QueueProducerAltOrderedDocCount> QueueProducerAltOrderedScratchStreams{
     0, 1};
-constexpr u32 QueueProducerAltOrderedCounterBaseBytes = 0x500;
+constexpr u32 QueueProducerAltOrderedCounterBaseDwords = 0x500;
 constexpr u32 QueueProducerAltOrderedGroupCountDword = TraversalOrderedGroupCountDword;
 constexpr u32 QueueProducerAltOrderedLanesPerWorkgroup = 64;
 constexpr u32 QueueProducerAltOrderedCounterFromControl(u32 control) {
-    return OrderedCounterDword(QueueProducerAltOrderedCounterBaseBytes, control);
+    return OrderedCounterDword(QueueProducerAltOrderedCounterBaseDwords, control);
 }
 constexpr u32 QueueProducerAltOrderedScratchBaseDword(u32 doc_index) {
     return OrderedScratchStreamBaseDword(QueueProducerAltOrderedScratchStreams[doc_index]);
@@ -240,7 +242,7 @@ static_assert(QueueProducerAltOrderedCounterFromControl(QueueProducerAltOrderedC
 // The sculpt-volume writer has one wave per x workgroup and one ordered-count operation. Its
 // collect pass stores one entry per full WorkgroupId.x; the prefix pass writes the exact guest
 // return value beside it for the parallel replay pass.
-constexpr u32 SculptOrderedCounterIndex = 0x78;
+constexpr u32 SculptOrderedCounterIndex = 0x1e0;
 constexpr u32 SculptOrderedScratchStream = 0;
 constexpr u32 SculptOrderedPayloadOffset = 0;
 constexpr u32 SculptOrderedPrefixOffset = 1;
@@ -250,9 +252,11 @@ constexpr u32 OrderedPhaseCollect = 1;
 constexpr u32 OrderedPhaseReplay = 2;
 
 // f030 dispatches one 4x4x4 Liverpool wave per workgroup. Reuse scratch stream zero only while its
-// direct dispatch is enclosed by explicit reuse barriers; the host scan seeds from guest GDS[0x100].
+// direct dispatch is enclosed by explicit reuse barriers; the host scan seeds from guest GDS[0x400].
 constexpr u32 SculptSurfaceOrderedControl = 0x0005000c;
-constexpr u32 SculptSurfaceOrderedCounterIndex = 0x100;
+constexpr u32 SculptSurfaceOrderedCounterBaseDwords = 0x400;
+constexpr u32 SculptSurfaceOrderedCounterIndex =
+    OrderedCounterDword(SculptSurfaceOrderedCounterBaseDwords, SculptSurfaceOrderedControl);
 constexpr u32 SculptSurfaceOrderedScratchStream = 0;
 constexpr u32 SculptSurfaceOrderedThreadsX = 4;
 constexpr u32 SculptSurfaceOrderedThreadsY = 4;
@@ -262,10 +266,14 @@ constexpr u32 SculptSurfaceOrderedLanesPerWorkgroup =
     SculptSurfaceOrderedThreadsZ;
 constexpr u32 SculptSurfaceOrderedScratchBaseDword =
     OrderedScratchStreamBaseDword(SculptSurfaceOrderedScratchStream);
-// 5ac continues f030's GDS[0x100] counter and uses the same one-wave 4x4x4 workgroup shape. Its
-// GDS descriptor is binding three, so its packed DOC control differs from f030's binding five.
+// 5ac uses the same one-wave 4x4x4 workgroup shape and addresses the same GDS[0x400] counter slot.
+// Its GDS descriptor is binding three, so its packed control still differs.
 constexpr u32 SculptSurfaceFinalizeOrderedControl = 0x0003000c;
-constexpr u32 SculptSurfaceFinalizeOrderedCounterIndex = 0x100;
+constexpr u32 SculptSurfaceFinalizeOrderedCounterBaseDwords = 0x400;
+constexpr u32 SculptSurfaceFinalizeOrderedCounterIndex = OrderedCounterDword(
+    SculptSurfaceFinalizeOrderedCounterBaseDwords, SculptSurfaceFinalizeOrderedControl);
+static_assert(SculptSurfaceOrderedCounterIndex == 0x400);
+static_assert(SculptSurfaceFinalizeOrderedCounterIndex == 0x400);
 constexpr u32 SculptSurfaceFinalizeOrderedThreadsX = 4;
 constexpr u32 SculptSurfaceFinalizeOrderedThreadsY = 4;
 constexpr u32 SculptSurfaceFinalizeOrderedThreadsZ = 4;
@@ -305,17 +313,17 @@ constexpr u32 IndirectArgsOrderedRowCounterDword(u32 row) {
 }
 static_assert(IndirectArgsOrderedRowScratchFirstStream + IndirectArgsOrderedRowCount <=
               OrderedCounterCount);
-static_assert(IndirectArgsOrderedRowCounterDword(0) == 0xa7);
-static_assert(IndirectArgsOrderedRowCounterDword(3) == 0xaa);
+static_assert(IndirectArgsOrderedRowCounterDword(0) == 0x29c);
+static_assert(IndirectArgsOrderedRowCounterDword(3) == 0x2a8);
 
 // d8 is a ten-pass ping-pong radix compactor. Every pass contains one DOC with packed control
-// 0x0002000c, and its counter is GDS dword 0x155 + pass. Collect publishes the indirect x
+// 0x0002000c, and its counter is GDS dword 0x554 + 4 * pass. Collect publishes the indirect x
 // dimension for the x-by-1-by-1 wave64 dispatch and records one payload per WorkgroupIndex. The
 // host scans the pass-selected counter, then replay performs the sole guest-visible output store
 // exactly once.
 constexpr u32 VisibilityCandidateOrderedPassCount = 10;
-constexpr u32 VisibilityCandidateOrderedCounterFirstDword = 0x155;
-constexpr u32 VisibilityCandidateOrderedCounterStrideDwords = 1;
+constexpr u32 VisibilityCandidateOrderedCounterFirstDword = 0x554;
+constexpr u32 VisibilityCandidateOrderedCounterStrideDwords = 4;
 constexpr u32 VisibilityCandidateOrderedScratchStream = 6;
 constexpr u32 VisibilityCandidateOrderedScratchBaseDword =
     OrderedScratchStreamBaseDword(VisibilityCandidateOrderedScratchStream);
@@ -328,18 +336,18 @@ constexpr u32 VisibilityCandidateOrderedCounterDword(u32 pass) {
            pass * VisibilityCandidateOrderedCounterStrideDwords;
 }
 static_assert(VisibilityCandidateOrderedScratchStream < OrderedCounterCount);
-static_assert(VisibilityCandidateOrderedCounterDword(0) == 0x155);
-static_assert(VisibilityCandidateOrderedCounterDword(9) == 0x15e);
+static_assert(VisibilityCandidateOrderedCounterDword(0) == 0x554);
+static_assert(VisibilityCandidateOrderedCounterDword(9) == 0x578);
 static_assert(TraversalOrderedGroupCountDword == 0x184000);
 
 // 95c performs one stable radix pass per direct x-by-1-by-1 wave64 dispatch. Its sole DOC uses
-// GDS[0x5d + pass], where pass is SRT word 9 / flattened user-data word 25. The only
+// GDS[0x174 + 4 * pass], where pass is SRT word 9 / flattened user-data word 25. The only
 // guest-visible
 // store follows DOC, so collect/prefix/replay is exact without checkpointing any other state. It
 // reuses d8's scratch stream; the host inserts a reuse barrier before every collect.
 constexpr u32 GatherInputOrderedPassCount = 37;
-constexpr u32 GatherInputOrderedCounterFirstDword = 0x5d;
-constexpr u32 GatherInputOrderedCounterStrideDwords = 1;
+constexpr u32 GatherInputOrderedCounterFirstDword = 0x174;
+constexpr u32 GatherInputOrderedCounterStrideDwords = 4;
 constexpr u32 GatherInputOrderedControl = 0x0002000c;
 constexpr u32 GatherInputOrderedScratchStream = VisibilityCandidateOrderedScratchStream;
 constexpr u32 GatherInputOrderedScratchBaseDword =
@@ -428,8 +436,8 @@ constexpr u32 SceneCompactOrderedStreamCount =
     SceneCompactOrderedWavesPerWorkgroup * SceneCompactOrderedDocCount;
 constexpr std::array<u32, SceneCompactOrderedDocCount> SceneCompactOrderedControls{
     0x0004, 0x0404, 0x0804, 0x0c0c};
-constexpr u32 SceneCompactOrderedCounterBaseDword = 0x900;
-constexpr u32 SceneCompactOrderedCounterRowStrideDwords = 4;
+constexpr u32 SceneCompactOrderedCounterBaseDword = 0x2400;
+constexpr u32 SceneCompactOrderedCounterRowStrideDwords = 16;
 constexpr u32 SceneCompactOrderedMaxWorkgroups = 1u << 11;
 constexpr u32 SceneCompactOrderedScratchBaseDword = SculptOrderedStateBaseDword;
 constexpr u32 SceneCompactOrderedScratchStreamStrideDwords =
@@ -1238,6 +1246,30 @@ constexpr u32 RecordDword(u32 site, u32 record, u32 field) {
            (site * MaxRecordsPerSite + record) * RecordDwords + field;
 }
 } // namespace ImageGather3DConsumerCapture
+
+// Passive, one-shot value provenance for GatherVoxels' R8 atlas writes. The complete atlas is
+// 2048x2048x128, but the aligned 2f samples observed by the sculpt-lineage capture occupy this
+// bounded x/y/z window. Two address-preserving tables retain the minimum and maximum UNORM8 value
+// written to each texel without depending on writer order. Zero means unwritten; valid values are
+// biased by 0x100. This intentionally reuses the opt-in ordered-chain high tail, so the host must
+// reject simultaneous ordered-chain, A3-producer, or ce3-coverage capture modes.
+namespace GatherVoxelsImageWriteCapture {
+constexpr u32 Width = 2048;
+constexpr u32 Height = 128;
+constexpr u32 Depth = 8;
+constexpr u32 TexelCount = Width * Height * Depth;
+constexpr u32 EncodedBias = 0x100;
+constexpr u32 MaxValueBaseDword = 0x900000;
+constexpr u32 MinInverseBaseDword = MaxValueBaseDword + TexelCount;
+constexpr u32 EndDword = MinInverseBaseDword + TexelCount;
+
+constexpr u32 TexelDword(u32 x, u32 y, u32 z) {
+    return (z * Height + y) * Width + x;
+}
+} // namespace GatherVoxelsImageWriteCapture
+static_assert(GatherVoxelsImageWriteCapture::TexelCount == 0x200000);
+static_assert(GatherVoxelsImageWriteCapture::MaxValueBaseDword >= 0x800000);
+static_assert(GatherVoxelsImageWriteCapture::EndDword <= 0xd00000);
 static_assert(ImageGather3DConsumerCapture::MaxRecordsPerSite <=
               ImageGather3DSampleWindow::MaxCandidatesPerSite);
 static_assert(GatherStageTraceBaseDword >= OrderedScratchBaseDword + OrderedScratchDwords);
@@ -1346,6 +1378,10 @@ inline bool CaptureImageGather3DForShader(u64 hash) {
            (CaptureSculptAtlasLineage() && IsSculptAtlasGatherConsumer(hash));
 }
 
+inline bool CaptureGatherVoxelsImageWrites(u64 hash) {
+    return CaptureSculptAtlasLineage() && hash == GatherVoxelsShader;
+}
+
 inline bool CaptureImageGather3D() {
     return CaptureAllImageGather3D() || CaptureSculptAtlasLineage();
 }
@@ -1433,6 +1469,7 @@ inline bool IsCaptureInstrumentedShader(u64 hash) {
            (CaptureA3LookupProducerTrace() && hash == A3LookupProducerShader) ||
            ((CaptureGatherStageTrace() || CaptureGatherFocusTrace()) &&
             hash == GatherVoxelsShader) ||
+           CaptureGatherVoxelsImageWrites(hash) ||
            CaptureImageGather3DForShader(hash);
 }
 

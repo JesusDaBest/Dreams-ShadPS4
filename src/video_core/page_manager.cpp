@@ -213,7 +213,8 @@ struct PageManager::Impl {
             return rasterizer->InvalidateMemory(
                 addr, 8, reinterpret_cast<u64>(Common::GetRip(context)));
         } else {
-            return rasterizer->ReadMemory(addr, 8);
+            return rasterizer->ReadMemory(
+                addr, 8, reinterpret_cast<u64>(Common::GetRip(context)));
         }
         return false;
     }

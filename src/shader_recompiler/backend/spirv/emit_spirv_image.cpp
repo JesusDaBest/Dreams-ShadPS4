@@ -630,6 +630,95 @@ Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod
     return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texel) : texel;
 }
 
+void EmitGatherVoxelsImageWriteCapture(EmitContext& ctx, u32 image_binding, Id coords,
+                                       Id texel, const EmitContext::TextureDefinition& texture) {
+    if (!DreamsCompat::CaptureGatherVoxelsImageWrites(ctx.info.pgm_hash) ||
+        ctx.stage != Stage::Compute || ctx.l_stage != LogicalStage::Compute ||
+        image_binding != 1 || texture.view_type != AmdGpu::ImageType::Color3D ||
+        texture.is_integer) {
+        return;
+    }
+
+    const auto gds = std::ranges::find(ctx.buffers, BufferType::GdsBuffer,
+                                       &EmitContext::BufferDefinition::buffer_type);
+    ASSERT_MSG(gds != ctx.buffers.end(),
+               "GatherVoxels image-write capture has no GDS descriptor");
+    const auto [buffer_id, pointer_type] = gds->Alias(EmitContext::PointerType::U32);
+    const auto pointer = [&](Id index) {
+        return ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, index);
+    };
+
+    const Id push_u32_ptr = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
+    const Id arm_ptr = ctx.OpAccessChain(
+        push_u32_ptr, ctx.push_data_block, ctx.ConstU32(PushData::HostDataIndex),
+        ctx.ConstU32(PushData::DreamsGatherVoxelsWriteCapture));
+    const Id arm = ctx.OpLoad(ctx.U32[1], arm_ptr);
+    const Id is_armed = ctx.OpINotEqual(ctx.U1[1], arm, ctx.u32_zero_value);
+
+    const Id coordinate_check_label = ctx.OpLabel();
+    const Id capture_label = ctx.OpLabel();
+    const Id coordinate_done_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(is_armed, coordinate_check_label, merge_label);
+
+    ctx.AddLabel(coordinate_check_label);
+    const Id unsigned_coords = ctx.OpBitcast(ctx.U32[3], coords);
+    const Id x = ctx.OpCompositeExtract(ctx.U32[1], unsigned_coords, 0);
+    const Id y = ctx.OpCompositeExtract(ctx.U32[1], unsigned_coords, 1);
+    const Id z = ctx.OpCompositeExtract(ctx.U32[1], unsigned_coords, 2);
+    namespace Capture = DreamsCompat::GatherVoxelsImageWriteCapture;
+    const Id x_in_bounds =
+        ctx.OpULessThan(ctx.U1[1], x, ctx.ConstU32(Capture::Width));
+    const Id y_in_bounds =
+        ctx.OpULessThan(ctx.U1[1], y, ctx.ConstU32(Capture::Height));
+    const Id z_in_bounds =
+        ctx.OpULessThan(ctx.U1[1], z, ctx.ConstU32(Capture::Depth));
+    const Id in_bounds = ctx.OpLogicalAnd(
+        ctx.U1[1], x_in_bounds,
+        ctx.OpLogicalAnd(ctx.U1[1], y_in_bounds, z_in_bounds));
+    ctx.OpSelectionMerge(coordinate_done_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(in_bounds, capture_label, coordinate_done_label);
+
+    ctx.AddLabel(capture_label);
+    const Id zy = ctx.OpIAdd(
+        ctx.U32[1], y,
+        ctx.OpIMul(ctx.U32[1], z, ctx.ConstU32(Capture::Height)));
+    const Id texel_index = ctx.OpIAdd(
+        ctx.U32[1], x,
+        ctx.OpIMul(ctx.U32[1], zy, ctx.ConstU32(Capture::Width)));
+    const Id value = ctx.OpCompositeExtract(ctx.F32[1], texel, 0);
+    const Id clamped =
+        ctx.OpFClamp(ctx.F32[1], value, ctx.ConstF32(0.0f), ctx.ConstF32(1.0f));
+    const Id scaled = ctx.OpFMul(ctx.F32[1], clamped, ctx.ConstF32(255.0f));
+    const Id byte =
+        ctx.OpConvertFToU(ctx.U32[1], ctx.OpRoundEven(ctx.F32[1], scaled));
+    const Id encoded_max =
+        ctx.OpIAdd(ctx.U32[1], byte, ctx.ConstU32(Capture::EncodedBias));
+    const Id encoded_min_inverse = ctx.OpIAdd(
+        ctx.U32[1],
+        ctx.OpISub(ctx.U32[1], ctx.ConstU32(255u), byte),
+        ctx.ConstU32(Capture::EncodedBias));
+    const Id device_scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
+    const auto memory_semantics = spv::MemorySemanticsMask::UniformMemory;
+    const Id semantics = ctx.ConstU32(static_cast<u32>(memory_semantics));
+    ctx.OpAtomicUMax(
+        ctx.U32[1],
+        pointer(ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(Capture::MaxValueBaseDword),
+                           texel_index)),
+        device_scope, semantics, encoded_max);
+    ctx.OpAtomicUMax(
+        ctx.U32[1],
+        pointer(ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(Capture::MinInverseBaseDword),
+                           texel_index)),
+        device_scope, semantics, encoded_min_inverse);
+    ctx.OpBranch(coordinate_done_label);
+
+    ctx.AddLabel(coordinate_done_label);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms,
                     Id color) {
     if (ctx.info.pgm_hash == 0x7ba4de5d &&
@@ -653,6 +742,7 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
     const Id image = ctx.OpLoad(texture.image_type, image_ptr);
     const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
     ctx.OpImageWrite(image, coords, texel, operands.mask, operands.operands);
+    EmitGatherVoxelsImageWriteCapture(ctx, handle & 0xFFFF, coords, texel, texture);
 }
 
 Id EmitCubeFaceIndex(EmitContext& ctx, IR::Inst* inst, Id cube_coords) {

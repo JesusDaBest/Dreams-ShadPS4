@@ -751,25 +751,20 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
                                      Shader::DreamsCompat::IsSpriteCullShader(info.pgm_hash);
     const bool dreams_gather_patch =
         std::getenv("SHADPS4_DREAMS_GATHER_SHADER_PATCH") && info.pgm_hash == 0x7ba4de5d;
-    const bool dreams_vs370_capture =
-        Shader::DreamsCompat::CaptureVs370Interface() &&
-        info.pgm_hash == Shader::DreamsCompat::Vs370InterfaceCaptureShader &&
-        info.stage == Shader::Stage::Vertex;
-    const bool dreams_ce3_readconst_capture =
-        (Shader::DreamsCompat::CaptureCe3ReadConst() ||
-         Shader::DreamsCompat::CaptureCe3FleckTrace() ||
-         Shader::DreamsCompat::CaptureCe3CoverageTrace()) &&
-        info.pgm_hash == Shader::DreamsCompat::Ce3ReadConstCaptureShader &&
-        info.stage == Shader::Stage::Fragment;
-    const bool dreams_image_gather_3d_capture =
-        Shader::DreamsCompat::CaptureImageGather3DForShader(info.pgm_hash) &&
-        info.stage == Shader::Stage::Compute && info.has_image_gather;
+    const bool dreams_capture_instrumented =
+        Shader::DreamsCompat::IsCaptureInstrumentedShader(info.pgm_hash);
     const bool dreams_ordered_specialized =
         Shader::DreamsCompat::UsesExactOrderedCountReplay(info.pgm_hash);
     const bool is_patched =
-        !dreams_vs370_capture && !dreams_ce3_readconst_capture && !dreams_image_gather_3d_capture &&
-        !dreams_ordered_specialized && patch &&
+        !dreams_capture_instrumented && !dreams_ordered_specialized && patch &&
         (EmulatorSettings.IsPatchShaders() || dreams_sprite_patch || dreams_gather_patch);
+    if (dreams_capture_instrumented && patch &&
+        (EmulatorSettings.IsPatchShaders() || dreams_sprite_patch || dreams_gather_patch)) {
+        LOG_WARNING(Loader,
+                    "Ignoring external patch for Dreams shader {:#x}: the active capture "
+                    "requires its instrumented translation",
+                    info.pgm_hash);
+    }
     if (dreams_ordered_specialized && patch && EmulatorSettings.IsPatchShaders()) {
         LOG_WARNING(Loader,
                     "Ignoring external patch for Dreams shader {:#x}: the exact ordered-count "
@@ -859,10 +854,12 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {
             if (m.module == module) {
-                if (Shader::DreamsCompat::UsesExactOrderedCountReplay(program->info.pgm_hash)) {
+                if (Shader::DreamsCompat::UsesExactOrderedCountReplay(program->info.pgm_hash) ||
+                    Shader::DreamsCompat::IsCaptureInstrumentedShader(
+                        program->info.pgm_hash)) {
                     LOG_WARNING(Loader,
-                                "Refusing live replacement of Dreams shader {:#x}: the exact "
-                                "ordered-count path requires its phase specialization constant",
+                                "Refusing live replacement of Dreams shader {:#x}: an active "
+                                "specialized or capture-instrumented translation is required",
                                 program->info.pgm_hash);
                     return std::nullopt;
                 }
