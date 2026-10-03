@@ -1,5 +1,7 @@
 # Dreams on shadPS4 Investigation
 
+For applying and compiling the retained source fixes, start with [SOURCE_BUILD.md](SOURCE_BUILD.md). The verified local game is CUSA04301 **1.00**, with **Precise readbacks**. Game update 2.65 remains unverified.
+
 ## Research update — September 7, 2026
 
 This update publishes investigation records and experimental patch deltas. It does not replace the downloadable August 29 emulator checkpoint or claim a newer playable build.

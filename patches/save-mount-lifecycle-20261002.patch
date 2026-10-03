@@ -1,0 +1,197 @@
+diff --git a/src/core/libraries/save_data/save_instance.cpp b/src/core/libraries/save_data/save_instance.cpp
+index 599227e02..35523aace 100644
+--- a/src/core/libraries/save_data/save_instance.cpp
++++ b/src/core/libraries/save_data/save_instance.cpp
+@@ -6,6 +6,7 @@
+ #include <magic_enum/magic_enum.hpp>
+ 
+ #include "common/assert.h"
++#include "common/logging/log.h"
+ #include "common/path_util.h"
+ #include "common/singleton.h"
+ #include "core/emulator_settings.h"
+@@ -194,10 +195,9 @@ void SaveInstance::SetupAndMount(bool read_only, bool copy_icon, bool ignore_cor
+ 
+ void SaveInstance::Umount() {
+     if (!mounted) {
+-        UNREACHABLE_MSG("Save instance is not mounted");
++        LOG_WARNING(Lib_SaveData, "Ignoring unmount of inactive save instance {}", mount_point);
+         return;
+     }
+-    mounted = false;
+     const bool ok = param_sfo.Encode(param_sfo_path);
+     if (!ok) {
+         throw fs::filesystem_error("Failed to write param.sfo", param_sfo_path,
+@@ -207,6 +207,7 @@ void SaveInstance::Umount() {
+ 
+     fs::remove(corrupt_file_path);
+     g_mnt->Unmount(save_path, mount_point);
++    mounted = false;
+ }
+ 
+ void SaveInstance::CreateFiles() {
+diff --git a/src/core/libraries/save_data/savedata.cpp b/src/core/libraries/save_data/savedata.cpp
+index 69e9282e0..d813465f0 100644
+--- a/src/core/libraries/save_data/savedata.cpp
++++ b/src/core/libraries/save_data/savedata.cpp
+@@ -4,6 +4,7 @@
+ #include <atomic>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include <span>
+ #include <thread>
+ #include <vector>
+@@ -342,6 +343,8 @@ struct OrbisSaveDataEvent {
+ static bool g_initialized = false;
+ static std::string g_game_serial;
+ static u32 g_fw_ver;
++// Serialize mount-slot access, including metadata reads, across guest threads.
++static std::mutex g_mount_slots_mutex;
+ static std::array<std::optional<SaveInstance>, 16> g_mount_slots;
+ 
+ static bool DreamsSaveQuotaTraceEnabled() {
+@@ -436,6 +439,7 @@ static Error setNotInitializedError() {
+ static Error saveDataMount(const OrbisSaveDataMount2* mount_info,
+                            OrbisSaveDataMountResult* mount_result,
+                            std::string_view title_id = g_game_serial) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+ 
+     if (mount_info->userId < 0) {
+         return Error::INVALID_LOGIN_USER;
+@@ -475,12 +479,14 @@ static Error saveDataMount(const OrbisSaveDataMount2* mount_info,
+         const auto& instance = g_mount_slots[i];
+         if (instance.has_value()) {
+             const auto& slot_name = instance->GetDirName();
+-            if (slot_name == dir_name) {
++            if (slot_name == dir_name && instance->GetUserId() == mount_info->userId &&
++                instance->GetTitleId() == title_id) {
++                LOG_WARNING(Lib_SaveData, "Save already mounted: user={} title={} dir={}",
++                            mount_info->userId, title_id, dir_name);
+                 return Error::BUSY;
+             }
+-        } else {
++        } else if (slot_num == -1) {
+             slot_num = static_cast<int>(i);
+-            break;
+         }
+     }
+     if (slot_num == -1) {
+@@ -545,11 +551,16 @@ static Error saveDataMount(const OrbisSaveDataMount2* mount_info,
+     }
+ 
+     g_mount_slots[slot_num].emplace(std::move(save_instance));
++    LOG_INFO(Lib_SaveData, "Mounted save: user={} title={} dir={} mount={} host={}",
++             mount_info->userId, title_id, dir_name,
++             g_mount_slots[slot_num]->GetMountPoint(),
++             g_mount_slots[slot_num]->GetSavePath().string());
+ 
+     return Error::OK;
+ }
+ 
+ static Error Umount(const OrbisSaveDataMountPoint* mountPoint, bool call_backup = false) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -566,6 +577,12 @@ static Error Umount(const OrbisSaveDataMountPoint* mountPoint, bool call_backup
+         if (instance.has_value()) {
+             const auto& slot_name = instance->GetMountPoint();
+             if (slot_name == mount_point_str) {
++                // A stale/unmounted slot is an API error, not a fatal emulator assertion.
++                if (!instance->Mounted()) {
++                    LOG_WARNING(Lib_SaveData, "Unmount requested for inactive slot {}", mount_point_str);
++                    instance.reset();
++                    return Error::NOT_MOUNTED;
++                }
+                 // TODO: check if is busy
+                 instance->Umount();
+                 if (call_backup) {
+@@ -605,6 +622,7 @@ int PS4_SYSV_ABI sceSaveDataAbort() {
+ }
+ 
+ Error PS4_SYSV_ABI sceSaveDataBackup(const OrbisSaveDataBackup* backup) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -653,6 +671,7 @@ int PS4_SYSV_ABI sceSaveDataChangeInternal() {
+ }
+ 
+ Error PS4_SYSV_ABI sceSaveDataCheckBackupData(const OrbisSaveDataCheckBackupData* check) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -794,6 +813,7 @@ int PS4_SYSV_ABI sceSaveDataDebugTarget() {
+ }
+ 
+ Error PS4_SYSV_ABI sceSaveDataDelete(const OrbisSaveDataDelete* del) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -1066,6 +1086,7 @@ int PS4_SYSV_ABI sceSaveDataGetMountedSaveDataCount() {
+ 
+ Error PS4_SYSV_ABI sceSaveDataGetMountInfo(const OrbisSaveDataMountPoint* mountPoint,
+                                            OrbisSaveDataMountInfo* info) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+ #ifdef _WIN32
+     if (g_game_serial == "CUSA04301" && DreamsSaveQuotaTraceEnabled()) {
+         TraceDreamsSaveQuotaCall(__builtin_return_address(0), _AddressOfReturnAddress());
+@@ -1101,6 +1122,7 @@ Error PS4_SYSV_ABI sceSaveDataGetMountInfo(const OrbisSaveDataMountPoint* mountP
+ Error PS4_SYSV_ABI sceSaveDataGetParam(const OrbisSaveDataMountPoint* mountPoint,
+                                        OrbisSaveDataParamType paramType, void* paramBuf,
+                                        size_t paramBufSize, size_t* gotSize) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -1308,6 +1330,7 @@ int PS4_SYSV_ABI sceSaveDataIsMounted() {
+ 
+ Error PS4_SYSV_ABI sceSaveDataLoadIcon(const OrbisSaveDataMountPoint* mountPoint,
+                                        OrbisSaveDataIcon* icon) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -1402,6 +1425,7 @@ int PS4_SYSV_ABI sceSaveDataRegisterEventCallback() {
+ }
+ 
+ Error PS4_SYSV_ABI sceSaveDataRestoreBackupData(const OrbisSaveDataRestoreBackupData* restore) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -1453,6 +1477,7 @@ int PS4_SYSV_ABI sceSaveDataRestoreLoadSaveDataMemory() {
+ 
+ Error PS4_SYSV_ABI sceSaveDataSaveIcon(const OrbisSaveDataMountPoint* mountPoint,
+                                        const OrbisSaveDataIcon* icon) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -1501,6 +1526,7 @@ int PS4_SYSV_ABI sceSaveDataSetEventInfo() {
+ Error PS4_SYSV_ABI sceSaveDataSetParam(const OrbisSaveDataMountPoint* mountPoint,
+                                        OrbisSaveDataParamType paramType, const void* paramBuf,
+                                        size_t paramBufSize) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -1644,6 +1670,7 @@ sceSaveDataSetupSaveDataMemory(Libraries::UserService::OrbisUserServiceUserId us
+ 
+ Error PS4_SYSV_ABI sceSaveDataSetupSaveDataMemory2(const OrbisSaveDataMemorySetup2* setupParam,
+                                                    OrbisSaveDataMemorySetupResult* result) {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     if (!g_initialized) {
+         LOG_INFO(Lib_SaveData, "called without initialize");
+         return setNotInitializedError();
+@@ -1746,6 +1773,7 @@ Error PS4_SYSV_ABI sceSaveDataSyncSaveDataMemory(OrbisSaveDataMemorySync* syncPa
+ }
+ 
+ Error PS4_SYSV_ABI sceSaveDataTerminate() {
++    const std::scoped_lock mount_lock{g_mount_slots_mutex};
+     LOG_DEBUG(Lib_SaveData, "called");
+     if (!g_initialized) {
+         return setNotInitializedError();
