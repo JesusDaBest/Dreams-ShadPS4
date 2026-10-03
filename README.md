@@ -1,5 +1,9 @@
 # Dreams on shadPS4 Investigation
 
+## October 3 save-ID correction
+
+The [host-random-byte source fix](SAVE_ID_FIX_20261003.md) addresses repeating random streams observed on Windows. In an isolated game test, three scenes retained distinct version IDs, contents and previews; discarding a fourth scene preserved all three. Apply the source patch and rebuild using [SOURCE_BUILD.md](SOURCE_BUILD.md). This does not repair old damaged saves or fix remaining sculpt rendering. The archived August 29 executable is unchanged.
+
 For applying and compiling the retained source fixes, start with [SOURCE_BUILD.md](SOURCE_BUILD.md). The working local profile uses **Precise readbacks**. The active game metadata reports CUSA04301 **VERSION 02.64** and **APP_VER 01.00**; APP_VER alone must not be treated as the content update version. Game update 2.65 remains unverified.
 
 ## Research update — September 7, 2026

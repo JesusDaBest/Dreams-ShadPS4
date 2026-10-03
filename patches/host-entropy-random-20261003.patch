@@ -1,0 +1,50 @@
+diff --git a/src/core/libraries/random/random.cpp b/src/core/libraries/random/random.cpp
+index 8549a9b05..2b21eb7fa 100644
+--- a/src/core/libraries/random/random.cpp
++++ b/src/core/libraries/random/random.cpp
+@@ -1,6 +1,11 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <exception>
++#include <mutex>
++#include <random>
++
+ #include "random.h"
+ #include "random_error.h"
+ 
+@@ -12,13 +17,30 @@ namespace Libraries::Random {
+ 
+ s32 PS4_SYSV_ABI sceRandomGetRandomNumber(u8* buf, std::size_t size) {
+     LOG_TRACE(Lib_Random, "called");
+-    if (size > SCE_RANDOM_MAX_SIZE) {
++    if (size > SCE_RANDOM_MAX_SIZE || (size != 0 && buf == nullptr)) {
+         return SCE_RANDOM_ERROR_INVALID;
+     }
++    if (size == 0) {
++        return ORBIS_OK;
++    }
+ 
+-    for (auto i = 0; i < size; ++i) {
+-        buf[i] = std::rand() & 0xFF;
++    // rand() has repeatable default state (and per-thread state on Windows).
++    // Device opens can also reseed it. Guest random bytes must not share that stream.
++    // Stage the output so an entropy-provider failure cannot partially modify it.
++    std::array<u8, SCE_RANDOM_MAX_SIZE> bytes{};
++    try {
++        static std::mutex entropy_mutex;
++        const std::scoped_lock lock{entropy_mutex};
++        std::random_device entropy;
++        std::uniform_int_distribution<unsigned int> byte{0, 255};
++        for (std::size_t i = 0; i < size; ++i) {
++            bytes[i] = static_cast<u8>(byte(entropy));
++        }
++    } catch (const std::exception& e) {
++        LOG_ERROR(Lib_Random, "Host entropy provider failed: {}", e.what());
++        return SCE_RANDOM_ERROR_FATAL;
+     }
++    std::copy_n(bytes.begin(), size, buf);
+     return ORBIS_OK;
+ }
+ 

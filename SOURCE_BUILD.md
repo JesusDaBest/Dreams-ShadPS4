@@ -2,6 +2,10 @@
 
 This is the source-patch workflow for the retained rendering checkpoint. You can compile it yourself; the archived executable is an optional historical comparison. These patches are tied to an upstream revision and a specific tested game installation, not guaranteed to apply to arbitrary shadPS4 revisions or work on every GPU.
 
+## October 3 save-ID correction
+
+The [random-byte correction](SAVE_ID_FIX_20261003.md) passed an isolated three-scene persistence and unsaved-scene discard test. The commands below include it. It does not recover damaged saves or resolve the remaining sculpt rendering defects. The optional October 2 save-mount delta below was also present in the tested executable.
+
 ## Game metadata and verified settings
 
 The active launcher command points to the inspected game folder. Its SFO reports **CUSA04301, VERSION 02.64, APP_VER 01.00**. The content update is identified here as **2.64**; the separate APP_VER field alone does not identify the content update. The reported Wide Calculator is consistent with this later version. The earlier conclusion that the installed game was original 1.00 was incorrect. The working profile uses **GPU readbacks: Precise** (`GPU.readbacks_mode = 2`). Check the Dreams-specific override as well as the global setting: an override wins. Modes 0 and 1 mean Disabled and Relaxed respectively.
@@ -24,6 +28,8 @@ git apply --check "$dreamsPatches/dreams-focused-20260829-full-covered-filled.pa
 git apply "$dreamsPatches/dreams-focused-20260829-full-covered-filled.patch"
 git -C externals/sirit apply --check "$dreamsPatches/sirit-group-nonuniform-shuffle-20260829.patch"
 git -C externals/sirit apply "$dreamsPatches/sirit-group-nonuniform-shuffle-20260829.patch"
+git apply --check "$dreamsPatches/host-entropy-random-20261003.patch"
+git apply "$dreamsPatches/host-entropy-random-20261003.patch"
 cmake -S . -B build-dreams -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-dreams --parallel 1
 ```
