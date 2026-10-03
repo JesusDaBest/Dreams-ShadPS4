@@ -4,7 +4,7 @@ This is the source-patch workflow for the retained rendering checkpoint. You can
 
 ## Game metadata and verified settings
 
-The active launcher command points to the same game folder whose metadata reports **CUSA04301, APP_VER 01.00**. However, the user reports that this installation contains Wide Calculator, introduced in 2.44. The metadata therefore does not establish the actual executable/content version. A mixed or modified installation is a possibility, not a confirmed diagnosis. Do not conclude that the two PCs differ by original 1.00 versus 2.65 from this field alone. The working profile uses **GPU readbacks: Precise** (`GPU.readbacks_mode = 2`). Check the Dreams-specific override as well as the global setting: an override wins. Modes 0 and 1 mean Disabled and Relaxed respectively.
+The active launcher command points to the inspected game folder. Its SFO reports **CUSA04301, VERSION 02.64, APP_VER 01.00**. The content update is identified here as **2.64**; the separate APP_VER field alone does not identify the content update. The reported Wide Calculator is consistent with this later version. The earlier conclusion that the installed game was original 1.00 was incorrect. The working profile uses **GPU readbacks: Precise** (`GPU.readbacks_mode = 2`). Check the Dreams-specific override as well as the global setting: an override wins. Modes 0 and 1 mean Disabled and Relaxed respectively.
 
 The September 4 isolated comparison restored the patterned cube with Precise readbacks. This does not establish a universal fix. Sculpts still look wrong.
 
