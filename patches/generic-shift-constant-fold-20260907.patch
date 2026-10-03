@@ -1,0 +1,76 @@
+diff --git a/src/shader_recompiler/ir/passes/constant_propagation_pass.cpp b/src/shader_recompiler/ir/passes/constant_propagation_pass.cpp
+index 4926ad3..2b3e3a3 100644
+--- a/src/shader_recompiler/ir/passes/constant_propagation_pass.cpp
++++ b/src/shader_recompiler/ir/passes/constant_propagation_pass.cpp
+@@ -79,6 +79,61 @@ bool FoldWhenAllImmediates(IR::Inst& inst, Func&& func) {
+     return true;
+ }
+ 
++// Prove that a U32 value has no set bits at or above first_bit. This uses only
++// IR semantics and immediate masks/widths, never a captured value or a stage-specific bound.
++bool HasZeroUpperBits32(IR::Value value, u32 first_bit) {
++    if (value.Type() != IR::Type::U32) {
++        return false;
++    }
++    if (value.IsImmediate()) {
++        return (value.U32() >> first_bit) == 0;
++    }
++    const auto* producer = value.InstRecursive();
++    switch (producer->GetOpcode()) {
++    case IR::Opcode::BitFieldUExtract: {
++        const auto offset = producer->Arg(1);
++        const auto width = producer->Arg(2);
++        return offset.IsImmediate() && width.IsImmediate() && offset.U32() < 32 &&
++               width.U32() <= 32 - offset.U32() && width.U32() <= first_bit;
++    }
++    case IR::Opcode::BitwiseAnd32:
++        for (size_t index = 0; index < 2; ++index) {
++            const auto mask = producer->Arg(index);
++            if (mask.IsImmediate() && (mask.U32() >> first_bit) == 0) {
++                return true;
++            }
++        }
++        return false;
++    default:
++        return false;
++    }
++}
++
++void FoldShiftRightLogical32(IR::Inst& inst) {
++    const auto shift = inst.Arg(1);
++    if (!shift.IsImmediate() || shift.U32() >= 32) {
++        return;
++    }
++    if (FoldWhenAllImmediates(inst, [](u32 value, u32 amount) { return value >> amount; })) {
++        return;
++    }
++    const auto* producer = inst.Arg(0).InstRecursive();
++    if (producer->GetOpcode() != IR::Opcode::BitwiseOr32) {
++        return;
++    }
++    // (constant | low_bits) >> shift == constant >> shift when every possible bit
++    // in low_bits is shifted out. In particular, unsigned extraction bounds its
++    // result even when its source is unknown. Addition cannot use this rule: it can carry.
++    for (size_t index = 0; index < 2; ++index) {
++        const auto constant = producer->Arg(index);
++        if (constant.IsImmediate() &&
++            HasZeroUpperBits32(producer->Arg(1 - index), shift.U32())) {
++            inst.ReplaceUsesWithAndRemove(IR::Value{constant.U32() >> shift.U32()});
++            return;
++        }
++    }
++}
++
+ template <IR::Opcode op, typename Dest, typename Source>
+ void FoldBitCast(IR::Inst& inst, IR::Opcode reverse) {
+     const IR::Value value{inst.Arg(0)};
+@@ -349,8 +404,7 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
+         FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return static_cast<u32>(a << b); });
+         return;
+     case IR::Opcode::ShiftRightLogical32:
+-        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return static_cast<u32>(a >> b); });
+-        return;
++        return FoldShiftRightLogical32(inst);
+     case IR::Opcode::ShiftRightArithmetic32:
+         FoldWhenAllImmediates(inst, [](s32 a, s32 b) { return static_cast<u32>(a >> b); });
+         return;

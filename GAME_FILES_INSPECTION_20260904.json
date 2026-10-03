@@ -1,0 +1,119 @@
+{
+  "archive": "D:\\Downloads\\DREAMS PS4 GAME FILES.zip",
+  "archive_bytes": 13673103195,
+  "outer_files": 1608,
+  "nested_archives": 9,
+  "nested_files": 97478,
+  "nested_inventory_errors": [],
+  "identified_engine_source_project": false,
+  "source_search_limit": "All ZIP directory listings plus selected content/header inspection; opaque asset bodies were not exhaustively decoded.",
+  "zip_metadata": {
+    "APP_VER": "01.00",
+    "CATEGORY": "gd",
+    "SYSTEM_VER": 302022656,
+    "TITLE": "Dreams\u2122",
+    "TITLE_ID": "CUSA08010",
+    "VERSION": "02.65"
+  },
+  "installed_metadata": {
+    "APP_VER": "01.00",
+    "CATEGORY": "gd",
+    "SYSTEM_VER": 151027712,
+    "TITLE": "Dreams\u2122",
+    "TITLE_ID": "CUSA04301",
+    "VERSION": "02.64"
+  },
+  "selected_hashes": {
+    "eboot.bin": {
+      "size": 41016159,
+      "sha256": "0a3bf1c7212ae8f341755726870ec5c6ea5404c32cdc7acdd5e5e5ed154d0a43"
+    },
+    "dd.shaders": {
+      "size": 2900464,
+      "sha256": "02e3d197037a484d60751eb6c18e581a908386a0a1ad3df3823c7d5583a98b33"
+    },
+    "param.sfo": {
+      "size": 1704,
+      "sha256": "ebf2fee94a55f81ab93c9b30c9a723e148ef6e5b2ba7ffe7702f32668c4d371f"
+    },
+    "TrenTemplate.proto": {
+      "size": 9470,
+      "sha256": "74ebd755279910a271760a5056a10a51d0474f9c9a98b394b0f5da9396b50106"
+    },
+    "title_id.json": {
+      "size": 61,
+      "sha256": "1ce8a09c50d0b8672788b5889395bc68ad8a06955f1c66ded14806cd517e9f98"
+    },
+    "changeinfo.xml": {
+      "size": 13901,
+      "sha256": "72ba49c8b6696037ea08d5e8ccf314fe7e59ac0a1a3d9427c1f06500eb13d7cf"
+    },
+    "installed_eboot": {
+      "size": 41296079,
+      "sha256": "f3d3711120278471c4c7fa84aa6bd321700d9adbea0d6e53be9665a4bcb6383f"
+    }
+  },
+  "shader_pack_comparison": {
+    "files_identical": false,
+    "common_entry_keys": 604,
+    "all_code_locators_valid": true,
+    "declared_code_extent_basis": "Validated BEEB03FF code-start locator; BinaryInfo.length bytes, matching emulator GetParams. Excludes interstitial bytes before OrbShdr and BinaryInfo itself.",
+    "identical_declared_code_spans": 546,
+    "identical_payload_count": 0,
+    "common_shader_hash_count": 0,
+    "target_hash_matches": {
+      "cbac06d2": {
+        "sample": [],
+        "installed": [
+          "00000000cbac06d2"
+        ]
+      },
+      "4ebeffd2": {
+        "sample": [],
+        "installed": [
+          "000000004ebeffd2"
+        ]
+      },
+      "84aa3dc9": {
+        "sample": [],
+        "installed": [
+          "0000000084aa3dc9"
+        ]
+      }
+    },
+    "target_entry_mapping": [
+      {
+        "entry_key": "097df0f5cc4e7df1",
+        "installed_hash": "00000000cbac06d2",
+        "sample_hash": "00000000fff5a423",
+        "code_identical": true,
+        "sample_code_size": 2308,
+        "installed_code_size": 2308
+      },
+      {
+        "entry_key": "1d06b993301fe08e",
+        "installed_hash": "0000000084aa3dc9",
+        "sample_hash": "00000000e0887e2d",
+        "code_identical": true,
+        "sample_code_size": 1048,
+        "installed_code_size": 1048
+      },
+      {
+        "entry_key": "833ba1c24f3bc611",
+        "installed_hash": "000000004ebeffd2",
+        "sample_hash": "00000000c1a85bbd",
+        "code_identical": true,
+        "sample_code_size": 364,
+        "installed_code_size": 364
+      }
+    ]
+  },
+  "visible_elf_section_count": 0,
+  "external_sources": [
+    "https://github.com/x1nixmzeng/dreamiverse-transformer",
+    "https://github.com/jaames/dreams-api",
+    "https://www.mediamolecule.com/blog/article/alex_at_umbra_ignite_2015_learning_from_failure_video",
+    "https://docs.indreams.me/en-US/whats-happening/updates/release-notes/dreams/v265"
+  ],
+  "execution": "No archive executable or script was run. Installation, launcher selection, and saves were unchanged."
+}

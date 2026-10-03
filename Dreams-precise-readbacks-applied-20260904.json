@@ -1,0 +1,30 @@
+{
+  "applied_at": "2026-09-04T18:08:23.531904-07:00",
+  "config": "C:\\Users\\Jdura\\AppData\\Roaming\\shadPS4\\custom_configs\\CUSA04301.json",
+  "backup": "D:\\CodexData\\Workspaces\\2026-09-04\\usi\\work\\runtime-comparison-20260904\\applied-20260904-180823\\CUSA04301.before.json",
+  "only_setting_changed": "GPU.readbacks_mode",
+  "before": 1,
+  "after": 2,
+  "before_sha256": "8a6ff990c542c16c80c7fce57178b1ec5bcbeb3b53fdc8c1129f9ca0da0d5335",
+  "after_sha256": "31f5f688c345bf38f8ba593acfced44f36e8ade28540601fed96d5cc20990085",
+  "user_confirmation": "User answered Yes to navigating isolated Precise-mode test into Edit Mode and smooth behavior without sculpt jitter.",
+  "isolated_visual_observation": "Tan patterned cube and floor visible; FPS overlay 30.",
+  "saves_changed_by_setting_application": false,
+  "executable_replaced": false,
+  "normal_launcher_verification": {
+    "pid_at_check": 40064,
+    "observed": "Normal launcher session displayed tan patterned cube and 30 FPS; startup logged precise=true with eager readback skipped.",
+    "left_running_for_user": true,
+    "isolated_user_feedback": "Yes: entered Edit Mode, smooth without sculpt jitter.",
+    "normal_session_jitter_limit": "Normal-session still images confirm rendering/FPS, not an independent measurement of jitter.",
+    "isolated_screenshot": "D:\\CodexData\\Workspaces\\2026-09-04\\usi\\outputs\\Dreams-precise-isolated-20260904.png",
+    "normal_screenshot": "D:\\CodexData\\Workspaces\\2026-09-04\\usi\\outputs\\Dreams-normal-launcher-restored-20260904.png"
+  },
+  "relaxed_readback_profile": {
+    "reports": 227,
+    "median_reported_wait_ms": 130.202,
+    "min_reported_wait_ms": 5.428,
+    "max_reported_wait_ms": 843.903,
+    "limit": "Aggregate readback wait per reporting interval; not a matched-scene FPS benchmark or precise percentage of frame time."
+  }
+}

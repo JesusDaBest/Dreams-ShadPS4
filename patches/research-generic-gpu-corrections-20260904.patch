@@ -1,0 +1,407 @@
+diff --git a/src/shader_recompiler/frontend/translate/data_share.cpp b/src/shader_recompiler/frontend/translate/data_share.cpp
+index 34b9e46..cc0da39 100644
+--- a/src/shader_recompiler/frontend/translate/data_share.cpp
++++ b/src/shader_recompiler/frontend/translate/data_share.cpp
+@@ -399,9 +399,19 @@ void Translator::DS_SWIZZLE_B32(const GcnInst& inst) {
+         const IR::U32 quad_base{ir.BitwiseAnd(lane_id, ir.Imm32(~u32{3}))};
+         const IR::U32 source_lane{ir.BitwiseOr(quad_base, index)};
+         const IR::U1 target_active{source_lane_active(source_lane)};
+-        const IR::U32 current_quad_lane{ir.BitwiseAnd(lane_id, ir.Imm32(3))};
+-        const IR::U32 safe_index{ir.Select(target_active, index, current_quad_lane)};
+-        const IR::U32 shuffled{ir.QuadShuffle(src, safe_index)};
++        std::array<IR::U32, 4> sources{};
++        for (u32 lane = 0; lane < 4; ++lane) {
++            const u32 source_index = (offset0 >> (lane * 2)) & 3;
++            if (sources[source_index].IsEmpty()) {
++                sources[source_index] = ir.QuadShuffle(src, ir.Imm32(source_index));
++            }
++        }
++        IR::U32 shuffled = sources[offset0 & 3];
++        for (u32 lane = 1; lane < 4; ++lane) {
++            const u32 source_index = (offset0 >> (lane * 2)) & 3;
++            const IR::U1 selected{ir.IEqual(id_in_group, ir.Imm32(lane))};
++            shuffled = IR::U32{ir.Select(selected, sources[source_index], shuffled)};
++        }
+         SetDst(inst.dst[0], IR::U32{ir.Select(target_active, shuffled, ir.Imm32(0))});
+     } else {
+         const u8 and_mask = (offset0 & 0x1f) | (~u8{0} << 5);
+diff --git a/src/video_core/buffer_cache/buffer.h b/src/video_core/buffer_cache/buffer.h
+index c9623d1..ddc7b7b 100644
+--- a/src/video_core/buffer_cache/buffer.h
++++ b/src/video_core/buffer_cache/buffer.h
+@@ -10,6 +10,7 @@
+ #include "common/types.h"
+ #include "core/memory.h"
+ #include "video_core/amdgpu/resource.h"
++#include "video_core/buffer_cache/buffer_access_state.h"
+ #include "video_core/renderer_vulkan/vk_common.h"
+ 
+ namespace Vulkan {
+@@ -129,33 +130,8 @@ public:
+                                                        vk::PipelineStageFlagBits2 dst_stage,
+                                                        u32 offset = 0,
+                                                        bool force_dependency = false) {
+-        // Matching state is not enough to elide a dependency after a write. Consecutive compute
+-        // dispatches commonly bind the same storage buffer as read|write, and Vulkan does not make
+-        // one dispatch's stores visible to the next dispatch without a memory dependency. Mirror
+-        // the image tracker: only identical read-only accesses can safely reuse their state.
+-        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+-                                     vk::AccessFlagBits2::eShaderWrite |
+-                                     vk::AccessFlagBits2::eMemoryWrite;
+-        const bool previous_access_writes = static_cast<bool>(access_mask & write_flags);
+-        if (!force_dependency && !previous_access_writes && dst_acess_mask == access_mask &&
+-            stage == dst_stage) {
+-            return {};
+-        }
+-
+-        DEBUG_ASSERT(offset < size_bytes);
+-
+-        const auto barrier = vk::BufferMemoryBarrier2{
+-            .srcStageMask = stage,
+-            .srcAccessMask = access_mask,
+-            .dstStageMask = dst_stage,
+-            .dstAccessMask = dst_acess_mask,
+-            .buffer = buffer.buffer,
+-            .offset = offset,
+-            .size = size_bytes - offset,
+-        };
+-        access_mask = dst_acess_mask;
+-        stage = dst_stage;
+-        return barrier;
++        return GetBufferBarrier(buffer.buffer, size_bytes, access_mask, stage, dst_acess_mask,
++                                dst_stage, offset, force_dependency);
+     }
+ 
+     void Fill(u64 offset, u32 num_bytes, u32 value);
+diff --git a/src/video_core/buffer_cache/buffer_access_state.h b/src/video_core/buffer_cache/buffer_access_state.h
+new file mode 100644
+index 0000000..9c70cb2
+--- /dev/null
++++ b/src/video_core/buffer_cache/buffer_access_state.h
+@@ -0,0 +1,45 @@
++// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <cassert>
++#include <optional>
++#include "common/types.h"
++#include "video_core/renderer_vulkan/vk_common.h"
++
++namespace VideoCore {
++
++inline std::optional<vk::BufferMemoryBarrier2> GetBufferBarrier(
++    vk::Buffer buffer, u64 size_bytes, vk::AccessFlags2& access_mask,
++    vk::PipelineStageFlagBits2& stage, vk::AccessFlags2 dst_access_mask,
++    vk::PipelineStageFlagBits2 dst_stage, [[maybe_unused]] u32 offset = 0,
++    bool force_dependency = false) {
++    assert(offset < size_bytes);
++
++    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
++                                 vk::AccessFlagBits2::eShaderWrite |
++                                 vk::AccessFlagBits2::eShaderStorageWrite |
++                                 vk::AccessFlagBits2::eHostWrite |
++                                 vk::AccessFlagBits2::eMemoryWrite;
++    const bool previous_access_writes = static_cast<bool>(access_mask & write_flags);
++    if (!force_dependency && !previous_access_writes && dst_access_mask == access_mask &&
++        stage == dst_stage) {
++        return {};
++    }
++
++    const auto barrier = vk::BufferMemoryBarrier2{
++        .srcStageMask = stage,
++        .srcAccessMask = access_mask,
++        .dstStageMask = dst_stage,
++        .dstAccessMask = dst_access_mask,
++        .buffer = buffer,
++        .offset = 0,
++        .size = size_bytes,
++    };
++    access_mask = dst_access_mask;
++    stage = dst_stage;
++    return barrier;
++}
++
++}
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+index 8681b88..d7e4063 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -17,7 +17,7 @@ namespace Serialization {
+ // Version 19 contained an unverified unscaled DS_ORDERED_COUNT address experiment. Version 20
+ // restores the coherent Liverpool byte-to-dword mapping and prevents any revision-19 shader,
+ // including untargeted generic ordered-count modules, from being reused.
+-static constexpr u32 ShaderBinaryVersion = 20u;
++static constexpr u32 ShaderBinaryVersion = 21u;
+ static constexpr u32 ShaderMetaVersion = 6u;
+ static constexpr u32 PreviousShaderMetaVersion = 5u;
+ static constexpr u32 PipelineKeyVersion = 3u;
+diff --git a/tests/gcn/test_gcn_instructions.cpp b/tests/gcn/test_gcn_instructions.cpp
+index be2f238..a74477a 100644
+--- a/tests/gcn/test_gcn_instructions.cpp
++++ b/tests/gcn/test_gcn_instructions.cpp
+@@ -2,9 +2,11 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cmath>
++#include <unordered_set>
+ 
+ #include <gtest/gtest.h>
+ #include <half.hpp>
++#include <spirv/unified1/spirv.hpp>
+ 
+ #include "gcn_test_runner.hpp"
+ #include "instructions.hpp"
+@@ -25,6 +27,53 @@ protected:
+     }
+ };
+ 
++TEST(GcnSwizzle, QuadBroadcastIndicesAreConstant) {
++    for (u32 lane_pattern = 0; lane_pattern < 256; ++lane_pattern) {
++        const u32 pattern = 0x8000U | lane_pattern;
++        const std::array<u64, 1> instructions{0xd8d40000U | pattern};
++        const auto spirv = TranslateToSpirv(instructions, true, 0xa5a5a5a5U);
++        std::unordered_set<u32> constants;
++        u32 broadcasts = 0;
++        for (size_t offset = 5; offset < spirv.size();) {
++            const u32 word_count = spirv[offset] >> 16;
++            const auto opcode = static_cast<spv::Op>(spirv[offset] & 0xffff);
++            ASSERT_GT(word_count, 0U);
++            ASSERT_LE(offset + word_count, spirv.size());
++            if (opcode == spv::OpConstant) {
++                constants.insert(spirv[offset + 2]);
++            } else if (opcode == spv::OpGroupNonUniformQuadBroadcast) {
++                ++broadcasts;
++                EXPECT_TRUE(constants.contains(spirv[offset + 5])) << pattern;
++            }
++            offset += word_count;
++        }
++        EXPECT_GE(broadcasts, 1U);
++        EXPECT_LE(broadcasts, 4U);
++    }
++}
++
++TEST_F(GcnTest, ds_swizzle_quad_permutations_and_inactive_sources) {
++    const auto runner_result = gcn_test::Runner::instance();
++    ASSERT_TRUE(runner_result.has_value()) << runner_result.error().message;
++    auto* runner = *runner_result;
++    for (u32 mask : {0xffffffffU, 0xa5a5a5a5U, 0x80000001U}) {
++        for (u32 pattern : {0x8000U, 0x80b1U, 0x80e4U, 0x801bU, 0x805aU}) {
++            const std::array<u64, 1> instructions{0xd8d40000U | pattern};
++            const auto spirv = TranslateToSpirv(instructions, true, mask);
++            const auto result = runner->run<std::array<u32, 32>>(spirv, std::array<u32, 4>{});
++            ASSERT_TRUE(result.has_value()) << result.error().message;
++            for (u32 lane = 0; lane < 32; ++lane) {
++                if (!(mask & (1U << lane))) {
++                    continue;
++                }
++                const u32 source = (lane & ~3U) | ((pattern >> (2 * (lane & 3U))) & 3U);
++                const u32 expected = mask & (1U << source) ? source + 1 : 0;
++                EXPECT_EQ((*result)[lane], expected) << pattern << ":" << mask << ":" << lane;
++            }
++        }
++    }
++}
++
+ TEST(Ce3CoverageTrace, DecisionAndTrinaryRangesAreContiguousAndBounded) {
+     namespace Capture = Shader::DreamsCompat::Ce3CoverageTrace;
+     EXPECT_EQ(Capture::DecisionDword(Capture::DecisionSites - 1,
+diff --git a/tests/gcn/translator.cpp b/tests/gcn/translator.cpp
+index bd8def2..f954173 100644
+--- a/tests/gcn/translator.cpp
++++ b/tests/gcn/translator.cpp
+@@ -27,11 +27,15 @@ std::vector<u32> TranslateToSpirv(u64 raw_gcn_inst) {
+     return TranslateToSpirv(std::span<const u64>{&raw_gcn_inst, 1});
+ }
+ 
+-std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
++std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts, bool lane_inputs,
++                                u32 exec_mask) {
+     std::array<u32, 2> store{
+         0xe0700000,
+         0x80000000 // buffer_store_dword v0, v0, s[0:3], 0
+     };
++    if (lane_inputs) {
++        store = {0xe0701000, 0x80000001};
++    }
+     Gcn::GcnCodeSlice second(store.data(), store.data() + store.size());
+ 
+     Gcn::GcnDecodeContext decoder;
+@@ -72,7 +76,7 @@ std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
+     RuntimeInfo runtime_info{};
+     runtime_info.Initialize(Stage::Compute);
+     runtime_info.num_user_data = 4;
+-    runtime_info.cs_info.workgroup_size = {1, 1, 1};
++    runtime_info.cs_info.workgroup_size = {lane_inputs ? 32U : 1U, 1, 1};
+ 
+     Gcn::Translator translator(program.info, runtime_info, profile);
+     translator.EmitPrologue(block);
+@@ -87,9 +91,21 @@ std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
+         mov.dst[0].code = i;
+         translator.S_MOV(mov);
+     }
++    IR::IREmitter ir{*block};
++    if (lane_inputs) {
++        const IR::U32 lane = ir.LaneId();
++        ir.SetVectorReg(IR::VectorReg{0}, ir.IAdd(lane, ir.Imm32(1)));
++        ir.SetVectorReg(IR::VectorReg{1}, ir.ShiftLeftLogical(lane, ir.Imm32(2)));
++        const IR::U32 bit = ir.BitwiseAnd(ir.ShiftRightLogical(ir.Imm32(exec_mask), lane),
++                                         ir.Imm32(1));
++        ir.SetExec(IR::U1{ir.INotEqual(bit, ir.Imm32(0))});
++    }
+     for (const Gcn::GcnInst& inst : instructions) {
+         translator.TranslateInstruction(inst);
+     }
++    if (lane_inputs) {
++        ir.SetExec(ir.Imm1(true));
++    }
+     translator.TranslateInstruction(store_inst);
+ 
+     Shader::Optimization::SsaRewritePass(program.post_order_blocks);
+diff --git a/tests/gcn/translator.hpp b/tests/gcn/translator.hpp
+index 7105e95..7212b26 100644
+--- a/tests/gcn/translator.hpp
++++ b/tests/gcn/translator.hpp
+@@ -9,4 +9,5 @@
+ #include "common/types.h"
+ 
+ std::vector<u32> TranslateToSpirv(u64 raw_gcn_inst);
+-std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts);
++std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts, bool lane_inputs = false,
++                                u32 exec_mask = ~u32{0});
+diff --git a/tools/tests/buffer_access_state/test_buffer_access_state.cpp b/tools/tests/buffer_access_state/test_buffer_access_state.cpp
+new file mode 100644
+index 0000000..0f66cc9
+--- /dev/null
++++ b/tools/tests/buffer_access_state/test_buffer_access_state.cpp
+@@ -0,0 +1,116 @@
++// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <cstdio>
++#include <cstdlib>
++#include <limits>
++#include "video_core/buffer_cache/buffer_access_state.h"
++
++namespace {
++
++struct AccessState {
++    std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::Buffer buffer, u64 size,
++                                                       vk::AccessFlags2 destination_access,
++                                                       vk::PipelineStageFlagBits2 destination_stage,
++                                                       u32 offset = 0, bool force = false) {
++        return VideoCore::GetBufferBarrier(buffer, size, access_mask, stage, destination_access,
++                                           destination_stage, offset, force);
++    }
++
++    vk::AccessFlags2 access_mask{vk::AccessFlagBits2::eMemoryRead |
++                                 vk::AccessFlagBits2::eMemoryWrite};
++    vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
++};
++
++void Require(bool condition, const char* expression) {
++    if (!condition) {
++        std::fprintf(stderr, "FAIL: %s\n", expression);
++        std::exit(EXIT_FAILURE);
++    }
++}
++
++void DisjointReadPreservesPriorWriteVisibility() {
++    AccessState state;
++    constexpr u64 size = 256;
++    constexpr auto stage = vk::PipelineStageFlagBits2::eComputeShader;
++    constexpr auto read = vk::AccessFlagBits2::eShaderRead;
++    constexpr auto write = vk::AccessFlagBits2::eShaderWrite;
++    state.GetBarrier({}, size, write, stage, 0);
++    const auto barrier = state.GetBarrier({}, size, read, stage, 128);
++    Require(barrier.has_value(), "write A -> read B emits a dependency");
++    Require(static_cast<bool>(barrier->srcAccessMask & write), "source includes A's shader write");
++    Require(barrier->offset == 0 && barrier->size == size, "dependency covers A and B");
++    Require(!state.GetBarrier({}, size, read, stage, 0), "read A reuses full-buffer visibility");
++}
++
++void RepeatedStorageWritesRemainOrdered() {
++    AccessState state;
++    constexpr auto read_write =
++        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
++    constexpr auto stage = vk::PipelineStageFlagBits2::eComputeShader;
++    state.GetBarrier({}, 256, read_write, stage, 64);
++    const auto barrier = state.GetBarrier({}, 256, read_write, stage, 64);
++    Require(barrier.has_value(), "repeated read/write emits a dependency");
++    Require(barrier->srcAccessMask == read_write && barrier->dstAccessMask == read_write,
++            "repeated read/write preserves access scopes");
++    Require(barrier->srcStageMask == stage && barrier->dstStageMask == stage,
++            "repeated read/write preserves stages");
++}
++
++void ReadOnlyReuseAndForcedDependency() {
++    AccessState state;
++    constexpr auto read = vk::AccessFlagBits2::eShaderRead;
++    constexpr auto stage = vk::PipelineStageFlagBits2::eComputeShader;
++    state.GetBarrier({}, 256, read, stage);
++    Require(!state.GetBarrier({}, 256, read, stage, 128), "repeated read-only skips dependency");
++    const auto barrier = state.GetBarrier({}, 256, read, stage, 128, true);
++    Require(barrier.has_value(), "forced read-only dependency is emitted");
++    Require(barrier->offset == 0 && barrier->size == 256, "forced dependency covers full buffer");
++}
++
++void SpecificWritesRemainOrdered() {
++    for (const auto write :
++         {vk::AccessFlagBits2::eShaderStorageWrite, vk::AccessFlagBits2::eHostWrite}) {
++        AccessState state;
++        const auto stage = write == vk::AccessFlagBits2::eHostWrite
++                               ? vk::PipelineStageFlagBits2::eHost
++                               : vk::PipelineStageFlagBits2::eComputeShader;
++        state.GetBarrier({}, 256, write, stage, 64);
++        const auto barrier = state.GetBarrier({}, 256, write, stage, 64);
++        Require(barrier.has_value(), "repeated specific write emits a dependency");
++        Require(barrier->srcAccessMask == write && barrier->dstAccessMask == write,
++                "specific write scopes are preserved");
++    }
++}
++
++void LargeBufferRetainsFullSize() {
++    AccessState state;
++    constexpr u64 size = (u64{1} << 33) + 256;
++    const auto barrier =
++        state.GetBarrier({}, size, vk::AccessFlagBits2::eTransferRead,
++                         vk::PipelineStageFlagBits2::eTransfer, std::numeric_limits<u32>::max());
++    Require(barrier.has_value(), "large buffer transition emits dependency");
++    Require(barrier->offset == 0 && barrier->size == size, "full size is not truncated to 32 bits");
++}
++
++void StateAndHandleFollowTransition() {
++    AccessState state;
++    const auto handle = vk::Buffer{reinterpret_cast<VkBuffer>(std::uintptr_t{1})};
++    constexpr auto read = vk::AccessFlagBits2::eIndexRead;
++    constexpr auto stage = vk::PipelineStageFlagBits2::eIndexInput;
++    const auto barrier = state.GetBarrier(handle, 256, read, stage, 32);
++    Require(barrier && barrier->buffer == handle, "barrier preserves buffer handle");
++    Require(state.access_mask == read && state.stage == stage, "state records destination access");
++}
++
++}
++
++int main() {
++    DisjointReadPreservesPriorWriteVisibility();
++    RepeatedStorageWritesRemainOrdered();
++    ReadOnlyReuseAndForcedDependency();
++    SpecificWritesRemainOrdered();
++    LargeBufferRetainsFullSize();
++    StateAndHandleFollowTransition();
++    std::puts("PASS: 6 buffer access state regressions");
++}
+diff --git a/tools/tests/dreams_ordered_replay/test_ordered_count_semantics.py b/tools/tests/dreams_ordered_replay/test_ordered_count_semantics.py
+index 2188be3..a13c7da 100644
+--- a/tools/tests/dreams_ordered_replay/test_ordered_count_semantics.py
++++ b/tools/tests/dreams_ordered_replay/test_ordered_count_semantics.py
+@@ -342,7 +342,7 @@ class ProductionSourceContractTests(unittest.TestCase):
+         serialization = (
+             SOURCE_ROOT / "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
+         ).read_text(encoding="utf-8")
+-        self.assertRegex(serialization, r"ShaderBinaryVersion\s*=\s*20u;")
++        self.assertRegex(serialization, r"ShaderBinaryVersion\s*=\s*21u;")
+ 
+     def test_frontend_makes_empty_exec_lane_selection_defined(self) -> None:
+         source = (

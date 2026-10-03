@@ -1,0 +1,87 @@
+{
+  "capture": "D:\\CodexData\\Workspaces\\2026-09-04\\usi\\work\\dispatch-runtime-20260904\\startup-20260904-163209",
+  "run": {
+    "started_utc": "2026-09-04T23:32:09.8300093Z",
+    "duration_seconds": 5.5,
+    "reason": "exited",
+    "exit_code": -2147483645,
+    "executable": "D:\\CodexData\\Workspaces\\2026-09-04\\usi\\work\\dispatch-runtime-20260904\\shadps4.exe",
+    "executable_sha256": "A02BC6FB964F21A4658EA2A8657171481F132C7DCC38B57FFB792559816E10FD",
+    "working_directory": "D:\\CodexData\\Workspaces\\2026-09-04\\usi\\work\\dispatch-runtime-20260904",
+    "game_path": "D:\\Emulators\\ShadPS4\\Games\\CUSA04301\\CUSA04301\\eboot.bin",
+    "profile": "isolated diagnostic profile; configuration/default users copied from earlier isolated baseline; no saves copied",
+    "samples": [],
+    "stopped": []
+  },
+  "shader": "0xcbac06d2",
+  "observed_launch": {
+    "kind": "direct",
+    "shader": 3417048786,
+    "program_address": 9707847680,
+    "user_sgprs": 2,
+    "dispatch_initiator": 9
+  },
+  "observed_register_state": {
+    "shader": 3417048786,
+    "dimension_registers": [
+      24,
+      1,
+      1
+    ],
+    "start": [
+      0,
+      0,
+      0
+    ],
+    "threads": [
+      64,
+      1,
+      1
+    ],
+    "partial_threads": [
+      0,
+      0,
+      0
+    ],
+    "tg_size_enable": true,
+    "tgid_enable": [
+      true,
+      false,
+      false
+    ],
+    "dispatch_initiator": 9,
+    "ordered_append_enable": true,
+    "ordered_append_per_threadgroup": false,
+    "dispatch_out_of_order": false,
+    "max_wave_id": 0
+  },
+  "recorded_lines": [
+    "[Render.Vulkan] <Info> (shadPS4:GpuCommandProcessor) vk_rasterizer.cpp:330 DispatchDirect: Compute launch: kind=direct shader=0xcbac06d2 program_address=0x242a20000 user_sgprs=2 dispatch_initiator=0x9",
+    "[Render.Vulkan] <Info> (shadPS4:GpuCommandProcessor) vk_pipeline_cache.cpp:634 CompileModule: Compute dispatch: shader=0xcbac06d2 dimension_registers=(24,1,1) start=(0,0,0) threads=(64,1,1) partial_threads=(0,0,0) tg_size_enable=true tgid_enable=(true,false,false) dispatch_initiator=0x9 ordered_append_enable=true ordered_append_per_threadgroup=false dispatch_out_of_order=false max_wave_id=0"
+  ],
+  "dispatch_dimensions": [
+    24,
+    1,
+    1
+  ],
+  "expected_tg_info_sgpr_from_enabled_register_layout": 3,
+  "tg_info_emulation": "Missing from current compute prologue; no measured PS4 TG_INFO value.",
+  "shader_dump_sha256": "6d024583de0764ebb5eca74772dfca8ff2d460667c39afd844b070cd14f10ce2",
+  "source_commit": "f47e5f5cfeecffa036861fc221e634336516de11",
+  "build_provenance_sha256": "44c86ab7829ebeefbd208fa8ca28dc6645ae4cc98ae2f409be9e676a4373ccc5",
+  "compilation_units": 390,
+  "frozen_baseline_sha256_after_capture": "f27e15d833b7b3690c4ad4a52dbe111b5df7c9ac552e366e3e08f7212535d05d",
+  "dumping_disabled_after_capture": true,
+  "failure_lines": [
+    "[Render.Recompiler] <Error> (shadPS4:GpuCommandProcessor) translate.cpp:1154 LogMissingOpcode: Unknown opcode DS_ORDERED_COUNT (1681, category = DataShare)",
+    "[Debug] <Critical> (shadPS4:GpuCommandProcessor) structured_control_flow.cpp:802 BuildASL: Assertion Failed!",
+    "Shader translation has failed"
+  ],
+  "limitations": [
+    "These are emulator-observed guest register settings, not a PS4 hardware trace.",
+    "No actual initial EXEC, hardware ordered token, returned result lane, or GDS initial contents were measured.",
+    "Dimension registers are not actual dimensions for indirect dispatches.",
+    "No DS_ORDERED_COUNT execution implementation or full game fix established.",
+    "Clean-core startup failure remains distinct from earlier research-build Edit Mode visual defects."
+  ]
+}

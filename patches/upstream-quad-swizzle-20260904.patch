@@ -1,0 +1,157 @@
+diff --git a/src/shader_recompiler/frontend/translate/data_share.cpp b/src/shader_recompiler/frontend/translate/data_share.cpp
+index 499c602..61e1e1f 100644
+--- a/src/shader_recompiler/frontend/translate/data_share.cpp
++++ b/src/shader_recompiler/frontend/translate/data_share.cpp
+@@ -307,9 +307,20 @@ void Translator::DS_SWIZZLE_B32(const GcnInst& inst) {
+     const IR::U32 lane_id = ir.LaneId();
+     if (offset1 & 0x80) {
+         const IR::U32 id_in_group = ir.BitwiseAnd(lane_id, ir.Imm32(0b11));
+-        const IR::U32 base = ir.ShiftLeftLogical(id_in_group, ir.Imm32(1));
+-        const IR::U32 index = ir.BitFieldExtract(ir.Imm32(offset0), base, ir.Imm32(2));
+-        SetDst(inst.dst[0], ir.QuadShuffle(src, index));
++        std::array<IR::U32, 4> sources{};
++        for (u32 lane = 0; lane < 4; ++lane) {
++            const u32 source_index = (offset0 >> (lane * 2)) & 3;
++            if (sources[source_index].IsEmpty()) {
++                sources[source_index] = ir.QuadShuffle(src, ir.Imm32(source_index));
++            }
++        }
++        IR::U32 shuffled = sources[offset0 & 3];
++        for (u32 lane = 1; lane < 4; ++lane) {
++            const u32 source_index = (offset0 >> (lane * 2)) & 3;
++            const IR::U1 selected{ir.IEqual(id_in_group, ir.Imm32(lane))};
++            shuffled = IR::U32{ir.Select(selected, sources[source_index], shuffled)};
++        }
++        SetDst(inst.dst[0], shuffled);
+     } else {
+         const u8 and_mask = (offset0 & 0x1f) | (~u8{0} << 5);
+         const u8 or_mask = (offset0 >> 5) | ((offset1 & 0x3) << 3);
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+index bdc37cb..6000b0b 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -12,7 +12,7 @@
+ 
+ namespace Serialization {
+ /* You should increment versions below once corresponding serialization scheme is changed. */
+-static constexpr u32 ShaderBinaryVersion = 4u;
++static constexpr u32 ShaderBinaryVersion = 5u;
+ static constexpr u32 ShaderMetaVersion = 3u;
+ static constexpr u32 PipelineKeyVersion = 3u;
+ } // namespace Serialization
+diff --git a/tests/gcn/test_gcn_instructions.cpp b/tests/gcn/test_gcn_instructions.cpp
+index c5a9194..baefef3 100644
+--- a/tests/gcn/test_gcn_instructions.cpp
++++ b/tests/gcn/test_gcn_instructions.cpp
+@@ -2,9 +2,11 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cmath>
++#include <unordered_set>
+ 
+ #include <gtest/gtest.h>
+ #include <half.hpp>
++#include <spirv/unified1/spirv.hpp>
+ 
+ #include "gcn_test_runner.hpp"
+ #include "instructions.hpp"
+@@ -21,6 +23,47 @@ protected:
+     }
+ };
+ 
++TEST(GcnSwizzle, QuadBroadcastIndicesAreConstant) {
++    for (u32 lane_pattern = 0; lane_pattern < 256; ++lane_pattern) {
++        const u32 pattern = 0x8000U | lane_pattern;
++        const std::array<u64, 1> instructions{0xd8d40000U | pattern};
++        const auto spirv = TranslateToSpirv(instructions, true);
++        std::unordered_set<u32> constants;
++        u32 broadcasts = 0;
++        for (size_t offset = 5; offset < spirv.size();) {
++            const u32 word_count = spirv[offset] >> 16;
++            const auto opcode = static_cast<spv::Op>(spirv[offset] & 0xffff);
++            ASSERT_GT(word_count, 0U);
++            ASSERT_LE(offset + word_count, spirv.size());
++            if (opcode == spv::OpConstant) {
++                constants.insert(spirv[offset + 2]);
++            } else if (opcode == spv::OpGroupNonUniformQuadBroadcast) {
++                ++broadcasts;
++                EXPECT_TRUE(constants.contains(spirv[offset + 5])) << pattern;
++            }
++            offset += word_count;
++        }
++        EXPECT_GE(broadcasts, 1U);
++        EXPECT_LE(broadcasts, 4U);
++    }
++}
++
++TEST_F(GcnTest, ds_swizzle_quad_permutations) {
++    const auto runner_result = gcn_test::Runner::instance();
++    ASSERT_TRUE(runner_result.has_value()) << runner_result.error().message;
++    auto* runner = *runner_result;
++    for (u32 pattern : {0x8000U, 0x80b1U, 0x80e4U, 0x801bU, 0x805aU}) {
++        const std::array<u64, 1> instructions{0xd8d40000U | pattern};
++        const auto spirv = TranslateToSpirv(instructions, true);
++        const auto result = runner->run<std::array<u32, 32>>(spirv, std::array<u32, 4>{});
++        ASSERT_TRUE(result.has_value()) << result.error().message;
++        for (u32 lane = 0; lane < 32; ++lane) {
++            const u32 source = (lane & ~3U) | ((pattern >> (2 * (lane & 3U))) & 3U);
++            EXPECT_EQ((*result)[lane], source + 1) << pattern << ":" << lane;
++        }
++    }
++}
++
+ struct F32x2 {
+     float a;
+     float b;
+diff --git a/tests/gcn/translator.cpp b/tests/gcn/translator.cpp
+index 4909beb..abe9118 100644
+--- a/tests/gcn/translator.cpp
++++ b/tests/gcn/translator.cpp
+@@ -27,11 +27,14 @@ std::vector<u32> TranslateToSpirv(u64 raw_gcn_inst) {
+     return TranslateToSpirv(std::span<const u64>{&raw_gcn_inst, 1});
+ }
+ 
+-std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
++std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts, bool lane_inputs) {
+     std::array<u32, 2> store{
+         0xe0700000,
+         0x80000000 // buffer_store_dword v0, v0, s[0:3], 0
+     };
++    if (lane_inputs) {
++        store = {0xe0701000, 0x80000001};
++    }
+     Gcn::GcnCodeSlice second(store.data(), store.data() + store.size());
+ 
+     Gcn::GcnDecodeContext decoder;
+@@ -72,7 +75,7 @@ std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
+     RuntimeInfo runtime_info{};
+     runtime_info.Initialize(Stage::Compute);
+     runtime_info.num_user_data = 4;
+-    runtime_info.cs_info.workgroup_size = {1, 1, 1};
++    runtime_info.cs_info.workgroup_size = {lane_inputs ? 32U : 1U, 1, 1};
+ 
+     Gcn::Translator translator(program.info, runtime_info, profile);
+     translator.EmitPrologue(block);
+@@ -87,6 +90,12 @@ std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
+         mov.dst[0].code = i;
+         translator.S_MOV(mov);
+     }
++    IR::IREmitter ir{*block};
++    if (lane_inputs) {
++        const IR::U32 lane = ir.LaneId();
++        ir.SetVectorReg(IR::VectorReg{0}, ir.IAdd(lane, ir.Imm32(1)));
++        ir.SetVectorReg(IR::VectorReg{1}, ir.ShiftLeftLogical(lane, ir.Imm32(2)));
++    }
+     for (const Gcn::GcnInst& inst : instructions) {
+         translator.TranslateInstruction(inst);
+     }
+diff --git a/tests/gcn/translator.hpp b/tests/gcn/translator.hpp
+index 7105e95..821787e 100644
+--- a/tests/gcn/translator.hpp
++++ b/tests/gcn/translator.hpp
+@@ -9,4 +9,4 @@
+ #include "common/types.h"
+ 
+ std::vector<u32> TranslateToSpirv(u64 raw_gcn_inst);
+-std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts);
++std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts, bool lane_inputs = false);

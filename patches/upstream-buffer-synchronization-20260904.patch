@@ -1,0 +1,212 @@
+diff --git a/src/video_core/buffer_cache/buffer.h b/src/video_core/buffer_cache/buffer.h
+index 0b71a15..01f616a 100644
+--- a/src/video_core/buffer_cache/buffer.h
++++ b/src/video_core/buffer_cache/buffer.h
+@@ -10,6 +10,7 @@
+ #include "common/types.h"
+ #include "core/memory.h"
+ #include "video_core/amdgpu/resource.h"
++#include "video_core/buffer_cache/buffer_access_state.h"
+ #include "video_core/renderer_vulkan/vk_common.h"
+ 
+ namespace Vulkan {
+@@ -128,24 +129,8 @@ public:
+     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
+                                                        vk::PipelineStageFlagBits2 dst_stage,
+                                                        u32 offset = 0) {
+-        if (dst_acess_mask == access_mask && stage == dst_stage) {
+-            return {};
+-        }
+-
+-        DEBUG_ASSERT(offset < size_bytes);
+-
+-        const auto barrier = vk::BufferMemoryBarrier2{
+-            .srcStageMask = stage,
+-            .srcAccessMask = access_mask,
+-            .dstStageMask = dst_stage,
+-            .dstAccessMask = dst_acess_mask,
+-            .buffer = buffer.buffer,
+-            .offset = offset,
+-            .size = size_bytes - offset,
+-        };
+-        access_mask = dst_acess_mask;
+-        stage = dst_stage;
+-        return barrier;
++        return GetBufferBarrier(buffer.buffer, size_bytes, access_mask, stage, dst_acess_mask,
++                                dst_stage, offset);
+     }
+ 
+     void Fill(u64 offset, u32 num_bytes, u32 value);
+diff --git a/src/video_core/buffer_cache/buffer_access_state.h b/src/video_core/buffer_cache/buffer_access_state.h
+new file mode 100644
+index 0000000..9c70cb2
+--- /dev/null
++++ b/src/video_core/buffer_cache/buffer_access_state.h
+@@ -0,0 +1,45 @@
++// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <cassert>
++#include <optional>
++#include "common/types.h"
++#include "video_core/renderer_vulkan/vk_common.h"
++
++namespace VideoCore {
++
++inline std::optional<vk::BufferMemoryBarrier2> GetBufferBarrier(
++    vk::Buffer buffer, u64 size_bytes, vk::AccessFlags2& access_mask,
++    vk::PipelineStageFlagBits2& stage, vk::AccessFlags2 dst_access_mask,
++    vk::PipelineStageFlagBits2 dst_stage, [[maybe_unused]] u32 offset = 0,
++    bool force_dependency = false) {
++    assert(offset < size_bytes);
++
++    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
++                                 vk::AccessFlagBits2::eShaderWrite |
++                                 vk::AccessFlagBits2::eShaderStorageWrite |
++                                 vk::AccessFlagBits2::eHostWrite |
++                                 vk::AccessFlagBits2::eMemoryWrite;
++    const bool previous_access_writes = static_cast<bool>(access_mask & write_flags);
++    if (!force_dependency && !previous_access_writes && dst_access_mask == access_mask &&
++        stage == dst_stage) {
++        return {};
++    }
++
++    const auto barrier = vk::BufferMemoryBarrier2{
++        .srcStageMask = stage,
++        .srcAccessMask = access_mask,
++        .dstStageMask = dst_stage,
++        .dstAccessMask = dst_access_mask,
++        .buffer = buffer,
++        .offset = 0,
++        .size = size_bytes,
++    };
++    access_mask = dst_access_mask;
++    stage = dst_stage;
++    return barrier;
++}
++
++}
+diff --git a/tools/tests/buffer_access_state/test_buffer_access_state.cpp b/tools/tests/buffer_access_state/test_buffer_access_state.cpp
+new file mode 100644
+index 0000000..0f66cc9
+--- /dev/null
++++ b/tools/tests/buffer_access_state/test_buffer_access_state.cpp
+@@ -0,0 +1,116 @@
++// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <cstdio>
++#include <cstdlib>
++#include <limits>
++#include "video_core/buffer_cache/buffer_access_state.h"
++
++namespace {
++
++struct AccessState {
++    std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::Buffer buffer, u64 size,
++                                                       vk::AccessFlags2 destination_access,
++                                                       vk::PipelineStageFlagBits2 destination_stage,
++                                                       u32 offset = 0, bool force = false) {
++        return VideoCore::GetBufferBarrier(buffer, size, access_mask, stage, destination_access,
++                                           destination_stage, offset, force);
++    }
++
++    vk::AccessFlags2 access_mask{vk::AccessFlagBits2::eMemoryRead |
++                                 vk::AccessFlagBits2::eMemoryWrite};
++    vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
++};
++
++void Require(bool condition, const char* expression) {
++    if (!condition) {
++        std::fprintf(stderr, "FAIL: %s\n", expression);
++        std::exit(EXIT_FAILURE);
++    }
++}
++
++void DisjointReadPreservesPriorWriteVisibility() {
++    AccessState state;
++    constexpr u64 size = 256;
++    constexpr auto stage = vk::PipelineStageFlagBits2::eComputeShader;
++    constexpr auto read = vk::AccessFlagBits2::eShaderRead;
++    constexpr auto write = vk::AccessFlagBits2::eShaderWrite;
++    state.GetBarrier({}, size, write, stage, 0);
++    const auto barrier = state.GetBarrier({}, size, read, stage, 128);
++    Require(barrier.has_value(), "write A -> read B emits a dependency");
++    Require(static_cast<bool>(barrier->srcAccessMask & write), "source includes A's shader write");
++    Require(barrier->offset == 0 && barrier->size == size, "dependency covers A and B");
++    Require(!state.GetBarrier({}, size, read, stage, 0), "read A reuses full-buffer visibility");
++}
++
++void RepeatedStorageWritesRemainOrdered() {
++    AccessState state;
++    constexpr auto read_write =
++        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
++    constexpr auto stage = vk::PipelineStageFlagBits2::eComputeShader;
++    state.GetBarrier({}, 256, read_write, stage, 64);
++    const auto barrier = state.GetBarrier({}, 256, read_write, stage, 64);
++    Require(barrier.has_value(), "repeated read/write emits a dependency");
++    Require(barrier->srcAccessMask == read_write && barrier->dstAccessMask == read_write,
++            "repeated read/write preserves access scopes");
++    Require(barrier->srcStageMask == stage && barrier->dstStageMask == stage,
++            "repeated read/write preserves stages");
++}
++
++void ReadOnlyReuseAndForcedDependency() {
++    AccessState state;
++    constexpr auto read = vk::AccessFlagBits2::eShaderRead;
++    constexpr auto stage = vk::PipelineStageFlagBits2::eComputeShader;
++    state.GetBarrier({}, 256, read, stage);
++    Require(!state.GetBarrier({}, 256, read, stage, 128), "repeated read-only skips dependency");
++    const auto barrier = state.GetBarrier({}, 256, read, stage, 128, true);
++    Require(barrier.has_value(), "forced read-only dependency is emitted");
++    Require(barrier->offset == 0 && barrier->size == 256, "forced dependency covers full buffer");
++}
++
++void SpecificWritesRemainOrdered() {
++    for (const auto write :
++         {vk::AccessFlagBits2::eShaderStorageWrite, vk::AccessFlagBits2::eHostWrite}) {
++        AccessState state;
++        const auto stage = write == vk::AccessFlagBits2::eHostWrite
++                               ? vk::PipelineStageFlagBits2::eHost
++                               : vk::PipelineStageFlagBits2::eComputeShader;
++        state.GetBarrier({}, 256, write, stage, 64);
++        const auto barrier = state.GetBarrier({}, 256, write, stage, 64);
++        Require(barrier.has_value(), "repeated specific write emits a dependency");
++        Require(barrier->srcAccessMask == write && barrier->dstAccessMask == write,
++                "specific write scopes are preserved");
++    }
++}
++
++void LargeBufferRetainsFullSize() {
++    AccessState state;
++    constexpr u64 size = (u64{1} << 33) + 256;
++    const auto barrier =
++        state.GetBarrier({}, size, vk::AccessFlagBits2::eTransferRead,
++                         vk::PipelineStageFlagBits2::eTransfer, std::numeric_limits<u32>::max());
++    Require(barrier.has_value(), "large buffer transition emits dependency");
++    Require(barrier->offset == 0 && barrier->size == size, "full size is not truncated to 32 bits");
++}
++
++void StateAndHandleFollowTransition() {
++    AccessState state;
++    const auto handle = vk::Buffer{reinterpret_cast<VkBuffer>(std::uintptr_t{1})};
++    constexpr auto read = vk::AccessFlagBits2::eIndexRead;
++    constexpr auto stage = vk::PipelineStageFlagBits2::eIndexInput;
++    const auto barrier = state.GetBarrier(handle, 256, read, stage, 32);
++    Require(barrier && barrier->buffer == handle, "barrier preserves buffer handle");
++    Require(state.access_mask == read && state.stage == stage, "state records destination access");
++}
++
++}
++
++int main() {
++    DisjointReadPreservesPriorWriteVisibility();
++    RepeatedStorageWritesRemainOrdered();
++    ReadOnlyReuseAndForcedDependency();
++    SpecificWritesRemainOrdered();
++    LargeBufferRetainsFullSize();
++    StateAndHandleFollowTransition();
++    std::puts("PASS: 6 buffer access state regressions");
++}

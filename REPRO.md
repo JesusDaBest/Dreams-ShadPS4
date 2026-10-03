@@ -1,5 +1,7 @@
 # Reproduction Notes
 
+> **Latest September 4 runtime test:** [CLEAN_CORE_TEST_20260904.md](CLEAN_CORE_TEST_20260904.md) records two actual official-core runs with the general GPU corrections. Both fail translating `DS_ORDERED_COUNT` in `cbac06d2`; Dreams is not working on this build. This supersedes the earlier plan to establish a clean-core run. Earlier GPU provenance and correction tests remain in [HANDOFF_20260904.md](HANDOFF_20260904.md).
+
 ## September 2 focused producer-count test
 
 Do not use the September 2 WIP executable as a baseline performance build. For the next diagnostic

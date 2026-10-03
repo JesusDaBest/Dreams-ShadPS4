@@ -1,0 +1,31 @@
+{
+  "patches": [
+    {
+      "file": "upstream-buffer-synchronization-20260904.patch",
+      "base_commit": "f47e5f5cfeecffa036861fc221e634336516de11",
+      "sha256": "205942B65E7E9FDE93392A063FCCB745005813F60EBCA84595047069E98E35D1",
+      "bytes": 9186,
+      "application_check": "passed against a separate index loaded from base_commit"
+    },
+    {
+      "file": "upstream-quad-swizzle-20260904.patch",
+      "base_commit": "f47e5f5cfeecffa036861fc221e634336516de11",
+      "sha256": "3963DBB8E13529EE517C014C4DC842AD92097A4B8462ADBC83D2759BD2E81142",
+      "bytes": 6898,
+      "application_check": "passed against a separate index loaded from base_commit"
+    },
+    {
+      "file": "research-generic-gpu-corrections-20260904.patch",
+      "base_commit": "0d5ca6bdc98c1e55bd9438d80accc520703767a5",
+      "sha256": "AE60B042DC9E4BA39C184A2D4CACE7D51F4F5C55512C7F69CE2C18835451B6B4",
+      "bytes": 18928,
+      "application_check": "passed against a separate index loaded from base_commit"
+    }
+  ],
+  "research_build": {
+    "path": "D:\\CodexData\\Worktrees\\Dreams-ShadPS4\\3c77544\\Build\\x64-Clang-Release\\shadps4.exe",
+    "sha256": "8408220E51A4D0E434B9315FB5548D3AF2B29F9A28EEB99142886588B17EFD1F",
+    "clean_upstream_binary": false,
+    "game_tested": false
+  }
+}

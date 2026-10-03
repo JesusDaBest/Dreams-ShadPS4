@@ -1,5 +1,7 @@
 # Open Issues
 
+> **Latest September 4 runtime test:** [CLEAN_CORE_TEST_20260904.md](CLEAN_CORE_TEST_20260904.md) records two actual official-core runs with the general GPU corrections. Both fail translating `DS_ORDERED_COUNT` in `cbac06d2`; Dreams is not working on this build. This supersedes the earlier plan to establish a clean-core run. Earlier GPU provenance and correction tests remain in [HANDOFF_20260904.md](HANDOFF_20260904.md).
+
 ## 1. Find why the scene-record producer publishes zero or an incomplete prefix
 
 Capture flattened SRT words 41 and 18 immediately before queue producer `0x2bfebd3c`. Refresh word

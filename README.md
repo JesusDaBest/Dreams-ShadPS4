@@ -1,5 +1,27 @@
 # Dreams on shadPS4 Investigation
 
+## Research update — September 7, 2026
+
+This update publishes investigation records and experimental patch deltas. It does not replace the downloadable August 29 emulator checkpoint or claim a newer playable build.
+
+The [September 4 configuration comparison](Dreams-runtime-setting-fix-20260904.md) restored the patterned cube using Precise readbacks in the tested profile. This is a checkpoint-specific observation, not a universal compatibility fix. Screenshots and bounded logs are included in [the runtime evidence archive](Dreams-runtime-fix-evidence-20260904.zip).
+
+The official-core experiments below are separate from the retained research checkpoint. Their failed runs do not mean that the retained checkpoint stopped reaching edit mode. September 7 results concern standalone fixtures and offline shader compilation; renderer integration and gameplay remain unverified.
+
+> **September 7 feasibility decision:** [DOC_FEASIBILITY_CHECK_20260907.md](DOC_FEASIBILITY_CHECK_20260907.md) pauses further shared-planner expansion. The inspected difficult shaders do not disprove collect/prefix/replay, and specialized multi-wave machinery already exists in the research source. Runtime integration and performance remain unverified; a limited matched-build runtime comparison is the next decision gate. No build or game run was performed during this audit.
+
+> **Latest September 7 implementation:** [DOC_GDS_STORES_20260907.md](DOC_GDS_STORES_20260907.md) adds fixed scalar GDS stores after the final DOC, disjoint from all counters and reads. 133 synthetic GPU cases, 152 planner checks and 48 optimizer checks pass. Eight of 26 recovered permutations now compile to validated shared-DOC SPIR-V, covering seven distinct shaders. Runtime writer and stability obligations remain; no actual Dreams shader GPU execution, renderer integration or gameplay improvement is verified. The installed best build is unchanged.
+
+> **Earlier September 7 counter expressions:** [DOC_COUNTER_FOLD_20260907.md](DOC_COUNTER_FOLD_20260907.md) records the general counter-address simplification, with 117 GPU cases and six compiled permutations.
+
+> **Earlier September 7 GDS reads:** [DOC_GDS_READS_20260907.md](DOC_GDS_READS_20260907.md) records fixed scalar GDS read support, with 105 GPU cases and four compiled real shaders.
+
+> **Earlier September 7 constant reads:** [DOC_FLAT_READS_20260907.md](DOC_FLAT_READS_20260907.md) records the preceding milestone with 83 GPU cases, 94 planner checks and two compiled real shaders.
+
+> **Earlier September 7 input recovery:** [DOC_SHARED_OFFLINE_20260907.md](DOC_SHARED_OFFLINE_20260907.md) records the prototype before flattened constant-read support. Cached inputs cover 22 of 26 DOC shaders; all 26 recovered permutations replayed successfully, and one passed the static planner at that checkpoint.
+
+> **Latest September 4 runtime test:** [CLEAN_CORE_TEST_20260904.md](CLEAN_CORE_TEST_20260904.md) records two actual official-core runs with the general GPU corrections. Both fail translating `DS_ORDERED_COUNT` in `cbac06d2`; Dreams is not working on this build. This supersedes the earlier plan to establish a clean-core run. Earlier GPU provenance and correction tests remain in [HANDOFF_20260904.md](HANDOFF_20260904.md).
+
 This repository tracks source-level work on `Dreams` (`CUSA04301`) in `shadPS4`.
 
 ## Current status — September 2, 2026
@@ -57,7 +79,7 @@ checkpoint.
 
 ## Repository contents
 
-- [HANDOFF_20260902.md](HANDOFF_20260902.md): current source of truth, decisive empty-scene
+- [HANDOFF_20260902.md](HANDOFF_20260902.md): historical September 2 record, empty-scene
   evidence, September 2 WIP status, uncertainties, and next proof-producing step
 - [HANDOFF_20260830.md](HANDOFF_20260830.md): preserved August 30 evidence and history
 - [STATUS.md](STATUS.md): exact visible state and build identity
