@@ -1,6 +1,6 @@
 # Dreams on shadPS4 Investigation
 
-For applying and compiling the retained source fixes, start with [SOURCE_BUILD.md](SOURCE_BUILD.md). The verified local game is CUSA04301 **1.00**, with **Precise readbacks**. Game update 2.65 remains unverified.
+For applying and compiling the retained source fixes, start with [SOURCE_BUILD.md](SOURCE_BUILD.md). The working local profile uses **Precise readbacks**. Its metadata reports CUSA04301 **1.00**, but the user reports Wide Calculator, a post-1.00 feature; the actual content version remains unresolved. Game update 2.65 remains unverified.
 
 ## Research update — September 7, 2026
 

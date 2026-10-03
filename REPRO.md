@@ -1,6 +1,6 @@
 # Reproduction Notes
 
-For applying and compiling the retained source fixes, start with [SOURCE_BUILD.md](SOURCE_BUILD.md). The verified local game is CUSA04301 **1.00**, with **Precise readbacks**. Game update 2.65 remains unverified.
+For applying and compiling the retained source fixes, start with [SOURCE_BUILD.md](SOURCE_BUILD.md). The working local profile uses **Precise readbacks**. Its metadata reports CUSA04301 **1.00**, but the user reports Wide Calculator, a post-1.00 feature; the actual content version remains unresolved. Game update 2.65 remains unverified.
 
 > **Latest September 4 runtime test:** [CLEAN_CORE_TEST_20260904.md](CLEAN_CORE_TEST_20260904.md) records two actual official-core runs with the general GPU corrections. Both fail translating `DS_ORDERED_COUNT` in `cbac06d2`; Dreams is not working on this build. This supersedes the earlier plan to establish a clean-core run. Earlier GPU provenance and correction tests remain in [HANDOFF_20260904.md](HANDOFF_20260904.md).
 

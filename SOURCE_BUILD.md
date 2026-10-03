@@ -1,10 +1,10 @@
 # Build the Dreams source fixes
 
-This is the source-patch workflow for the retained rendering checkpoint. You can compile it yourself; the archived executable is an optional historical comparison. These patches are tied to an upstream revision and tested game version, not guaranteed to apply to arbitrary shadPS4 revisions or work on every GPU.
+This is the source-patch workflow for the retained rendering checkpoint. You can compile it yourself; the archived executable is an optional historical comparison. These patches are tied to an upstream revision and a specific tested game installation, not guaranteed to apply to arbitrary shadPS4 revisions or work on every GPU.
 
-## Verified game and settings
+## Game metadata and verified settings
 
-The local game inspected on October 3 reports **CUSA04301, APP_VER 01.00**. The working profile uses **GPU readbacks: Precise** (`GPU.readbacks_mode = 2`). Check the Dreams-specific override as well as the global setting: an override wins. Modes 0 and 1 mean Disabled and Relaxed respectively.
+The active launcher command points to the same game folder whose metadata reports **CUSA04301, APP_VER 01.00**. However, the user reports that this installation contains Wide Calculator, introduced in 2.44. The metadata therefore does not establish the actual executable/content version. A mixed or modified installation is a possibility, not a confirmed diagnosis. Do not conclude that the two PCs differ by original 1.00 versus 2.65 from this field alone. The working profile uses **GPU readbacks: Precise** (`GPU.readbacks_mode = 2`). Check the Dreams-specific override as well as the global setting: an override wins. Modes 0 and 1 mean Disabled and Relaxed respectively.
 
 The September 4 isolated comparison restored the patterned cube with Precise readbacks. This does not establish a universal fix. Sculpts still look wrong.
 
