@@ -2,6 +2,10 @@
 
 This is the source-patch workflow for the retained rendering checkpoint. You can compile it yourself; the archived executable is an optional historical comparison. These patches are tied to an upstream revision and a specific tested game installation, not guaranteed to apply to arbitrary shadPS4 revisions or work on every GPU.
 
+## October 4 imp/smush correction
+
+The [raw-image cache refresh](IMP_SMUSH_FIX_20261004.md) was user-tested and removes imp trails and the tweak-menu smush. The build commands include this patch. Other sculpt and tweak-menu rendering issues remain.
+
 ## October 3 save-ID correction
 
 The [random-byte correction](SAVE_ID_FIX_20261003.md) passed an isolated three-scene persistence and unsaved-scene discard test. The commands below include it. It does not recover damaged saves or resolve the remaining sculpt rendering defects. The optional October 2 save-mount delta below was also present in the tested executable.
@@ -30,6 +34,8 @@ git -C externals/sirit apply --check "$dreamsPatches/sirit-group-nonuniform-shuf
 git -C externals/sirit apply "$dreamsPatches/sirit-group-nonuniform-shuffle-20260829.patch"
 git apply --check "$dreamsPatches/host-entropy-random-20261003.patch"
 git apply "$dreamsPatches/host-entropy-random-20261003.patch"
+git apply --check "$dreamsPatches/dreams-raw-image-clear-cache-refresh-20261004.patch"
+git apply "$dreamsPatches/dreams-raw-image-clear-cache-refresh-20261004.patch"
 cmake -S . -B build-dreams -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-dreams --parallel 1
 ```

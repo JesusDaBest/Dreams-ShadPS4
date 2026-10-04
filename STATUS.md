@@ -1,5 +1,9 @@
 # Status
 
+## October 4 update
+
+The user verified the imp-copy and tweak-menu smush correction on the retained checkpoint. See [IMP_SMUSH_FIX_20261004.md](IMP_SMUSH_FIX_20261004.md) for the focused patch, tested executable and remaining limitations. Historical findings below retain their original dates.
+
 > **Historical September 4 implementation draft:** [ORDERED_COUNT_DRAFT_20260904.md](ORDERED_COUNT_DRAFT_20260904.md) records the decoder, IR and runtime-metadata groundwork plus the next targeted experiment. That official-core draft did not implement GPU execution of DS_ORDERED_COUNT. Later standalone prototype results are recorded in [DOC_GDS_STORES_20260907.md](DOC_GDS_STORES_20260907.md); no newer working-game result is claimed.
 
 > **Latest September 4 runtime test:** [CLEAN_CORE_TEST_20260904.md](CLEAN_CORE_TEST_20260904.md) records two actual official-core runs with the general GPU corrections. Both fail translating `DS_ORDERED_COUNT` in `cbac06d2`; Dreams is not working on this build. This supersedes the earlier plan to establish a clean-core run. Earlier GPU provenance and correction tests remain in [HANDOFF_20260904.md](HANDOFF_20260904.md).

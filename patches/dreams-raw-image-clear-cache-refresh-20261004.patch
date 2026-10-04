@@ -1,0 +1,19 @@
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -25899,7 +25899,15 @@
+             const bool is_dreams_scene_stream =
+                 Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+                 stage.pgm_hash == 0x34267ace && i == 0;
+-            if (desc.is_written && (desc.is_formatted || is_dreams_scene_stream)) {
++            // Dreams also clears image-backed allocations through a raw buffer.
++            // The menu trace shows this shader writing the same allocation later
++            // used by the sprite pass; refresh matching images from that GPU buffer.
++            const bool is_dreams_raw_image_clear =
++                Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
++                stage.l_stage == Shader::LogicalStage::Compute &&
++                stage.pgm_hash == 0x85f67046 && i == 0;
++            if (desc.is_written &&
++                (desc.is_formatted || is_dreams_scene_stream || is_dreams_raw_image_clear)) {
+                 if (TraceDreamsVolumeResources() && size >= 64_MB) {
+                     using InvalidationKey = std::array<u64, 7>;
+                     static std::map<InvalidationKey, u64> counts;

@@ -1,5 +1,9 @@
 # Dreams on shadPS4 Investigation
 
+## October 4 confirmed imp and tweak-menu smush correction
+
+The user-tested [raw-image cache refresh fix](IMP_SMUSH_FIX_20261004.md) removes persistent imp copies in menus and the tweak-menu smush. The [tested executable](builds/cusa04301-imp-smush-cache-fix-20261004/shadps4.exe) and focused source patch are included. Sculpt rendering and distance-dependent tweak-menu content remain unresolved.
+
 ## October 3 save-ID correction
 
 The [host-random-byte source fix](SAVE_ID_FIX_20261003.md) addresses repeating random streams observed on Windows. In an isolated game test, three scenes retained distinct version IDs, contents and previews; discarding a fourth scene preserved all three. Apply the source patch and rebuild using [SOURCE_BUILD.md](SOURCE_BUILD.md). This does not repair old damaged saves or fix remaining sculpt rendering. The archived August 29 executable is unchanged.

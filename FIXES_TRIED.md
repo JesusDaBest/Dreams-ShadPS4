@@ -1,5 +1,9 @@
 # Fixes Tried
 
+## October 4 update
+
+The user verified the imp-copy and tweak-menu smush correction on the retained checkpoint. See [IMP_SMUSH_FIX_20261004.md](IMP_SMUSH_FIX_20261004.md) for the focused patch, tested executable and remaining limitations. Historical findings below retain their original dates.
+
 ## September 2 ordered-counter address-unit WIP
 
 ### Preserved but not accepted as a fix
