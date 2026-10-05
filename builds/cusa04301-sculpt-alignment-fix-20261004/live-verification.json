@@ -1,0 +1,39 @@
+{
+  "result": "live GPU tiled normal seams removed for captured cube and floor",
+  "before": {
+    "method": "adjacent cube pixels, normal changes over 10 degrees; real cube edges included",
+    "stats": {
+      "cross_brick": {
+        "pairs": 14998,
+        "large_changes": 13053,
+        "mean_angle_degrees": 60.30229584855748,
+        "large_change_fraction": 0.8703160421389519
+      },
+      "same_brick": {
+        "pairs": 190264,
+        "large_changes": 17546,
+        "mean_angle_degrees": 5.9403942715171665,
+        "large_change_fraction": 0.09221923222469831
+      }
+    }
+  },
+  "after": {
+    "method": "adjacent cube pixels, normal changes over 10 degrees; real cube edges included",
+    "stats": {
+      "same_brick": {
+        "pairs": 211655,
+        "large_changes": 4091,
+        "mean_angle_degrees": 0.6556641569453703,
+        "large_change_fraction": 0.019328624412369187
+      },
+      "cross_brick": {
+        "pairs": 16303,
+        "large_changes": 253,
+        "mean_angle_degrees": 0.5214370356681876,
+        "large_change_fraction": 0.01551861620560633
+      }
+    }
+  },
+  "identical_frame": false,
+  "scope": "cube/floor normals verified; complete sculpt rendering and performance not yet assessed"
+}

@@ -1,8 +1,12 @@
 # Dreams on shadPS4 Investigation
 
+## October 4 confirmed sculpt shading correction
+
+The [alignment instruction fix](SCULPT_ALIGNMENT_FIX_20261004.md) removes the tiled cube/floor normal seams in the tested scene. The user confirmed that the cube now looks like an actual cube. The [new tested executable](builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe) includes the earlier imp/tweak-menu cache correction. Focused and cumulative source patches, validation results, and before/after normal images are included. Other sculpt shapes, performance, distance-dependent tweak-menu content, and other GPUs/game versions still need testing.
+
 ## October 4 confirmed imp and tweak-menu smush correction
 
-The user-tested [raw-image cache refresh fix](IMP_SMUSH_FIX_20261004.md) removes persistent imp copies in menus and the tweak-menu smush. The [tested executable](builds/cusa04301-imp-smush-cache-fix-20261004/shadps4.exe) and focused source patch are included. Sculpt rendering and distance-dependent tweak-menu content remain unresolved.
+The user-tested [raw-image cache refresh fix](IMP_SMUSH_FIX_20261004.md) removes persistent imp copies in menus and the tweak-menu smush. The [earlier tested executable](builds/cusa04301-imp-smush-cache-fix-20261004/shadps4.exe) and focused source patch remain available. The newer executable above adds the confirmed cube shading correction.
 
 ## October 3 save-ID correction
 

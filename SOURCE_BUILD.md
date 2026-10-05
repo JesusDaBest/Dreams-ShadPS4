@@ -4,6 +4,8 @@ This is the source-patch workflow for the retained rendering checkpoint. You can
 
 ## October 4 imp/smush correction
 
+The later [sculpt alignment correction](SCULPT_ALIGNMENT_FIX_20261004.md) fixes zero-offset `V_ALIGNBIT_B32` and `V_ALIGNBYTE_B32` translation. The build commands below include its focused patch. The new downloadable diagnostic executable and cumulative source snapshot are described in that record; the focused patch workflow below does not reproduce all diagnostic instrumentation in that executable.
+
 The [raw-image cache refresh](IMP_SMUSH_FIX_20261004.md) was user-tested and removes imp trails and the tweak-menu smush. The build commands include this patch. Other sculpt and tweak-menu rendering issues remain.
 
 ## October 3 save-ID correction
@@ -36,6 +38,8 @@ git apply --check "$dreamsPatches/host-entropy-random-20261003.patch"
 git apply "$dreamsPatches/host-entropy-random-20261003.patch"
 git apply --check "$dreamsPatches/dreams-raw-image-clear-cache-refresh-20261004.patch"
 git apply "$dreamsPatches/dreams-raw-image-clear-cache-refresh-20261004.patch"
+git apply --check "$dreamsPatches/generic-align-zero-offset-fix-20261004.patch"
+git apply "$dreamsPatches/generic-align-zero-offset-fix-20261004.patch"
 cmake -S . -B build-dreams -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-dreams --parallel 1
 ```

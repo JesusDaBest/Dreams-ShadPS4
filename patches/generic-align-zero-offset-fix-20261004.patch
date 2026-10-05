@@ -1,0 +1,29 @@
+diff --git a/src/shader_recompiler/frontend/translate/vector_alu.cpp b/src/shader_recompiler/frontend/translate/vector_alu.cpp
+index a55015d6d..ccf6db40f 100644
+--- a/src/shader_recompiler/frontend/translate/vector_alu.cpp
++++ b/src/shader_recompiler/frontend/translate/vector_alu.cpp
+@@ -1772,7 +1772,12 @@ void Translator::V_ALIGNBIT_B32(const GcnInst& inst) {
+     const IR::U32 src1{GetSrc(inst.src[1])};
+     const IR::U32 src2{ir.BitwiseAnd(GetSrc(inst.src[2]), ir.Imm32(0x1F))};
+     const IR::U32 lo{ir.ShiftRightLogical(src1, src2)};
+-    const IR::U32 hi{ir.ShiftLeftLogical(src0, ir.ISub(ir.Imm32(32), src2))};
++    // Align concatenates src0:src1. At offset zero only src1 contributes.
++    // Never emit a 32-bit shift by 32: SPIR-V leaves that result undefined,
++    // and drivers can wrap the count to zero and mix src0 into src1.
++    const IR::U32 high_shift{ir.BitwiseAnd(ir.ISub(ir.Imm32(32), src2), ir.Imm32(31))};
++    const IR::U32 shifted_hi{ir.ShiftLeftLogical(src0, high_shift)};
++    const IR::U32 hi{ir.Select(ir.IEqual(src2, ir.Imm32(0)), ir.Imm32(0), shifted_hi)};
+     SetDst(inst.dst[0], ir.BitwiseOr(lo, hi));
+ }
+ 
+@@ -1782,7 +1787,9 @@ void Translator::V_ALIGNBYTE_B32(const GcnInst& inst) {
+     const IR::U32 src2{ir.BitwiseAnd(GetSrc(inst.src[2]), ir.Imm32(0x3))};
+     const IR::U32 shift{ir.ShiftLeftLogical(src2, ir.Imm32(3))};
+     const IR::U32 lo{ir.ShiftRightLogical(src1, shift)};
+-    const IR::U32 hi{ir.ShiftLeftLogical(src0, ir.ISub(ir.Imm32(32), shift))};
++    const IR::U32 high_shift{ir.BitwiseAnd(ir.ISub(ir.Imm32(32), shift), ir.Imm32(31))};
++    const IR::U32 shifted_hi{ir.ShiftLeftLogical(src0, high_shift)};
++    const IR::U32 hi{ir.Select(ir.IEqual(shift, ir.Imm32(0)), ir.Imm32(0), shifted_hi)};
+     SetDst(inst.dst[0], ir.BitwiseOr(lo, hi));
+ }
+ 
