@@ -14,9 +14,11 @@ Use the executable with your existing launcher/runtime dependencies and **Precis
 - **Imp trails and tweak-menu smush:** persistent imp copies in menus and the tweak-menu smush were removed on the tested system. This fix is included in the new executable. [Validation record](IMP_SMUSH_FIX_20261004.md).
 - **Scene save IDs:** three test scenes kept distinct version IDs, contents, and previews; discarding a fourth preserved all three. [Validation record](SAVE_ID_FIX_20261003.md).
 
-The image below visualizes the corrected **live GPU surface normals**, not the final colored game image.
+## Current in-game screenshot
 
-![October 4 corrected cube and floor normals](builds/cusa04301-sculpt-alignment-fix-20261004/normals-after.png)
+Captured directly from Dreams running the October 4 alignment-fix executable. The cube now renders with clean faces. This image shows the game itself; the separate GPU-normal comparison is in the [validation record](SCULPT_ALIGNMENT_FIX_20261004.md).
+
+![October 4 Dreams in-game cube after the alignment fix](builds/cusa04301-sculpt-alignment-fix-20261004/current-dreams-cube.jpg)
 
 ## Remaining work
 

@@ -26,6 +26,10 @@ After:
 
 ## Executable and source
 
+Current in-game view, captured directly from the running tested executable:
+
+![Dreams cube after the alignment correction](builds/cusa04301-sculpt-alignment-fix-20261004/current-dreams-cube.jpg)
+
 Download [shadps4.exe](builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe). This is the exact experimental diagnostic executable used for the successful live test. It also contains the retained imp/tweak-menu cache, random-byte and save-handling changes. Optional capture/replay diagnostics remain in the build; run with diagnostic environment flags unset. Use the existing launcher/runtime dependencies and Precise readbacks. The older executable remains available for comparison.
 
 Executable SHA-256: `8C2E36874EEA2A4B83625D099E92F874F287EFE3894981CD93B6BC710454F904`.
