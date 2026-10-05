@@ -2,6 +2,10 @@
 
 This is the source-patch workflow for the retained rendering checkpoint. You can compile it yourself; the archived executable is an optional historical comparison. These patches are tied to an upstream revision and a specific tested game installation, not guaranteed to apply to arbitrary shadPS4 revisions or work on every GPU.
 
+## October 4 selector reset correction
+
+The [selector reset correction](SELECTOR_RESET_FIX_20261004.md) preserves two real Dreams compute dispatches incorrectly skipped as metadata clears. Apply `dreams-selector-reset-fix-20261004.patch` after the focused patches below, or use the latest cumulative diagnostic snapshot described in the validation record. Source compilation is optional; the latest tested executable is linked on the front page.
+
 ## October 4 imp/smush correction
 
 The later [sculpt alignment correction](SCULPT_ALIGNMENT_FIX_20261004.md) fixes zero-offset `V_ALIGNBIT_B32` and `V_ALIGNBYTE_B32` translation. The build commands below include its focused patch. The new downloadable diagnostic executable and cumulative source snapshot are described in that record; the focused patch workflow below does not reproduce all diagnostic instrumentation in that executable.

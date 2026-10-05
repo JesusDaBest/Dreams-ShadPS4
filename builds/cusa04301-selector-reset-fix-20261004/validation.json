@@ -1,0 +1,22 @@
+{
+  "fix": "Preserve Dreams selector compactor and counter-reset shader dispatches instead of skipping them as metadata clears",
+  "shaders": [
+    "0x1e7dbccf",
+    "0x723fd19c"
+  ],
+  "before_pause_instances": 3585,
+  "before_fix_after_pause_instances": 525193,
+  "before_fix_lag_draw_ms": [
+    1582.045,
+    1741.931,
+    1847.371
+  ],
+  "after_fix_baseline_selectors": 56,
+  "after_fix_post_unpause_selectors": 41,
+  "after_fix_post_unpause_invalid_selectors": 0,
+  "user_confirmed_severe_lag_gone": true,
+  "home_space_new_effect": "User observed previously invisible effect; identity and connection unverified",
+  "complete_fleck_rendering_verified": false,
+  "exe_sha256": "DA5B2166B8245803E6D8F2BE4FC082B0CAB33E5D5366CE904118028BAB98C79C",
+  "paint_strokes_render_user_confirmed": true
+}

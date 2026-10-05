@@ -1,6 +1,6 @@
 # Status — October 4, 2026
 
-The latest [tested executable](builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe) contains the user-confirmed sculpt alignment correction and the earlier imp/tweak-menu cache correction.
+The earlier alignment [tested executable](builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe) contains the user-confirmed sculpt alignment correction and the earlier imp/tweak-menu cache correction.
 
 - The user confirmed that the cube now looks like an actual cube.
 - Live GPU captures show the cube/floor tiled normal seams removed.
@@ -10,6 +10,16 @@ The latest [tested executable](builds/cusa04301-sculpt-alignment-fix-20261004/sh
 Verified system: AMD Radeon 8060S; CUSA04301 VERSION 02.64, APP_VER 01.00; Precise readbacks. Executable SHA-256: `8C2E36874EEA2A4B83625D099E92F874F287EFE3894981CD93B6BC710454F904`.
 
 Other sculpt shapes, severe sculpt-editing lag, distance-dependent tweak-menu content, other GPUs, and 02.65 remain unverified or unresolved. See [the alignment validation](SCULPT_ALIGNMENT_FIX_20261004.md) and [current open issues](ISSUES.md).
+
+## New selector reset and paint rendering update
+
+The [latest executable](builds/cusa04301-selector-reset-fix-20261004/shadps4.exe) also preserves the real counter reset and selector compaction dispatches. The user confirmed paint strokes now render and the severe pause/unpause lag stopped. Before the correction, the affected pass jumped from 3,585 to 525,193 instances and took about 1.6–1.8 seconds. After correction, captured lists had 56 and 41 valid, distinct IDs with zero invalid IDs. See [validation and limitations](SELECTOR_RESET_FIX_20261004.md).
+
+SHA-256: `DA5B2166B8245803E6D8F2BE4FC082B0CAB33E5D5366CE904118028BAB98C79C`. Other sculpt defects and low frame rates remain unresolved.
+
+![New Dreams paint-mode screenshot after selector reset correction](builds/cusa04301-selector-reset-fix-20261004/current-dreams-paint-mode.jpg)
+
+The earlier cube screenshot is retained in the [front-page status section](README.md#current-in-game-screenshot).
 
 ## Historical status records
 

@@ -3,11 +3,11 @@
 The tiled cube/floor normal seams were fixed and verified in the October 4 alignment build. The earlier imp trails and tweak-menu smush were fixed on the local system. Those resolved symptoms should not be treated as the current task list.
 
 1. Test a sphere and more complex sculpts with the alignment fix; verify shape, shading, stamping, and deletion.
-2. Investigate sculpt-limit warnings and severe editing lag. The alignment change has not been validated as a performance fix.
+2. Investigate sculpt-limit warnings, remaining low frame rates and other editing slowdowns. The selector-reset correction resolved the demonstrated pause/unpause workload explosion and restored paint rendering on the tested system; broader performance remains unverified.
 3. Correct tweak-menu content that renders differently depending on viewing distance.
 4. Verify other GPUs and game versions, including the separate user's persistent imp trails and 02.65 installation.
 
-See [the latest build and validation](SCULPT_ALIGNMENT_FIX_20261004.md).
+See [the latest build and validation](SELECTOR_RESET_FIX_20261004.md).
 
 ## Historical investigation tasks
 

@@ -1,0 +1,24 @@
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -10,6 +10,21 @@
+     const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+ 
+     // Assume if a shader reads metadata, it is a copy shader.
++    // Dreams' selector compactor atomically allocates output slots and writes record IDs.
++    // Its reset shader also initializes GDS counters and dispatch dimensions, which a
++    // metadata-only clear cannot reproduce.
++    // Reused guest addresses can still be registered as metadata; they do not make this
++    // dispatch a clear. Keep this targeted exclusion while validating the live output.
++    if (Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
++        (info.pgm_hash == 0x1e7dbccf || info.pgm_hash == 0x723fd19c)) {
++        static std::array<bool, 2> logged{};
++        const size_t index = info.pgm_hash == 0x1e7dbccf ? 0 : 1;
++        if (!logged[index]) {
++            logged[index] = true;
++            LOG_WARNING(Render_Vulkan, "Dreams selector shader {:#x} preserved: metadata-clear shortcut rejected", info.pgm_hash);
++        }
++        return false;
++    }
+     for (const auto& desc : info.buffers) {
+         const VAddr address = desc.GetSharp(info).base_address;
+         if (!desc.IsSpecial() && !desc.is_written && texture_cache.IsMeta(address)) {
