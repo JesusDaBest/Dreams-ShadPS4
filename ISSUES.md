@@ -1,4 +1,17 @@
-# Open Issues
+# Open issues — October 4, 2026
+
+The tiled cube/floor normal seams were fixed and verified in the October 4 alignment build. The earlier imp trails and tweak-menu smush were fixed on the local system. Those resolved symptoms should not be treated as the current task list.
+
+1. Test a sphere and more complex sculpts with the alignment fix; verify shape, shading, stamping, and deletion.
+2. Investigate sculpt-limit warnings and severe editing lag. The alignment change has not been validated as a performance fix.
+3. Correct tweak-menu content that renders differently depending on viewing distance.
+4. Verify other GPUs and game versions, including the separate user's persistent imp trails and 02.65 installation.
+
+See [the latest build and validation](SCULPT_ALIGNMENT_FIX_20261004.md).
+
+## Historical investigation tasks
+
+The tasks below are preserved from August/September. They require reassessment against the latest build before being resumed; they are not a current diagnosis of the corrected cube seams.
 
 > **Latest September 4 runtime test:** [CLEAN_CORE_TEST_20260904.md](CLEAN_CORE_TEST_20260904.md) records two actual official-core runs with the general GPU corrections. Both fail translating `DS_ORDERED_COUNT` in `cbac06d2`; Dreams is not working on this build. This supersedes the earlier plan to establish a clean-core run. Earlier GPU provenance and correction tests remain in [HANDOFF_20260904.md](HANDOFF_20260904.md).
 

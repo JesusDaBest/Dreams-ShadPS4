@@ -1,8 +1,19 @@
-# Status
+# Status — October 4, 2026
 
-## October 4 update
+The latest [tested executable](builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe) contains the user-confirmed sculpt alignment correction and the earlier imp/tweak-menu cache correction.
 
-The user verified the imp-copy and tweak-menu smush correction on the retained checkpoint. See [IMP_SMUSH_FIX_20261004.md](IMP_SMUSH_FIX_20261004.md) for the focused patch, tested executable and remaining limitations. Historical findings below retain their original dates.
+- The user confirmed that the cube now looks like an actual cube.
+- Live GPU captures show the cube/floor tiled normal seams removed.
+- Imp copies in menus and tweak-menu smush were corrected on the local system.
+- The scene save-ID correction passed the documented isolated persistence test.
+
+Verified system: AMD Radeon 8060S; CUSA04301 VERSION 02.64, APP_VER 01.00; Precise readbacks. Executable SHA-256: `8C2E36874EEA2A4B83625D099E92F874F287EFE3894981CD93B6BC710454F904`.
+
+Other sculpt shapes, severe sculpt-editing lag, distance-dependent tweak-menu content, other GPUs, and 02.65 remain unverified or unresolved. See [the alignment validation](SCULPT_ALIGNMENT_FIX_20261004.md) and [current open issues](ISSUES.md).
+
+## Historical status records
+
+Everything below preserves August/September observations. Its build identities, defects, and “latest” claims apply to those historical checkpoints, not the October 4 build.
 
 > **Historical September 4 implementation draft:** [ORDERED_COUNT_DRAFT_20260904.md](ORDERED_COUNT_DRAFT_20260904.md) records the decoder, IR and runtime-metadata groundwork plus the next targeted experiment. That official-core draft did not implement GPU execution of DS_ORDERED_COUNT. Later standalone prototype results are recorded in [DOC_GDS_STORES_20260907.md](DOC_GDS_STORES_20260907.md); no newer working-game result is claimed.
 
