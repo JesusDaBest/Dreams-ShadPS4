@@ -1,3 +1,7 @@
+# October 6 update
+
+The user validated the [tweak-menu blur correction](TWEAK_MENU_BLUR_FIX_20261006.md) at close, normal and far distances for the tested menu. The exact tested build and activation script are included. This specific fix is opt-in; other menus remain unverified.
+
 # Status — October 4, 2026
 
 The earlier alignment [tested executable](builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe) contains the user-confirmed sculpt alignment correction and the earlier imp/tweak-menu cache correction.

@@ -1,0 +1,52 @@
+--- a/src/shader_recompiler/dreams_compat.h
++++ b/src/shader_recompiler/dreams_compat.h
+@@ -9,6 +9,15 @@
+ #include "common/types.h"
+ 
+ namespace Shader::DreamsCompat {
++
++constexpr u64 GlassMipBlurShader = 0x345893a7;
++inline bool TestGlassMipCoordinates() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("SHADPS4_DREAMS_TEST_GLASS_MIP_COORDS");
++        return value && value[0] == '1' && value[1] == '\0';
++    }();
++    return enabled;
++}
+ 
+ // AMD encodes both the M0 high-half ordered-count base and OFFSET0 in bytes. Keep every Dreams
+ // replay path on the same byte-to-dword conversion as the generic shader lowering.
+--- a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+@@ -1243,8 +1243,17 @@
+                                      IsRuntimeOffset(offset);
+     const bool needs_dimentions =
+         (!is_msaa && unnormalized) || (is_msaa && !unnormalized) || fold_runtime_offset;
++    // Opt-in A/B hypothesis for Dreams' glass mip builder only. The original
++    // IMAGE_SAMPLE_L supplies texel coordinates and the previous mip explicitly.
++    const bool test_glass_mip = info.pgm_hash == DreamsCompat::GlassMipBlurShader &&
++                               DreamsCompat::TestGlassMipCoordinates() && unnormalized &&
++                               inst_info.has_lod && view_type == AmdGpu::ImageType::Color2D;
++    IR::U32 dimension_lod = ir.Imm32(0u);
++    if (test_glass_mip) {
++        dimension_lod = IR::U32{ir.ConvertFToU(32, get_addr_reg(addr_reg + 2))};
++    }
+     const auto dimensions =
+-        needs_dimentions ? ir.ImageQueryDimension(handle, ir.Imm32(0u), ir.Imm1(false), inst_info)
++        needs_dimentions ? ir.ImageQueryDimension(handle, dimension_lod, ir.Imm1(false), inst_info)
+                          : IR::Value{};
+     const auto get_coord = [&](u32 coord_idx, u32 dim_idx) -> IR::Value {
+         const auto coord = get_addr_reg(coord_idx);
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -30,6 +30,10 @@
+ std::string ShaderBinaryCacheKey(const Shader::Info& info,
+                                  const ProgramCacheKey& program_key, size_t perm_idx) {
+     const u64 pgm_hash = info.pgm_hash;
++    if (pgm_hash == Shader::DreamsCompat::GlassMipBlurShader &&
++        Shader::DreamsCompat::TestGlassMipCoordinates()) {
++        return fmt::format("{:#018x}_{}_glass_mip_coords_ab1", pgm_hash, perm_idx);
++    }
+     // Vertex ID lowering changed independently of every compute/fragment shader. Keep that
+     // invalidation stage-local so a vertex fix cannot force Dreams' expensive compute shaders to
+     // rebuild, while also preventing binaries made by the incomplete lowering from being reused.
