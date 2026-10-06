@@ -4,7 +4,9 @@ Updated **October 6, 2026**. This repository contains experimental shadPS4 fixes
 
 ## Latest tested build
 
-**[October 6 tweak-menu blur build and activation instructions](TWEAK_MENU_BLUR_FIX_20261006.md)** â€” user confirmed the tested menu looks correct at all distances. Includes the tested EXE, opt-in launch script and source patches.
+**[Download updated shadps4.exe — October 6 tweak-menu fix](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-tweak-menu-blur-fix-20261006/shadps4.exe)**
+
+The tweak-menu fix is enabled automatically. Use this EXE with your existing launcher/runtime dependencies and Precise GPU readbacks. [Fix and validation](TWEAK_MENU_BLUR_FIX_20261006.md).
 
 Previous October 4 checkpoint:
 
@@ -14,7 +16,7 @@ Use the executable with your existing launcher/runtime dependencies and **Precis
 
 ## Confirmed improvements
 
-- **Tweak-menu blur:** selected-mip coordinate correction passed close, normal and far tests for the tested menu. [Fix and activation instructions](TWEAK_MENU_BLUR_FIX_20261006.md).
+- **Tweak-menu blur:** selected-mip coordinate correction passed close, normal and far tests for the tested menu. [Fix and validation](TWEAK_MENU_BLUR_FIX_20261006.md).
 
 - **Selector reset and paint rendering:** the severe pause/unpause lag stopped in the tested scene, selector IDs are now valid, and the user confirmed paint strokes render. [Fix and validation](SELECTOR_RESET_FIX_20261004.md).
 

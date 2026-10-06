@@ -1,19 +1,20 @@
 {
-  "switch": "SHADPS4_DREAMS_TEST_GLASS_MIP_COORDS=1",
-  "default": "off",
+  "switch": "No setting required; optional SHADPS4_DREAMS_TEST_GLASS_MIP_COORDS=0 disables the fix",
+  "default": "on",
   "shader": "0x345893a7",
   "cache": "separate binary key",
   "validation": "resource tracking and pipeline serialization objects compiled successfully",
-  "exe": "Linked successfully and launched as PID 11772",
+  "exe": "Default-enabled build compiled and linked; visual validation was performed on the preceding build with the identical shader correction enabled",
   "status": "User-validated tweak-menu blur fix for the tested menu",
   "test_scene": "Open one gadget tweak menu with background visible; compare ordinary distance, close, and far. Look for blur sampling shifted or stretched across the panel, changed transparency, and regressions.",
-  "rollback": "Previous runtime executable preserved as shadps4-before-glass-mip-ab.exe. Switch absent or 0 restores original normalization in new build.",
+  "rollback": "Optional environment switch 0 restores original normalization; restart required",
   "cache_warning": "Alternate binary cache key is separate; process must restart when changing the switch.",
   "active_shader_validation": "Current dumped SPIR-V queries dimensions using sampled mip LOD; all four sample paths include OpConvertFToU + dynamic OpImageQuerySizeLod. Destination OpImageWrite Lod is preserved.",
-  "remaining": "Other gadget menus and broader regressions have not been tested. Opt-in switch remains enabled in current process; source still defaults off.",
+  "remaining": "Other GPUs, versions and broader regressions remain unverified",
   "distance_validation": {
     "close": "user reports correct",
     "normal": "user reports correct",
     "far": "user reports correct"
-  }
+  },
+  "sha256": "d3eb8e1893dc7078a6ef5478091471554de6de3b895a37dce9e6551811eeef73"
 }

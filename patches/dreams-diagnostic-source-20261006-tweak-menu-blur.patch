@@ -12800,7 +12800,7 @@ index 9236be6a0..bc0c1d04f 100644
  
 diff --git a/src/shader_recompiler/dreams_compat.h b/src/shader_recompiler/dreams_compat.h
 new file mode 100644
-index 000000000..bc3b63288
+index 000000000..2eb4e7bb1
 --- /dev/null
 +++ b/src/shader_recompiler/dreams_compat.h
 @@ -0,0 +1,1299 @@
@@ -12820,7 +12820,7 @@ index 000000000..bc3b63288
 +inline bool TestGlassMipCoordinates() {
 +    static const bool enabled = [] {
 +        const char* value = std::getenv("SHADPS4_DREAMS_TEST_GLASS_MIP_COORDS");
-+        return value && value[0] == '1' && value[1] == '\0';
++        return !(value && value[0] == '0' && value[1] == '\0');
 +    }();
 +    return enabled;
 +}
@@ -18540,7 +18540,7 @@ index 623c0f924..206c6e092 100644
          return IR::Opcode::Identity;
      case IR::Opcode::ConvertF64F32:
 diff --git a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
-index 9f25b2bd9..6f0ded82b 100644
+index 9f25b2bd9..e4860892c 100644
 --- a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
 +++ b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
 @@ -1,6 +1,11 @@
@@ -18990,7 +18990,7 @@ index 9f25b2bd9..6f0ded82b 100644
 +                                     IsRuntimeOffset(offset);
 +    const bool needs_dimentions =
 +        (!is_msaa && unnormalized) || (is_msaa && !unnormalized) || fold_runtime_offset;
-+    // Opt-in A/B hypothesis for Dreams' glass mip builder only. The original
++    // Dreams' glass mip builder uses coordinates relative to its selected mip. The original
 +    // IMAGE_SAMPLE_L supplies texel coordinates and the previous mip explicitly.
 +    const bool test_glass_mip = info.pgm_hash == DreamsCompat::GlassMipBlurShader &&
 +                               DreamsCompat::TestGlassMipCoordinates() && unnormalized &&
