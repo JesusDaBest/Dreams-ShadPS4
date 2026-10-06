@@ -4,7 +4,7 @@ Updated **October 6, 2026**. This repository contains experimental shadPS4 fixes
 
 ## Latest tested build
 
-**[Download updated shadps4.exe — October 6 tweak-menu fix](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-tweak-menu-blur-fix-20261006/shadps4.exe)**
+**[Download updated shadps4.exe â€” October 6 tweak-menu fix](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-tweak-menu-blur-fix-20261006/shadps4.exe)**
 
 The tweak-menu fix is enabled automatically. Use this EXE with your existing launcher/runtime dependencies and Precise GPU readbacks. [Fix and validation](TWEAK_MENU_BLUR_FIX_20261006.md).
 

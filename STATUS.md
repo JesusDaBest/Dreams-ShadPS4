@@ -1,6 +1,6 @@
 # October 6 update
 
-The user validated the [tweak-menu blur correction](TWEAK_MENU_BLUR_FIX_20261006.md) at close, normal and far distances for the tested menu. The exact tested build and activation script are included. This specific fix is opt-in; other menus remain unverified.
+The user validated the [tweak-menu blur correction](TWEAK_MENU_BLUR_FIX_20261006.md) at close, normal and far distances for the tested menu. A default-enabled build is included; no activation setting is required. Visual testing used the identical shader correction enabled in the preceding test build. Other GPUs and versions remain unverified.
 
 # Status — October 4, 2026
 
