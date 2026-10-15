@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "exe_sha256": "7a91bd313519f0beae84a7e17ea2ee41209baa565d49c19aae1df899aa9551e6",
+  "exe_matches_exact_tested_build": true,
+  "public_and_private_base_trees_identical": true,
+  "project_source_files_reconstructed_and_matched": 948,
+  "project_source_changed_files": 11,
+  "focused_patch_reconstructs_actual_compiler_file": true,
+  "source_header_checks": [
+    {
+      "source": "enumerate_live.comp",
+      "embedded_array": "Enumerate",
+      "matches_embedded_words": true
+    },
+    {
+      "source": "prepare_draws.comp",
+      "embedded_array": "PrepareDraws",
+      "matches_embedded_words": true
+    }
+  ],
+  "local_document_links_checked": 56,
+  "publication_does_not_include_game_captures_or_user_profile": true,
+  "new_game_session_launched": false,
+  "full_rebuild_repeated_for_publication": false,
+  "dependency_trees_not_in_project_hash_comparison": true
+}

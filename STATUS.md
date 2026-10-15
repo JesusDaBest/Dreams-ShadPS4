@@ -1,3 +1,12 @@
+# October 15 update
+
+The [shape-table correction](SHAPE_DENSITY_FIX_20261015.md) is available as the exact tested EXE
+and matching project-source delta. The user verified the saved cube, cylinder and vertically
+stretched sphere; the latter two share one sculpt. Broader shape and operation coverage remains
+unverified. The correction is automatic; the tested profile used Precise readbacks, pipeline
+caching disabled and shader patching disabled. This older-baseline branch does not include the
+separate October 6 branch's combined changes or nikmparis217-ux's ordered-count implementation.
+
 # October 6 update
 
 The user validated the [tweak-menu blur correction](TWEAK_MENU_BLUR_FIX_20261006.md) at close, normal and far distances for the tested menu. A default-enabled build is included; no activation setting is required. Visual testing used the identical shader correction enabled in the preceding test build. Other GPUs and versions remain unverified.

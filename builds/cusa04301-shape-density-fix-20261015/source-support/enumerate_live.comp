@@ -1,0 +1,117 @@
+#version 450
+// Independent complete volume-hierarchy enumeration. Not a game shader override:
+// the host must supply a coherent live root/children/coordinate epoch first.
+// No view/occlusion selection, original traversal, subgroup operations or GDS.
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Roots { uvec2 values[]; } roots;
+layout(set=0,binding=1,std430) readonly buffer Children { uint words[]; } children;
+layout(set=0,binding=2,std430) readonly buffer Coordinates { uint words[]; } coordinates;
+layout(set=0,binding=3,std430) writeonly buffer Leaves { uvec4 values[]; } leaves;
+layout(set=0,binding=4,std430) writeonly buffer Results { uvec4 values[]; } results;
+layout(set=0,binding=5,std430) readonly buffer Gds { uint words[]; } gds;
+layout(set=0,binding=6,std430) readonly buffer Objects { uint words[]; } objects;
+layout(push_constant) uniform Limits {
+    uint rootCount;
+    uint nodeCount;
+    uint capacityPerRoot;
+    uint maxVisits;
+} limits;
+
+uint childAt(uint parent, uint slot) {
+    // Eight 24-bit little-endian child indices packed into six uints.
+    uint byteOffset=slot*3u;
+    uint wordIndex=parent*6u+(byteOffset>>2u);
+    uint shift=(byteOffset&3u)*8u;
+    uint value=children.words[wordIndex]>>shift;
+    if (shift>8u) value|=children.words[wordIndex+1u]<<(32u-shift);
+    return value&0x00ffffffu;
+}
+
+void main() {
+    uint rootIndex=gl_GlobalInvocationID.x;
+    if (rootIndex>=limits.rootCount || rootIndex>=uint(results.values.length())) return;
+    if (uint(gds.words.length())<322u) {
+        results.values[rootIndex]=uvec4(0,0,1,0); return;
+    }
+    uint rootBase=gds.words[320], rootCount=gds.words[321];
+    if (rootBase>uint(roots.values.length()) ||
+        rootCount>uint(roots.values.length())-rootBase) {
+        results.values[rootIndex]=uvec4(0,0,1,0); return;
+    }
+    // Empty or later child queues must not replace an accepted root inventory.
+    // The host clears results at the primary producer epoch boundary.
+    if (rootCount==0u) return;
+    uvec2 first=roots.values[rootBase];
+    if (first.y>=uint(objects.words.length())/108u) {
+        results.values[rootIndex]=uvec4(0,0,128,0); return;
+    }
+    uint firstWord=objects.words[first.y*108u+95u];
+    uint firstRoot=(firstWord&0x00ffffffu)|((firstWord>>28u)<<24u);
+    if ((first.x&0x0fffffffu)!=firstRoot) return;
+    if (rootCount>limits.rootCount) {
+        results.values[rootIndex]=uvec4(0,0,1,0); return;
+    }
+    for (uint entry=0u; entry<rootCount; ++entry) {
+        uvec2 candidate=roots.values[rootBase+entry];
+        if (candidate.y>=uint(objects.words.length())/108u) {
+            results.values[rootIndex]=uvec4(0,0,128,0); return;
+        }
+        uint rootWord=objects.words[candidate.y*108u+95u];
+        uint expected=(rootWord&0x00ffffffu)|((rootWord>>28u)<<24u);
+        if ((candidate.x&0x0fffffffu)!=expected) return;
+    }
+    if (rootIndex>=rootCount) {
+        results.values[rootIndex]=uvec4(0); return;
+    }
+    uvec2 root=roots.values[rootBase+rootIndex];
+    if (root.y>=uint(objects.words.length())/108u) {
+        results.values[rootIndex]=uvec4(0,0,128,0); return;
+    }
+    uint metadata=objects.words[root.y*108u+80u];
+    if (((metadata>>20u)&3u)!=0u || (metadata&0x10000000u)!=0u) {
+        results.values[rootIndex]=uvec4(0,0,128,0); return;
+    }
+    uint rootLevel=(root.x>>24u)&15u;
+    uvec2 stack[128];
+    uint ancestors[16];
+    uint top=1u, count=0u, visited=0u, status=0u, emptyBranches=0u;
+    stack[0]=uvec2(root.x&0x00ffffffu,rootLevel);
+    uint outputBase=rootIndex*limits.capacityPerRoot;
+    if (limits.nodeCount>uint(coordinates.words.length()) ||
+        limits.nodeCount>uint(children.words.length())/6u ||
+        limits.capacityPerRoot==0u ||
+        limits.capacityPerRoot>uint(leaves.values.length()) ||
+        rootIndex>=uint(leaves.values.length())/limits.capacityPerRoot ||
+        limits.maxVisits==0u || (root.y&0xffff0000u)!=0u) status=1u;
+    while (top!=0u && status==0u) {
+        if (visited>=limits.maxVisits) { status=16u; break; }
+        uvec2 entry=stack[--top];
+        uint node=entry.x, level=entry.y;
+        if (node>=limits.nodeCount) { status=64u; break; }
+        for (uint ancestor=level+1u; ancestor<=rootLevel; ++ancestor)
+            if (ancestors[ancestor]==node) status|=8u;
+        if (status!=0u) break;
+        ancestors[level]=node;
+        ++visited;
+        uint cell=coordinates.words[node];
+        // Coordinate bit31 disables refinement in the observed guest traversal.
+        // The queue's four-bit level cannot refine below zero.
+        if (level==0u || (cell&0x80000000u)!=0u) {
+            if (count>=limits.capacityPerRoot) { status=32u; break; }
+            leaves.values[outputBase+count++]=uvec4(node,root.y,cell,level);
+        } else {
+            uint added=0u;
+            // Reverse push gives stable child0..7 depth-first output.
+            for (int slot=7; slot>=0; --slot) {
+                uint child=childAt(node,uint(slot));
+                if ((child&0x00800000u)!=0u) continue;
+                if (top>=128u) { status=4u; break; }
+                stack[top++]=uvec2(child,level-1u);
+                ++added;
+            }
+            if (added==0u) ++emptyBranches;
+        }
+    }
+    // A failed root publishes no usable list, even if some slots were written.
+    results.values[rootIndex]=uvec4(status==0u?count:0u,visited,status,emptyBranches);
+}

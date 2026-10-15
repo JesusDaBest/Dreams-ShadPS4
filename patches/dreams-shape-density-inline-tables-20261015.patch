@@ -1,0 +1,89 @@
+--- a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+@@ -1563,7 +1563,86 @@
+                "Dreams 2bf probe did not find all five decisive B2 stores");
+ }
+ 
++// Conservatively bound scalar table indexing; unknown/wrapping arithmetic stays unbounded.
++static u32 InlineScalarIndexMaximum(const IR::Value value, u32 depth = 0) {
++    constexpr u32 Unknown = std::numeric_limits<u32>::max();
++    if (value.IsImmediate()) return value.U32();
++    if (depth >= 16) return Unknown;
++    const auto* inst = value.InstRecursive();
++    const auto bound = [&](u32 arg) { return InlineScalarIndexMaximum(inst->Arg(arg), depth + 1); };
++    switch (inst->GetOpcode()) {
++    case IR::Opcode::UMin32:
++    case IR::Opcode::BitwiseAnd32:
++        return std::min(bound(0), bound(1));
++    case IR::Opcode::UMinTri32:
++        return std::min({bound(0), bound(1), bound(2)});
++    case IR::Opcode::IAdd32: {
++        const u64 result = u64{bound(0)} + bound(1);
++        return result <= Unknown ? static_cast<u32>(result) : Unknown;
++    }
++    case IR::Opcode::ShiftLeftLogical32: {
++        if (!inst->Arg(1).IsImmediate()) return Unknown;
++        const u32 shift = inst->Arg(1).U32() & 31;
++        const u32 maximum = bound(0);
++        return maximum <= (Unknown >> shift) ? maximum << shift : Unknown;
++    }
++    case IR::Opcode::ShiftRightLogical32:
++        return inst->Arg(1).IsImmediate() ? bound(0) >> (inst->Arg(1).U32() & 31) : Unknown;
++    case IR::Opcode::BitFieldUExtract: {
++        if (!inst->Arg(2).IsImmediate()) return Unknown;
++        const u32 width = inst->Arg(2).U32();
++        return width < 32 ? (u32{1} << width) - 1 : Unknown;
++    }
++    default:
++        return Unknown;
++    }
++}
++
++static void PatchInlineScalarTables(IR::Program& program) {
++    // S_GETPC intentionally yields a shader-relative PC so indirect control flow can be
++    // structurized. A scalar load through that constant pointer must therefore use a
++    // program-relative inline resource, just like an inline buffer sharp. Sending its
++    // small relative address to the BDA page table instead reads unmapped guest memory.
++    // GetParams supplies a 0x4000-dword code_data window to the CFG's jump-table resolver.
++    constexpr u64 InlineDataBytes = 0x4000 * sizeof(u32);
++    std::vector<std::pair<IR::Block*, IR::Inst*>> reads;
++    for (auto* block : program.post_order_blocks) {
++        for (auto& inst : block->Instructions()) {
++            if (inst.GetOpcode() == IR::Opcode::ReadConst && inst.Flags<u32>() == 0 &&
++                !inst.Arg(1).IsImmediate()) reads.emplace_back(block, &inst);
++        }
++    }
++    for (const auto [block, inst] : reads) {
++        const auto* pointer = inst->Arg(0).InstRecursive();
++        if (pointer->GetOpcode() != IR::Opcode::CompositeConstructU32x2 ||
++            !pointer->AreAllArgsImmediates()) continue;
++        const u64 relative = u64{pointer->Arg(0).U32()} |
++                             (u64{pointer->Arg(1).U32()} << 32);
++        const u32 maximum = InlineScalarIndexMaximum(inst->Arg(1));
++        const u64 bytes = (u64{maximum} + 1) * sizeof(u32);
++        if (relative <= 1 || relative % sizeof(u32) != 0 || relative >= InlineDataBytes ||
++            bytes > InlineDataBytes - relative) continue;
++
++        AmdGpu::Buffer sharp{};
++        sharp.base_address = relative;
++        sharp.stride = sizeof(u32);
++        sharp.num_records = maximum + 1;
++        sharp.num_format = static_cast<u32>(AmdGpu::NumberFormat::Uint);
++        sharp.data_format = static_cast<u32>(AmdGpu::DataFormat::Format32);
++        const auto words = std::bit_cast<std::array<u32, 4>>(sharp);
++        IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(*inst)};
++        const auto handle = ir.CompositeConstruct(ir.Imm32(words[0]), ir.Imm32(words[1]),
++                                                  ir.Imm32(words[2]), ir.Imm32(words[3]));
++        inst->ReplaceUsesWith(ir.ReadConstBuffer(handle, IR::U32{inst->Arg(1)}, {}));
++        inst->Invalidate();
++        LOG_WARNING(Render_Recompiler,
++                    "Relocated inline scalar table shader={:#x} offset={:#x} bytes={} max_index={}",
++                    program.info.pgm_hash, relative, bytes, maximum);
++    }
++}
++
+ void ResourceTrackingPass(IR::Program& program, const Profile& profile) {
++    PatchInlineScalarTables(program);
+     // Iterate resource instructions and patch them after finding the sharp.
+     auto& info = program.info;
+ 

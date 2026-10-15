@@ -1,0 +1,57 @@
+#version 450
+// Convert the independent leaf list to the existing VS370 visibility ABI.
+// If any root failed, retain the original fallback command and suppress all
+// native draws. No partly traversed scene is published as a complete result.
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Leaves { uvec4 values[]; } leaves;
+layout(set=0,binding=1,std430) readonly buffer Results { uvec4 values[]; } results;
+layout(set=0,binding=2,std430) writeonly buffer Instances { uvec2 values[]; } instances;
+layout(set=0,binding=3,std430) buffer Commands { uint words[]; } commands;
+layout(set=0,binding=4,std430) writeonly buffer Summary { uvec4 values[]; } summary;
+layout(push_constant) uniform Limits {
+    uint rootCount;
+    uint nodeCountUnused;
+    uint capacityPerRoot;
+    uint maxVisitsUnused;
+} limits;
+
+void main() {
+    uint index=gl_GlobalInvocationID.x;
+    if (limits.rootCount==0u || limits.capacityPerRoot==0u ||
+        limits.rootCount>uint(results.values.length()) ||
+        limits.rootCount>=uint(commands.words.length())/5u) return;
+    uint fallback=limits.rootCount*5u;
+    if (index<limits.rootCount) {
+        uint failures=0u,total=0u,activeRoots=0u,maximum=0u;
+        for (uint root=0u; root<limits.rootCount; ++root) {
+            uvec4 result=results.values[root];
+            failures|=result.z;
+            if (result.x>limits.capacityPerRoot) failures|=32u;
+            total+=result.x;
+            if (result.y!=0u) ++activeRoots;
+            maximum=max(maximum,result.x);
+        }
+        if (failures==0u && activeRoots==0u && commands.words[fallback+1u]!=0u)
+            failures=256u; // no accepted root set for a nonempty guest draw
+        uint command=index*5u;
+        commands.words[command]=commands.words[fallback];
+        commands.words[command+1u]=failures==0u?results.values[index].x:0u;
+        commands.words[command+2u]=commands.words[fallback+2u];
+        commands.words[command+3u]=commands.words[fallback+3u];
+        commands.words[command+4u]=index*limits.capacityPerRoot;
+        if (index==0u) {
+            if (failures==0u && activeRoots!=0u) commands.words[fallback+1u]=0u;
+            summary.values[0]=uvec4(total,failures,activeRoots,maximum);
+        }
+    }
+    uint root=index/limits.capacityPerRoot;
+    uint slot=index%limits.capacityPerRoot;
+    if (root>=limits.rootCount || slot>=results.values[root].x ||
+        results.values[root].z!=0u || index>=uint(leaves.values.length()) ||
+        index>=uint(instances.values.length())) return;
+    uvec4 leaf=leaves.values[index];
+    // Both bound halves are included. Full-detail volumes use no LOD coverage
+    // partition; object category1 is the explicitly supported opaque path.
+    uint node=(leaf.x&0x00ffffffu)|((leaf.w&15u)<<24u)|0xc0000000u;
+    instances.values[index]=uvec2(node,(leaf.y&65535u)|0x00010000u);
+}

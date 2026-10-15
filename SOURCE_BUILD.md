@@ -2,6 +2,13 @@
 
 This is the source-patch workflow for the retained rendering checkpoint. You can compile it yourself; the archived executable is an optional historical comparison. These patches are tied to an upstream revision and a specific tested game installation, not guaranteed to apply to arbitrary shadPS4 revisions or work on every GPU.
 
+## October 15 shape-table correction
+
+The [shape fix record](SHAPE_DENSITY_FIX_20261015.md#source) supplies a focused compiler patch,
+a matching project-source delta, an exact base commit and source hashes for the new tested EXE.
+Follow that separate recipe for the October 15 build. The older patch stack below is retained
+for the earlier checkpoints and is not the recipe for reproducing the new build.
+
 ## October 4 selector reset correction
 
 The [selector reset correction](SELECTOR_RESET_FIX_20261004.md) preserves two real Dreams compute dispatches incorrectly skipped as metadata clears. Apply `dreams-selector-reset-fix-20261004.patch` after the focused patches below, or use the latest cumulative diagnostic snapshot described in the validation record. Source compilation is optional; the latest tested executable is linked on the front page.

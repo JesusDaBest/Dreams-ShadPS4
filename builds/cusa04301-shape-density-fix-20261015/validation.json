@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "title_id": "CUSA04301",
+  "revision": "density-generation-fix-v1",
+  "exe_sha256": "7a91bd313519f0beae84a7e17ea2ee41209baa565d49c19aae1df899aa9551e6",
+  "compiled": true,
+  "source_base_commit": "ee046166afab8ca04759d5d34b63025a48fae2ae",
+  "source_snapshot_includes_existing_user_fixes": true,
+  "scope": "Relocate bounded shader-relative scalar tables through inline buffer resources; normal rendering; recorder disabled.",
+  "shape_fix_verified": true,
+  "all_shapes_verified_in_game": false,
+  "verification": "User confirmed saved cube, cylinder and vertically stretched sphere render correctly on 2026-10-15; latter two share one sculpt.",
+  "validation_scope": "This saved scene; all shapes and operations not yet verified",
+  "publication_date": "2026-10-15",
+  "public_source_base_commit": "b84847d1b6ca14d349bf9e11e91d14ae182e008d",
+  "ordered_count_implementation": "Older Dreams DataOrderedCount implementation from the base; no nikmparis217-ux 2100cf7386a1cbf1440c83566676b2dbdc4f191a implementation.",
+  "settings_used": {
+    "GPU.readbacks_mode": 2,
+    "GPU.patch_shaders": false,
+    "Vulkan.pipeline_cache_enabled": false
+  },
+  "activation": "The inline-table compiler correction is enabled automatically; no activation environment variable.",
+  "default_enabled": true,
+  "cumulative_with_october_6_build": false,
+  "source_check": "Source delta application and matching-source hashes are recorded separately in publication-check.json."
+}

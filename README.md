@@ -1,8 +1,20 @@
 # Dreams on shadPS4
 
-Updated **October 6, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
+Updated **October 15, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
 
 ## Latest tested build
+
+**[Download shadps4.exe — October 15 shape rendering fix](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-shape-density-fix-20261015/shadps4.exe)**
+
+The saved cube, cylinder and vertically stretched sphere rendered correctly in the user's test
+scene. The correction is enabled automatically. Use your existing launcher/runtime dependencies
+with **Precise GPU readbacks**, **pipeline caching disabled** and **shader patching disabled**.
+[Fix, test scope and source](SHAPE_DENSITY_FIX_20261015.md).
+
+This build uses the older Dreams ordered-count implementation. It is a different source branch
+from the October 6 tweak-menu build; it does not include that branch's combined changes.
+
+Previous October 6 checkpoint:
 
 **[Download updated shadps4.exe — October 6 tweak-menu fix](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-tweak-menu-blur-fix-20261006/shadps4.exe)**
 
@@ -15,6 +27,12 @@ Previous October 4 checkpoint:
 Use the executable with your existing launcher/runtime dependencies and **Precise GPU readbacks**. Diagnostic environment flags should be unset. This download is the exact diagnostic executable tested locally, rather than a complete portable runtime package.
 
 ## Confirmed improvements
+
+- **Shape tables (October 15 build):** shader-relative inline-table relocation corrected the saved
+  cube, cylinder and vertically stretched sphere in the tested scene. [Fix and validation](SHAPE_DENSITY_FIX_20261015.md).
+
+The older results below belong to their linked checkpoints; inclusion in the October 15 branch
+is not implied for every item.
 
 - **Tweak-menu blur:** selected-mip coordinate correction passed close, normal and far tests for the tested menu. [Fix and validation](TWEAK_MENU_BLUR_FIX_20261006.md).
 
@@ -38,7 +56,7 @@ Actual Dreams after the new fix, with paint tools open. Paint strokes now render
 
 ## Remaining work
 
-- Check spheres and more complex sculpts with the alignment fix.
+- Expand the October 15 shape fix tests beyond the saved cube, cylinder and stretched sphere, including more complex sculpts and editing operations.
 - Investigate sculpt-limit warnings, remaining low frame rates and other editing slowdowns. The demonstrated pause/unpause workload explosion is corrected locally.
 - Verify the new tweak-menu blur correction across other menus, GPUs and versions; other missing content may remain.
 - Verify other GPUs and game versions. A separate user's imp trails remain unresolved.
@@ -47,9 +65,13 @@ The successful local test used an **AMD Radeon 8060S**, **CUSA04301 VERSION 02.6
 
 ## Source and records
 
+- [October 15 shape fix and validation](SHAPE_DENSITY_FIX_20261015.md)
+- [Focused shape-table patch](patches/dreams-shape-density-inline-tables-20261015.patch)
+- [Matching October 15 source delta](patches/dreams-source-delta-20261015-shape-density.patch)
+
 - [Selector reset fix and validation](SELECTOR_RESET_FIX_20261004.md)
 - [Focused selector reset patch](patches/dreams-selector-reset-fix-20261004.patch)
-- [Latest cumulative main-source snapshot](patches/dreams-diagnostic-source-20261004-selector-reset.patch)
+- [October 4 cumulative main-source snapshot](patches/dreams-diagnostic-source-20261004-selector-reset.patch)
 
 - [Source build instructions](SOURCE_BUILD.md)
 - [Focused alignment patch](patches/generic-align-zero-offset-fix-20261004.patch)
