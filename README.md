@@ -2,6 +2,10 @@
 
 Updated **October 15, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
 
+![Dreams on shadPS4 showing sculpt shapes and paint, October 15, 2026](builds/cusa04301-shape-density-fix-20261015/dreams-shapes-20261015.png)
+
+October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
+
 ## Latest tested build
 
 **[Download shadps4.exe — October 15 shape rendering fix](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-shape-density-fix-20261015/shadps4.exe)**
@@ -42,7 +46,7 @@ is not implied for every item.
 - **Imp trails and tweak-menu smush:** persistent imp copies in menus and the tweak-menu smush were removed on the tested system. This fix is included in the new executable. [Validation record](IMP_SMUSH_FIX_20261004.md).
 - **Scene save IDs:** three test scenes kept distinct version IDs, contents, and previews; discarding a fourth preserved all three. [Validation record](SAVE_ID_FIX_20261003.md).
 
-## Current in-game screenshot
+## Earlier October 4 in-game screenshot
 
 Captured directly from Dreams running the October 4 alignment-fix executable. The cube now renders with clean faces. This image shows the game itself; the separate GPU-normal comparison is in the [validation record](SCULPT_ALIGNMENT_FIX_20261004.md).
 
