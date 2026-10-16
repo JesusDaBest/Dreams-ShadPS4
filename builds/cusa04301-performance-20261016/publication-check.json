@@ -1,0 +1,11 @@
+{
+  "exe_exact": true,
+  "zip_crc_ok": true,
+  "zip_exe_hash_exact": true,
+  "powershell_syntax_ok": true,
+  "source_reverse_apply_checked": true,
+  "fresh_full_rebuild": false,
+  "new_game_test": false,
+  "source_forward_apply_checked": true,
+  "source_reconstructed_files_match": 957
+}

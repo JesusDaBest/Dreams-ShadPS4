@@ -1,0 +1,34 @@
+{
+  "exit_code": 0,
+  "output": "GPU\tAMD Radeon(TM) 8060S Graphics\nPASS mode=dedicated scratch_buffers=54 device_allocations=54 dedicated=54 shared_pairs=0 validation_errors=0\nloader_get_json: Failed to open JSON file C:\\Program Files (x86)\\Epic Games\\Epic Online Services\\managedArtifacts\\98bc04bc842e4906993fd6d6644ffb8d\\EOSOverlayVkLayer-Win64.json\nloader_get_json: Failed to open JSON file D:\\Downloads\\Lethal Company Mods\\overwolf\\0.311.0.6\\ow-vulkan-overlay64.json\nloader_get_json: Failed to open JSON file D:\\Downloads\\Lethal Company Mods\\overwolf\\0.311.0.6\\ow-graphics-vulkan64.json\nLayer \"VK_LAYER_AMD_switchable_graphics\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_RTSS\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_VALVE_steam_overlay\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_VALVE_steam_fossilize\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_OBS_HOOK\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_OBS_HOOK\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nGPU\tAMD Radeon(TM) 8060S Graphics\nPASS mode=pooled scratch_buffers=54 device_allocations=7 dedicated=0 shared_pairs=120 validation_errors=0\nloader_get_json: Failed to open JSON file C:\\Program Files (x86)\\Epic Games\\Epic Online Services\\managedArtifacts\\98bc04bc842e4906993fd6d6644ffb8d\\EOSOverlayVkLayer-Win64.json\nloader_get_json: Failed to open JSON file D:\\Downloads\\Lethal Company Mods\\overwolf\\0.311.0.6\\ow-vulkan-overlay64.json\nloader_get_json: Failed to open JSON file D:\\Downloads\\Lethal Company Mods\\overwolf\\0.311.0.6\\ow-graphics-vulkan64.json\nLayer \"VK_LAYER_AMD_switchable_graphics\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_RTSS\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_VALVE_steam_overlay\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_VALVE_steam_fossilize\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_OBS_HOOK\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_OBS_HOOK\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nGPU\tAMD Radeon(TM) 8060S Graphics\nPASS mode=other-title scratch_buffers=54 device_allocations=54 dedicated=54 shared_pairs=0 validation_errors=0\nloader_get_json: Failed to open JSON file C:\\Program Files (x86)\\Epic Games\\Epic Online Services\\managedArtifacts\\98bc04bc842e4906993fd6d6644ffb8d\\EOSOverlayVkLayer-Win64.json\nloader_get_json: Failed to open JSON file D:\\Downloads\\Lethal Company Mods\\overwolf\\0.311.0.6\\ow-vulkan-overlay64.json\nloader_get_json: Failed to open JSON file D:\\Downloads\\Lethal Company Mods\\overwolf\\0.311.0.6\\ow-graphics-vulkan64.json\nLayer \"VK_LAYER_AMD_switchable_graphics\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_RTSS\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_VALVE_steam_overlay\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_VALVE_steam_fossilize\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_OBS_HOOK\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\nLayer \"VK_LAYER_OBS_HOOK\" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.\n",
+  "runs": [
+    {
+      "mode": "dedicated",
+      "exit_code": 0,
+      "stdout": "GPU\tAMD Radeon(TM) 8060S Graphics\nPASS mode=dedicated scratch_buffers=54 device_allocations=54 dedicated=54 shared_pairs=0 validation_errors=0\n"
+    },
+    {
+      "mode": "pooled",
+      "exit_code": 0,
+      "stdout": "GPU\tAMD Radeon(TM) 8060S Graphics\nPASS mode=pooled scratch_buffers=54 device_allocations=7 dedicated=0 shared_pairs=120 validation_errors=0\n"
+    },
+    {
+      "mode": "other-title",
+      "exit_code": 0,
+      "stdout": "GPU\tAMD Radeon(TM) 8060S Graphics\nPASS mode=other-title scratch_buffers=54 device_allocations=54 dedicated=54 shared_pairs=0 validation_errors=0\n"
+    }
+  ],
+  "source_sha256": {
+    "src/video_core/texture_cache/tile_manager.cpp": "b029814e1c83cc9d4d49a325eb987e69a9ea901467373dfd311dd0426cc55bb1"
+  },
+  "unchanged_functions": [
+    "TileManager::Result TileManager::DetileImage(",
+    "void TileManager::TileImage(",
+    "vk::Pipeline TileManager::GetTilingPipeline("
+  ],
+  "production_functions": [
+    "DreamsPooledTilingAllocationsEnabled",
+    "TileManager::GetScratchBuffer"
+  ],
+  "limits": "Actual production allocation function and title/environment gate, real VMA allocator, observed 4-8 MiB buffer sizes, six concurrent buffers, six reuse cycles with half retained, GPU fill/copy and complete data verification after fences, driver allocation/free counts and Vulkan synchronization validation. Tiling shaders and scheduler are not executed here; their code and deferred lifetimes are verified unchanged. Does not establish in-game speed or visuals."
+}

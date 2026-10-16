@@ -1,0 +1,6 @@
+{
+  "sha256": "061b1aa078be0fe93d9a6f43a1fd3affe3880ec3ecab6041cecbe699a68ac347",
+  "user_feedback": "still see the bugs but performance feels way better",
+  "interpretation": "Enabled windows reached 27.85 and 28.39 gameplay updates/s versus 27.44 and 24.09 disabled. Typical sampled update time was lower with pooling, but one later enabled window still contained a 461 ms sample. Host memory availability varied. Bounded pooled stack samples no longer caught dedicated scratch-allocation stalls; GPU-result waits remained. User reports substantially better feel, with existing visual bugs still present. This does not prove a precise speedup, complete stutter removal or visual correctness.",
+  "visual_bugs_resolved": false
+}
