@@ -8,9 +8,17 @@ October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
 ## Latest tested build
 
-**[Download the current October 16 performance build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-performance-20261016/Dreams-performance-20261016.zip)**
+**[Download the current occlusion rendering fix (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-occlusion-fix-20261016/Dreams-occlusion-fix-20261016.zip)**
 
-This is the exact EXE currently used by the owner, with its tested launch profile. Extract and run **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. The launcher backs up the existing per-game configuration before applying the tested settings. Requires your existing game/system setup and the Microsoft Visual C++ x64 runtime.
+This is the exact build currently played by the owner. Extract and run **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. It retains the preceding October 16 performance/shape fixes and launch profile. No extra activation switch is needed for this correction.
+
+The owner confirmed the tested scene's corner corruption was gone. The fix preserves the requested mip when Dreams samples a plain 2D occlusion map with array-style coordinates. Other scenes and performance impact remain unmeasured; a bound-view mip-limit uncertainty remains documented. [Fix, findings, tests and matching source](OCCLUSION_FIX_20261016.md).
+
+Previous October 16 performance checkpoint:
+
+**[Download the previous October 16 performance build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-performance-20261016/Dreams-performance-20261016.zip)**
+
+This is the preceding performance EXE, with its tested launch profile. Extract and run **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. The launcher backs up the existing per-game configuration before applying the tested settings. Requires your existing game/system setup and the Microsoft Visual C++ x64 runtime.
 
 Retains the October 15 shape correction and adds the retained loading/readback/queue changes and pooled tiling allocations. The owner reports substantially improved performance; existing visual bugs remain. This does not merge the separate October 6 branch. [Changes, source and validation](PERFORMANCE_BUILD_20261016.md).
 

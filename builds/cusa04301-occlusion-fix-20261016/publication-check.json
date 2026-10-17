@@ -1,0 +1,14 @@
+{
+  "exe_sha256": "fd882da7acb151db2a149b25a8a108683e4ef5d076f24fdd8d636dbdeb1772be",
+  "zip_sha256": "2ceb7d4fcdb24c6f66fc42f07c2c933fb786de4e2e41d6fab409ff65f07253d8",
+  "zip_bytes": 33634955,
+  "source_reconstruction_files": 957,
+  "changed_files": [
+    "src/shader_recompiler/dreams_compat.h",
+    "src/shader_recompiler/ir/passes/resource_tracking_pass.cpp",
+    "src/video_core/renderer_vulkan/vk_rasterizer.cpp"
+  ],
+  "compiler_test_rerun_passed": true,
+  "packaged_help_exit_code": 0,
+  "zip_contents_verified": true
+}

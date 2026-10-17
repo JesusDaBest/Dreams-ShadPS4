@@ -1,0 +1,540 @@
+--- a/src/shader_recompiler/dreams_compat.h
++++ b/src/shader_recompiler/dreams_compat.h
+@@ -19,7 +19,7 @@
+ constexpr u64 TraversalShader = 0xb535c6c8;
+ // Bump when b535 traversal lowering changes incompatibly. Revision 6 includes the exact
+ // unordered NGE comparison semantics used by its near-detail refinement path.
+-constexpr u32 TraversalCacheRevision = 10;
++constexpr u32 TraversalCacheRevision = 11;
+ // The instruction microtrace is a separate, opt-in traversal permutation. Its revision is kept
+ // separate from the guest-visible traversal lowering so diagnostics never invalidate or replace
+ // the normal Dreams shader.
+--- a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+@@ -1222,13 +1222,22 @@
+     const bool is_msaa = view_type == AmdGpu::ImageType::Color2DMsaa ||
+                          view_type == AmdGpu::ImageType::Color2DMsaaArray;
+     const bool unnormalized = sampler.force_unnormalized || inst_info.is_unnormalized;
++    // B535 declares array coordinates even when its occlusion map is a plain 2D
++    // texture. GCN ignores the supplied slice for that binding, but it still occupies
++    // a VGPR before LOD. Do not read that zero slice as the requested mip level.
++    const bool dreams_array_2d = info.pgm_hash == DreamsCompat::TraversalShader &&
++        inst_info.is_array && view_type == AmdGpu::ImageType::Color2D;
++    const IR::U32 dimension_lod = dreams_array_2d && unnormalized && inst_info.has_lod
++        ? IR::U32{ir.ConvertFToU(32, ir.FPClamp(get_addr_reg(addr_reg + 3), ir.Imm32(0.0f),
++              ir.Imm32(float(image.NumViewLevels(image_res.is_array) - 1))))}
++        : ir.Imm32(0u);
+     const bool fold_runtime_offset = !inst_info.is_gather && !is_msaa &&
+                                      !profile.supports_runtime_image_sample_offsets &&
+                                      IsRuntimeOffset(offset);
+     const bool needs_dimentions =
+         (!is_msaa && unnormalized) || (is_msaa && !unnormalized) || fold_runtime_offset;
+     const auto dimensions =
+-        needs_dimentions ? ir.ImageQueryDimension(handle, ir.Imm32(0u), ir.Imm1(false), inst_info)
++        needs_dimentions ? ir.ImageQueryDimension(handle, dimension_lod, ir.Imm1(false), inst_info)
+                          : IR::Value{};
+     const auto get_coord = [&](u32 coord_idx, u32 dim_idx) -> IR::Value {
+         const auto coord = get_addr_reg(coord_idx);
+@@ -1260,8 +1269,12 @@
+         case AmdGpu::ImageType::Color1DArray: // x, slice
+         case AmdGpu::ImageType::Color2D:      // x, y
+         case AmdGpu::ImageType::Color2DMsaa:  // x, y
++        {
+             addr_reg = addr_reg + 2;
+-            return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
++            const auto coords = ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
++            if (dreams_array_2d) ++addr_reg;
++            return coords;
++        }
+         case AmdGpu::ImageType::Color2DArray: // x, y, slice
+             addr_reg = addr_reg + 3;
+             // Note we can use FixCubeCoords with fallthrough cases since it checks for image type.
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -7812,6 +7812,24 @@
+                 std::string metadata{"schema\t1\nphase\tmaterial-live-gpu-output\n"
+                     "additional_draws\t0\nvolume_downloads\t0\n"
+                     "same_capture_as_old_cpu_reference\tfalse\n"};
++                const u32 material_present_counter = DebugState.GetFrameNum();
++                metadata += fmt::format("presentation_counter\t{}\n", material_present_counter);
++                // The paired request is created only after the selected sculpt input capture.
++                // A present counter is asynchronous: record it as context, not proof that
++                // every captured resource belongs to one complete GPU frame.
++                u32 geometry_present_begin{}, geometry_present_end{};
++                u64 geometry_color_address{};
++                std::ifstream pair(std::filesystem::path{root} / "paired-geometry.txt");
++                if (pair >> geometry_present_begin >> geometry_present_end >> std::hex >> geometry_color_address) {
++                    const auto input_id = dreams_material_fragment_image_bindings[4].first;
++                    const VAddr input_address = input_id ? texture_cache.GetImage(input_id).info.guest_address : 0;
++                    metadata += fmt::format("ordered_after_geometry_capture\ttrue\n"
++                        "geometry_presentation_begin\t{}\ngeometry_presentation_end\t{}\n"
++                        "geometry_color0_address\t{:#x}\nmaterial_ids_address\t{:#x}\n"
++                        "geometry_target_matches_material_ids\t{}\n",
++                        geometry_present_begin, geometry_present_end, geometry_color_address,
++                        input_address, geometry_color_address != 0 && geometry_color_address == input_address);
++                }
+                 bool ok = true;
+                 u64 hash{};
+                 const auto capture = [&](const char* role, VideoCore::ImageId id) {
+@@ -22554,6 +22572,142 @@
+         return;
+     }
+ 
++    // Private, trigger-selected camera/culling input snapshot. Preserve the original shader
++    // and its bindings; observe registered GPU memory without uploading CPU fallback data.
++    if (cs.pgm_hash == DreamsTraversalShader &&
++        Common::ElfInfo::Instance().GameSerial() == "CUSA04301") {
++        const char* capture_directory = DreamsEnvironment<"SHADPS4_DREAMS_CANDIDATE_SHADER_DIR">();
++        static u32 camera_capture_poll{};
++        // A prime interval avoids repeatedly sampling the same empty tail of a ten-pass chain.
++        if (capture_directory && (++camera_capture_poll % 127) == 0) {
++            const std::filesystem::path output{capture_directory};
++            std::error_code error;
++            if (std::filesystem::remove(output / "culling.trigger", error)) {
++                std::string metadata{"shader\t0xb535c6c8\nsource\tpre-dispatch-settled-bindings\n"};
++                u64 ignored_hash{};
++                std::array<u32, 3> captured_dimensions{};
++                bool ok = WriteDreamsCaptureWords(output / "culling.spv",
++                    pipeline_cache.GetCurrentShaderSpirv(Shader::LogicalStage::Compute), ignored_hash);
++                ok &= WriteDreamsCaptureWords(output / "culling-srt.bin", cs.flattened_ud_buf, ignored_hash);
++                ok &= WriteDreamsCaptureWords(output / "culling-user-data.bin", cs.user_data, ignored_hash);
++                const auto read_resident = [&](const char* label, VAddr address, u32 bytes) {
++                    constexpr u64 PageSize = VideoCore::BufferCache::CACHING_PAGESIZE;
++                    const bool valid = address && bytes && bytes <= 512 &&
++                        address < (u64{1} << 40) && bytes <= (u64{1} << 40) - address &&
++                        (address & (PageSize - 1)) + bytes <= PageSize &&
++                        buffer_cache.IsRegionRegistered(address, bytes);
++                    metadata += fmt::format("{}_address\t{:#x}\n{}_bytes\t{}\n{}_registered_range\t{}\n",
++                        label, address, label, bytes, label, valid);
++                    if (!valid) return false;
++                    const auto* table = buffer_cache.GetBdaPageTableBuffer();
++                    u64 gpu_page{};
++                    const bool mapped = ReadDreamsBoundBufferForCapture(scheduler, buffer_cache,
++                        vk::DescriptorBufferInfo{table->Handle(), 0, table->SizeBytes()},
++                        (address / PageSize) * sizeof(u64),
++                        std::span<u8>{reinterpret_cast<u8*>(&gpu_page), sizeof(gpu_page)});
++                    if (!mapped || !gpu_page) return false;
++                    auto& source = buffer_cache.GetBuffer(buffer_cache.FindBuffer(address, bytes));
++                    const u64 offset = source.Offset(address);
++                    const bool same = source.IsInBounds(address, bytes) &&
++                        source.BufferDeviceAddress() + offset == gpu_page + (address & (PageSize - 1));
++                    metadata += fmt::format("{}_mapping_matches\t{}\n{}_cpu_dirty\t{}\n",
++                        label, same, label, buffer_cache.IsRegionCpuModified(address, bytes));
++                    if (!same) return false;
++                    std::array<u8, 512> data{};
++                    const auto span = std::span<u8>{data}.first(bytes);
++                    const bool read = ReadDreamsBoundBufferForCapture(scheduler, buffer_cache,
++                        vk::DescriptorBufferInfo{source.Handle(), offset, bytes}, 0, span);
++                    if (read && std::string_view{label} == "culling-indirect" && bytes == 12)
++                        std::memcpy(captured_dimensions.data(), data.data(), 12);
++                    return read && WriteDreamsCaptureBytes(output / fmt::format("{}.gpu.bin", label), span, ignored_hash);
++                };
++                const VAddr root = cs.user_data.size() >= 2 ?
++                    (u64{cs.user_data[0]} | (u64{cs.user_data[1]} << 32)) & ((u64{1} << 48) - 1) : 0;
++                const bool root_ok = root && read_resident("culling-root", root, 272);
++                const bool args_ok = read_resident("culling-indirect", args_address, 12);
++                metadata += fmt::format("root_captured\t{}\nargs_captured\t{}\ndispatch_sequence\t{}\n",
++                    root_ok, args_ok, g_compute_dispatch_sequence);
++                // The root need not have a BDA page when this shader consumes a flattened
++                // upload. Its optional GPU copy is useful only when that mapping exists.
++                ok &= args_ok;
++                const bool active_dispatch = args_ok && captured_dimensions[0] &&
++                    captured_dimensions[1] && captured_dimensions[2];
++                metadata += fmt::format("dispatch_dimensions\t{}x{}x{}\nactive_dispatch\t{}\n",
++                    captured_dimensions[0], captured_dimensions[1], captured_dimensions[2], active_dispatch);
++                static u32 empty_capture_attempts{};
++                if (!active_dispatch) {
++                    const bool retry = args_ok && ++empty_capture_attempts < 16;
++                    metadata += fmt::format("complete\tfalse\nretry_pending\t{}\n", retry);
++                    WriteDreamsCaptureText(output / "culling-empty-pass.tsv", metadata);
++                    if (retry)
++                        WriteDreamsCaptureText(output / "culling.trigger", "wait for nonzero traversal dispatch\n");
++                    else
++                        WriteDreamsCaptureText(output / "culling-manifest.tsv", metadata);
++                } else {
++                empty_capture_attempts = 0;
++                bool flat_ok{};
++                for (u32 binding = 0; binding < cs.buffers.size(); ++binding) {
++                    if (cs.buffers[binding].buffer_type != Shader::BufferType::Flatbuf ||
++                        binding >= buffer_infos.size()) continue;
++                    const u64 bytes = u64{cs.flattened_ud_buf.size()} * sizeof(u32);
++                    const auto& bound = buffer_infos[binding];
++                    if (!bytes || bytes > 4096 || bound.range == VK_WHOLE_SIZE || bound.range < bytes)
++                        continue;
++                    std::vector<u8> data(static_cast<size_t>(bytes));
++                    flat_ok = ReadDreamsBoundBufferForCapture(scheduler, buffer_cache, bound, 0, data) &&
++                        WriteDreamsCaptureBytes(output / "culling-srt.gpu.bin", data, ignored_hash);
++                    metadata += fmt::format("flat_binding\t{}\nflat_bytes\t{}\n", binding, bytes);
++                }
++                metadata += fmt::format("flat_captured\t{}\n", flat_ok);
++                ok &= flat_ok;
++                const auto* gds = buffer_cache.GetGdsBuffer();
++                std::array<u8, 384 * sizeof(u32)> gds_data{};
++                const bool gds_ok = ReadDreamsBoundBufferForCapture(scheduler, buffer_cache,
++                    vk::DescriptorBufferInfo{gds->Handle(), 0, gds->SizeBytes()}, 0, gds_data) &&
++                    WriteDreamsCaptureBytes(output / "culling-gds.gpu.bin", gds_data, ignored_hash);
++                metadata += fmt::format("gds_captured\t{}\n", gds_ok);
++                ok &= gds_ok;
++                u64 downloaded{};
++                // Original B535 object records and spatial rows; metadata records their actual
++                // descriptors so the offline checker can reject a changed shader interface.
++                for (u32 binding : {8u, 10u}) {
++                    if (binding >= cs.buffers.size() || binding >= buffer_infos.size() ||
++                        cs.buffers[binding].IsSpecial()) { ok = false; continue; }
++                    const auto sharp = cs.buffers[binding].GetSharp(cs);
++                    const u64 bytes = sharp.GetSize();
++                    const auto& bound = buffer_infos[binding];
++                    const bool valid = bytes && bytes <= 16_MB && downloaded + bytes <= 24_MB &&
++                        bound.range != VK_WHOLE_SIZE && bound.range >= bytes;
++                    metadata += fmt::format("buffer{}_address\t{:#x}\nbuffer{}_bytes\t{}\nbuffer{}_stride\t{}\n",
++                        binding, sharp.base_address, binding, bytes, binding, sharp.stride);
++                    bool read{};
++                    if (valid) {
++                        std::vector<u8> data(static_cast<size_t>(bytes));
++                        downloaded += bytes;
++                        read = ReadDreamsBoundBufferForCapture(scheduler, buffer_cache, bound,
++                            bound.range - bytes, data) && WriteDreamsCaptureBytes(
++                            output / fmt::format("culling-buffer{}.gpu.bin", binding), data, ignored_hash);
++                    }
++                    metadata += fmt::format("buffer{}_captured\t{}\n", binding, read);
++                    ok &= read;
++                }
++                metadata += fmt::format("complete\t{}\npresentation_counter\t{}\n",
++                    ok, DebugState.GetFrameNum());
++                WriteDreamsCaptureText(output / "culling-manifest.tsv", metadata);
++                // The next matching sculpt draw supplies the projection and per-object camera
++                // for comparison. Exact object-buffer equality must be checked offline before
++                // treating the two snapshots as the same camera state.
++                if (ok) {
++                    WriteDreamsCaptureText(output / "material-after-geometry.request", "paired culling/draw camera comparison\n");
++                    WriteDreamsCaptureText(output / "capture.trigger", "ce3b8413 3706083c 0\n");
++                }
++                LOG_WARNING(Render_Vulkan, "Dreams private culling camera capture complete={} bytes={} dir={}",
++                    ok, downloaded, output.string());
++                }
++            }
++        }
++    }
++
+     const bool profile_dreams = ShouldProfileDreamsTraversal(cs);
+     const bool profile = ShouldProfileCompute() || profile_dreams;
+     VideoCore::Buffer* finalize_b535_membership_after_dispatch{};
+@@ -27656,6 +27810,7 @@
+         if (candidate && matching_draws++ >= skip_target &&
+             std::filesystem::remove(candidate_output / "capture.trigger",candidate_error)) {
+             matching_draws = 0;
++            const u32 candidate_present_begin = DebugState.GetFrameNum();
+             u64 candidate_hash{};
+             bool candidate_ok=WriteDreamsCaptureWords(candidate_output / "vs.spv",
+                 pipeline_cache.GetCurrentShaderSpirv(Shader::LogicalStage::Vertex),candidate_hash);
+@@ -27698,6 +27853,206 @@
+                 candidate_regs.num_instances.NumInstances());
+             candidate_ok &= WriteDreamsCaptureBytes(candidate_output / "gpu-regs.bin",
+                 std::span<const u8>{reinterpret_cast<const u8*>(&candidate_regs), sizeof(candidate_regs)}, candidate_hash);
++            candidate_ok &= WriteDreamsCaptureBytes(candidate_output / "push-data.bin",
++                std::span<const u8>{reinterpret_cast<const u8*>(&push_data), sizeof(push_data)}, candidate_hash);
++            const auto& candidate_key = pipeline->GetGraphicsKey();
++            candidate_ok &= WriteDreamsCaptureBytes(candidate_output / "graphics-key.bin",
++                std::span<const u8>{reinterpret_cast<const u8*>(&candidate_key), sizeof(candidate_key)}, candidate_hash);
++            // Observe the existing GPU camera data without uploading CPU backing or creating
++            // a missing BDA page. An absent/stale mapping is evidence, not something this
++            // recorder should repair. Each range is at most 64 bytes and stays in one page.
++            const auto read_camera = [&](const char* label, VAddr address, u32 bytes) {
++                constexpr u64 PageSize = VideoCore::BufferCache::CACHING_PAGESIZE;
++                const bool in_range = address && bytes && bytes <= 64 &&
++                    address < (u64{1} << 40) && bytes <= (u64{1} << 40) - address &&
++                    (address & (PageSize - 1)) + bytes <= PageSize;
++                candidate_metadata += fmt::format("{}_address\t{:#x}\n{}_bytes\t{}\n{}_in_range\t{}\n",
++                    label, address, label, bytes, label, in_range);
++                if (!in_range) return false;
++                const auto* table = buffer_cache.GetBdaPageTableBuffer();
++                u64 gpu_page{};
++                const bool table_ok = ReadDreamsBoundBufferForCapture(scheduler, buffer_cache,
++                    vk::DescriptorBufferInfo{table->Handle(), 0, table->SizeBytes()},
++                    (address / PageSize) * sizeof(u64),
++                    std::span<u8>{reinterpret_cast<u8*>(&gpu_page), sizeof(gpu_page)});
++                const bool registered = buffer_cache.IsRegionRegistered(address, bytes);
++                candidate_metadata += fmt::format("{}_page_read_ok\t{}\n{}_gpu_page\t{:#x}\n{}_registered\t{}\n",
++                    label, table_ok, label, gpu_page, label, registered);
++                if (!table_ok || !gpu_page || !registered) return false;
++                // Registered cache allocations are page-aligned. The one-page check above
++                // therefore guarantees that FindBuffer only looks up the existing buffer.
++                auto& source = buffer_cache.GetBuffer(buffer_cache.FindBuffer(address, bytes));
++                const u64 source_offset = source.Offset(address);
++                const bool matching = source.IsInBounds(address, bytes) &&
++                    source.BufferDeviceAddress() + source_offset == gpu_page + (address & (PageSize - 1));
++                candidate_metadata += fmt::format("{}_mapping_matches\t{}\n{}_cpu_dirty\t{}\n{}_gpu_dirty\t{}\n",
++                    label, matching, label, buffer_cache.IsRegionCpuModified(address, bytes),
++                    label, buffer_cache.IsRegionGpuModified(address, bytes));
++                if (!matching) return false;
++                std::array<u8, 64> data{};
++                const auto span = std::span<u8>{data}.first(bytes);
++                const bool read = ReadDreamsBoundBufferForCapture(scheduler, buffer_cache,
++                    vk::DescriptorBufferInfo{source.Handle(), source_offset, bytes}, 0, span);
++                candidate_metadata += fmt::format("{}_gpu_read_ok\t{}\n", label, read);
++                return read && WriteDreamsCaptureBytes(candidate_output / fmt::format("{}.gpu.bin", label),
++                    span, candidate_hash);
++            };
++            for (const auto* stage : candidate_stages) {
++                if (!stage) continue;
++                bool camera_ok{};
++                const char* camera_label{};
++                constexpr u64 AddressMask = (u64{1} << 48) - 1;
++                if (stage->pgm_hash == 0xce3b8413 && stage->user_data.size() >= 3) {
++                    const VAddr root = (u64{stage->user_data[0]} | (u64{stage->user_data[1]} << 32)) & AddressMask;
++                    camera_label = "ce3-screen-camera";
++                    camera_ok = read_camera(camera_label, root + u64{stage->user_data[2]} * 16 + 96, 16);
++                } else if (stage->pgm_hash == 0x3706083c && stage->user_data.size() >= 3 &&
++                           stage->flattened_ud_buf.size() > 37) {
++                    const VAddr root = (u64{stage->flattened_ud_buf[36]} |
++                        (u64{stage->flattened_ud_buf[37]} << 32)) & AddressMask;
++                    camera_label = "vs370-projection-camera";
++                    camera_ok = read_camera(camera_label, root + u64{stage->user_data[2]} * 192 + 128, 64);
++                }
++                if (camera_label) candidate_metadata += fmt::format("{}_captured\t{}\n", camera_label, camera_ok);
++            }
++            // Read only the atlas bricks referenced by this draw, including a one-texel
++            // periodic halo for linear filtering. Never download the full 512 MiB atlas.
++            const auto download_image_regions = [&](VideoCore::ImageId id,
++                std::vector<vk::BufferImageCopy> copies, u64 bytes, const char* name) {
++                if (!id || !bytes || bytes > 32_MB || copies.empty()) return false;
++                auto& image = texture_cache.GetImage(id);
++                if (image.info.resources.levels != 1 || image.info.resources.layers != 1 ||
++                    image.info.num_samples != 1 || image.info.props.is_block || image.info.props.is_depth ||
++                    image.info.props.has_stencil || image.info.num_bits % 8 ||
++                    image.backing->image.image_ci.samples != vk::SampleCountFlagBits::e1 ||
++                    image.backing->image.image_ci.extent.width < image.info.size.width ||
++                    image.backing->image.image_ci.extent.height < image.info.size.height ||
++                    image.backing->image.image_ci.extent.depth < image.info.size.depth ||
++                    image.backing->subresource_states.size() > 1) return false;
++                auto& download = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download);
++                const auto [data, offset] = download.Map(bytes, 4);
++                if (!data) return false;
++                download.Commit();
++                const auto saved = image.backing->state;
++                const auto saved_subresources = image.backing->subresource_states;
++                for (auto& copy : copies) copy.bufferOffset += offset;
++                image.Download(copies, download.Handle(), offset, bytes);
++                const auto& restore = saved_subresources.empty() ? saved : saved_subresources[0];
++                const auto barriers = image.GetBarriers(restore.layout, restore.access_mask,
++                    restore.pl_stage, std::nullopt);
++                if (!barriers.empty()) scheduler.CommandBuffer().pipelineBarrier2(
++                    vk::DependencyInfo{.imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
++                                       .pImageMemoryBarriers = barriers.data()});
++                image.backing->state = saved;
++                image.backing->subresource_states = saved_subresources;
++                scheduler.Finish();
++                download.InvalidateMappedRange(offset, bytes);
++                // Do not save undefined alignment padding from the utility buffer.
++                std::vector<u8> clean(static_cast<size_t>(bytes), 0);
++                for (const auto& copy : copies) {
++                    const u64 relative = copy.bufferOffset - offset;
++                    const u64 copied = u64{copy.imageExtent.width} * copy.imageExtent.height *
++                        copy.imageExtent.depth * image.info.num_bits / 8;
++                    if (relative > bytes || copied > bytes - relative) return false;
++                    std::memcpy(clean.data() + relative, data + relative, static_cast<size_t>(copied));
++                }
++                return WriteDreamsCaptureBytes(candidate_output / name,
++                    clean, candidate_hash);
++            };
++            const auto capture_density_samples = [&](const std::vector<u8>& records) {
++                if (candidate_target != 0xce3b8413 || records.empty() || records.size() % 8 ||
++                    dreams_ce3_fragment_image_bindings.size() != 2) return false;
++                const auto& [atlas_id, atlas_desc] = dreams_ce3_fragment_image_bindings[0];
++                const auto& [noise_id, noise_desc] = dreams_ce3_fragment_image_bindings[1];
++                if (!atlas_id || !noise_id) return false;
++                const auto& atlas = texture_cache.GetImage(atlas_id);
++                const auto& view = atlas_desc.view_info;
++                const bool atlas_valid = atlas.info.pixel_format == vk::Format::eR8Unorm &&
++                    atlas.info.num_bits == 8 && atlas.info.size.width == 2048 &&
++                    atlas.info.size.height == 2048 && atlas.info.size.depth == 128 &&
++                    view.format == vk::Format::eR8Unorm && view.type == AmdGpu::ImageType::Color3D &&
++                    view.range.base == VideoCore::SubresourceBase{} &&
++                    view.range.extent == VideoCore::SubresourceExtent{};
++                candidate_metadata += fmt::format("atlas_format_valid\t{}\natlas_image_id\t{}\n"
++                    "atlas_guest_address\t{:#x}\natlas_extent\t{}x{}x{}\natlas_view_mapping\t{},{},{},{}\n",
++                    atlas_valid, atlas_id.index, atlas.info.guest_address, atlas.info.size.width,
++                    atlas.info.size.height, atlas.info.size.depth, vk::to_string(view.mapping.r),
++                    vk::to_string(view.mapping.g), vk::to_string(view.mapping.b), vk::to_string(view.mapping.a));
++                if (!atlas_valid) return false;
++                const auto& sampler = g_dreams_resolved_sculpt_sampler;
++                const bool sampler_matches = sampler.valid && set_writes.size() > 5 &&
++                    set_writes[5].descriptorType == vk::DescriptorType::eSampler &&
++                    set_writes[5].pImageInfo && set_writes[5].pImageInfo->sampler == sampler.handle;
++                candidate_metadata += fmt::format("effective_sampler_matches\t{}\neffective_sampler_compare\t{}\n",
++                    sampler_matches, sampler.is_compare);
++                if (!sampler_matches || sampler.is_compare) return false;
++                bool ok = WriteDreamsCaptureBytes(candidate_output / "stage-0-effective-sampler.bin",
++                    std::span<const u8>{reinterpret_cast<const u8*>(&sampler.sharp), sizeof(sampler.sharp)}, candidate_hash);
++                std::vector<u32> keys;
++                keys.reserve(records.size() / 8);
++                for (size_t i = 0; i < records.size(); i += 8) {
++                    u32 key{}; std::memcpy(&key, records.data() + i, 4);
++                    keys.push_back(key & 0xffffff);
++                }
++                std::ranges::sort(keys);
++                keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
++                // At most eight wrapped pieces and 1024 aligned bytes per 10^3 halo.
++                if (keys.size() > 32_MB / 1024) return false;
++                struct AxisPiece { s32 source; u32 count; u32 logical; };
++                const auto split_axis = [](s32 origin, s32 extent) {
++                    std::vector<AxisPiece> parts;
++                    const s32 source = (origin % extent + extent) % extent;
++                    const u32 first = std::min<u32>(10, extent - source);
++                    parts.push_back({source, first, 0});
++                    if (first < 10) parts.push_back({0, 10 - first, first});
++                    return parts;
++                };
++                std::vector<vk::BufferImageCopy> copies;
++                std::string regions{"key\tx\ty\tz\tw\th\td\tlogical_x\tlogical_y\tlogical_z\toffset\tbytes\n"};
++                u64 bytes{};
++                for (u32 key : keys) {
++                    const s32 bx = (key & 255) * 8, by = ((key >> 8) & 255) * 8;
++                    const s32 bz = ((key >> 16) & 255) * 8;
++                    if (bz >= 128) return false;
++                    for (const auto& z : split_axis(bz - 1, 128))
++                        for (const auto& y : split_axis(by - 1, 2048))
++                            for (const auto& x : split_axis(bx - 1, 2048)) {
++                                bytes = (bytes + 3) & ~u64{3};
++                                const u64 count = u64{x.count} * y.count * z.count;
++                                if (bytes + count > 32_MB) return false;
++                                copies.push_back(vk::BufferImageCopy{
++                                    .bufferOffset = bytes,
++                                    .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++                                    .imageOffset = {x.source, y.source, z.source},
++                                    .imageExtent = {x.count, y.count, z.count}});
++                                regions += fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
++                                    key, x.source, y.source, z.source, x.count, y.count, z.count,
++                                    x.logical, y.logical, z.logical, bytes, count);
++                                bytes += count;
++                            }
++                }
++                ok &= download_image_regions(atlas_id, std::move(copies), bytes, "atlas-bricks-r8.bin");
++                ok &= WriteDreamsCaptureText(candidate_output / "atlas-brick-regions.tsv", regions);
++                candidate_metadata += fmt::format("atlas_brick_count\t{}\natlas_download_bytes\t{}\natlas_captured\t{}\n",
++                    keys.size(), bytes, ok);
++                const auto& noise = texture_cache.GetImage(noise_id);
++                const auto& noise_view = noise_desc.view_info;
++                const u64 noise_bytes = u64{noise.info.size.width} * noise.info.size.height * noise.info.num_bits / 8;
++                const bool noise_valid = noise.info.size.width == 128 && noise.info.size.height == 128 &&
++                    noise.info.size.depth == 1 && noise.info.num_bits && noise.info.num_bits % 8 == 0 &&
++                    noise_bytes <= 1_MB && noise_view.type == AmdGpu::ImageType::Color2D &&
++                    noise_view.range.base == VideoCore::SubresourceBase{} &&
++                    noise_view.range.extent == VideoCore::SubresourceExtent{};
++                const bool noise_ok = noise_valid && download_image_regions(noise_id,
++                    {vk::BufferImageCopy{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++                        .imageExtent = {128, 128, 1}}}, noise_bytes, "noise-image.bin");
++                candidate_metadata += fmt::format("noise_captured\t{}\nnoise_format\t{}\nnoise_view_format\t{}\n"
++                    "noise_bytes\t{}\nnoise_view_mapping\t{},{},{},{}\n", noise_ok,
++                    vk::to_string(noise.info.pixel_format), vk::to_string(noise_view.format), noise_bytes,
++                    vk::to_string(noise_view.mapping.r), vk::to_string(noise_view.mapping.g),
++                    vk::to_string(noise_view.mapping.b), vk::to_string(noise_view.mapping.a));
++                return ok && noise_ok;
++            };
+             // Optional one-shot geometry readback. Hard limits exclude textures and large arenas.
+             if (is_indirect) {
+                 const u32 command_size = is_indexed ? 20 : 16;
+@@ -27745,10 +28100,43 @@
+                         candidate_metadata += fmt::format("indirect_actual_indices\t{}\n"
+                             "indirect_first_index\t{}\nindirect_first_instance\t{}\n",
+                             actual_indices, first_index, first_instance);
++                        const u64 index_size = candidate_regs.index_buffer_type.index_type ==
++                            AmdGpu::IndexType::Index16 ? 2 : 4;
++                        const VAddr index_address = candidate_regs.index_base_address.Address<VAddr>() +
++                            (u64{first_index} + index_offset) * index_size;
++                        const u64 index_bytes = u64{actual_indices} * index_size;
++                        constexpr u64 IndexPage = VideoCore::BufferCache::CACHING_PAGESIZE;
++                        const bool index_range_valid = index_address && index_address < (u64{1} << 40) &&
++                            index_bytes && index_bytes <= 256 && index_bytes <= (u64{1} << 40) - index_address &&
++                            (index_address & (IndexPage - 1)) + index_bytes <= IndexPage;
++                        bool indices_ok{};
++                        if (index_range_valid && buffer_cache.IsRegionRegistered(index_address, index_bytes) &&
++                            !buffer_cache.IsRegionCpuModified(index_address, index_bytes)) {
++                            auto& index_buffer = buffer_cache.GetBuffer(buffer_cache.FindBuffer(index_address, index_bytes));
++                            std::array<u8, 256> data{};
++                            const auto bytes = std::span<u8>{data}.first(index_bytes);
++                            indices_ok = index_buffer.IsInBounds(index_address, index_bytes) &&
++                                ReadDreamsBoundBufferForCapture(scheduler, buffer_cache,
++                                    vk::DescriptorBufferInfo{index_buffer.Handle(), index_buffer.Offset(index_address), index_bytes},
++                                    0, bytes) && WriteDreamsCaptureBytes(candidate_output / "indices.gpu.bin", bytes, candidate_hash);
++                        }
++                        candidate_metadata += fmt::format("indices_address\t{:#x}\nindices_element_bytes\t{}\n"
++                            "indices_gpu_captured\t{}\n", index_address, index_size, indices_ok);
+                         // One-shot bounded preview record capture from the actual draw bindings.
+                         for (const auto* stage : candidate_stages) {
+-                            if (!stage || stage->pgm_hash != 0x3706083c || stage->buffers.size() < 5 ||
+-                                !actual_instances || actual_instances > 4096) continue;
++                            if (!stage || stage->pgm_hash != 0x3706083c || stage->buffers.size() < 5) continue;
++                            // Bound the list by its actual descriptor and the existing byte budget,
++                            // rather than rejecting otherwise small captures of larger creations.
++                            const auto records_sharp = stage->buffers[3].GetSharp(*stage);
++                            const u64 records_offset = u64{first_instance} * 8;
++                            const u64 records_bytes = u64{actual_instances} * 8;
++                            candidate_metadata += "vs370_capture_instance_limit\tdescriptor-and-byte-budget\nvs370_capture_byte_limit\t50331648\n";
++                            if (!records_bytes || records_bytes > 16_MB ||
++                                records_offset > records_sharp.GetSize() ||
++                                records_bytes > records_sharp.GetSize() - records_offset) {
++                                candidate_metadata += "vs370_records_complete\tfalse\nvs370_skip_reason\tinstance-list-out-of-range-or-empty\n";
++                                continue;
++                            }
+                             size_t bound_base{};
+                             for (const auto* previous : candidate_stages) {
+                                 if (previous == stage) break;
+@@ -27757,7 +28145,7 @@
+                             u64 downloaded{};
+                             const auto read_slice = [&](u32 binding, u64 offset, u64 bytes, std::vector<u8>& data) {
+                                 const auto sharp = stage->buffers[binding].GetSharp(*stage);
+-                                if (!bytes || bytes > 4_MB || downloaded + bytes > 8_MB ||
++                                if (!bytes || bytes > 16_MB || downloaded + bytes > 48_MB ||
+                                     offset > sharp.GetSize() || bytes > sharp.GetSize() - offset ||
+                                     bound_base + binding >= buffer_infos.size()) return false;
+                                 const auto& bound = buffer_infos[bound_base + binding];
+@@ -27772,7 +28160,10 @@
+                                 return ok;
+                             };
+                             std::vector<u8> records;
+-                            if (!read_slice(3, u64{first_instance} * 8, u64{actual_instances} * 8, records)) continue;
++                            if (!read_slice(3, records_offset, records_bytes, records)) {
++                                candidate_metadata += "vs370_records_complete\tfalse\nvs370_skip_reason\tinstance-list-read-failed\n";
++                                continue;
++                            }
+                             u32 min_key = ~0u, max_key{}, min_object = ~0u, max_object{};
+                             for (u32 instance = 0; instance < actual_instances; ++instance) {
+                                 u32 key{}, object{};
+@@ -27783,12 +28174,14 @@
+                                 min_object = std::min(min_object, object); max_object = std::max(max_object, object);
+                             }
+                             std::vector<u8> data;
+-                            read_slice(0, u64{min_object} * 432, (u64{max_object} - min_object + 1) * 432, data);
++                            bool records_ok = read_slice(0, u64{min_object} * 432, (u64{max_object} - min_object + 1) * 432, data);
+                             for (u32 binding : {1u, 2u, 4u}) {
+                                 const u64 stride = binding == 4 ? 16 : 4;
+-                                read_slice(binding, u64{min_key} * stride, (u64{max_key} - min_key + 1) * stride, data);
++                                records_ok &= read_slice(binding, u64{min_key} * stride, (u64{max_key} - min_key + 1) * stride, data);
+                             }
+-                            candidate_metadata += fmt::format("vs370_download_bytes\t{}\nvs370_source\tsettled-vulkan-binding\n", downloaded);
++                            candidate_metadata += fmt::format("vs370_download_bytes\t{}\nvs370_source\tsettled-vulkan-binding\nvs370_records_complete\t{}\n", downloaded, records_ok);
++                            const bool samples_ok = records_ok && capture_density_samples(records);
++                            candidate_metadata += fmt::format("density_samples_complete\t{}\n", samples_ok);
+                         }
+                         for (const auto* stage : candidate_stages) {
+                             if (!stage || stage->pgm_hash != 0xd25db925 || stage->buffers.size() < 3)
+@@ -27891,7 +28284,18 @@
+                     geometry_ok, downloaded);
+             }
+             candidate_metadata+=fmt::format("metadata_complete\t{}\n",candidate_ok);
++            const u32 candidate_present_end = DebugState.GetFrameNum();
++            candidate_metadata += fmt::format("presentation_counter_begin\t{}\npresentation_counter_end\t{}\n"
++                "sculpt_color0_address\t{:#x}\n", candidate_present_begin, candidate_present_end,
++                candidate_regs.color_buffers[0].Address());
+             WriteDreamsCaptureText(candidate_output / "manifest.tsv",candidate_metadata);
++            if (std::filesystem::remove(candidate_output / "material-after-geometry.request", candidate_error)) {
++                const bool pair_ok = WriteDreamsCaptureText(candidate_output / "paired-geometry.txt",
++                    fmt::format("{} {} {:x}\n", candidate_present_begin, candidate_present_end,
++                        candidate_regs.color_buffers[0].Address()));
++                if (pair_ok) WriteDreamsCaptureText(candidate_output / "material-gpu-output" / "capture.trigger",
++                    "after selected sculpt geometry capture\n");
++            }
+         }
+     }
+     const char* directory = DreamsEnvironment<"SHADPS4_DREAMS_MATERIAL_CAPTURE_DIR">();

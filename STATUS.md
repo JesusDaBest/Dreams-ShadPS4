@@ -1,3 +1,7 @@
+# October 16 occlusion update
+
+The [owner-tested occlusion build](OCCLUSION_FIX_20261016.md) is now the front-page download. It is the exact EXE used in the affected creation: the owner reported the corner corruption gone, and the corrected dynamic mip sampling was verified in the active shader. It retains the preceding performance/shape branch. The 65-case compiler test and source/package verification pass. Other scenes/GPUs, performance impact and changed bound-view mip counts remain unverified. This does not merge the separate October 6 branch.
+
 # October 15 update
 
 The [shape-table correction](SHAPE_DENSITY_FIX_20261015.md) is available as the exact tested EXE

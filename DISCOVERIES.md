@@ -1,5 +1,9 @@
 # Detailed Discoveries
 
+## October 16 — occlusion array-coordinate and mip correction
+
+Dreams traversal shader `0xb535c6c8` declares array-style sampling while the occlusion resource is plain 2D. The ignored slice still occupies a guest address component before the explicit mip. Consuming that slice as LOD lost the requested mip; querying level-zero dimensions also normalized mip-scaled coordinates incorrectly. The scoped lowering fix retains the requested mip and queries its dimensions. The owner reported the corner corruption gone in the tested creation; active shader sampling and 65 compiler cases corroborate the bounded result. Changed bound-view mip counts still need review: the compiled cap was 7 while the saved raw descriptor reports last level 8. [Full findings and validation](OCCLUSION_FIX_20261016.md).
+
 ## September 2 result — empty scene originates before rasterization
 
 A trigger-gated held-state capture produced a fully empty 3D scene while UI still rendered. The

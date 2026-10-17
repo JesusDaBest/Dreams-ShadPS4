@@ -1,0 +1,49 @@
+{
+  "user_report": "ready its gone wow",
+  "user_confirmed_corner_corruption_gone": true,
+  "actual_gpu_shader_verified": true,
+  "active_culling_dispatch": "2x1x1",
+  "corrected_sample_lods": [
+    "_2066",
+    "_2147",
+    "_2147"
+  ],
+  "dimension_query_lods": [
+    [
+      "_2066",
+      "7.0"
+    ],
+    [
+      "_2147",
+      "7.0"
+    ],
+    [
+      "_2147",
+      "7.0"
+    ]
+  ],
+  "visual_observation": "Same kitchen creation: restored table top and continuous floor surfaces in the new GPU material output. Camera pose differs from earlier captures.",
+  "geometry_records_complete": false,
+  "geometry_limit": "The next matching draw was empty; no complete post-fix geometry/density replay is claimed.",
+  "root_cause": "B535 declared-array sampling of a plain 2D occlusion texture consumed the ignored slice as the mip. Mip-scaled coordinates were normalized against level zero. The private correction preserves the requested mip and its dimensions.",
+  "fix_scope": "B535 shader with declared-array sampling of a plain 2D texture; other shader hashes unchanged in compiler tests",
+  "all_scenes_verified": false,
+  "performance_effect_measured": false,
+  "release_follow_up": "Review the compiled view-mip cap before main-build promotion: this shader has a cap of 7 while the captured raw guest descriptor reports last_level 8. The test confirms the current scene improvement, not robustness across changed bound-view mip counts.",
+  "exe_sha256": "fd882da7acb151db2a149b25a8a108683e4ef5d076f24fdd8d636dbdeb1772be",
+  "parent_exe_sha256": "061b1aa078be0fe93d9a6f43a1fd3affe3880ec3ecab6041cecbe699a68ac347",
+  "source_reconstruction_files_verified": 957,
+  "changed_project_files": [
+    "src/shader_recompiler/dreams_compat.h",
+    "src/shader_recompiler/ir/passes/resource_tracking_pass.cpp",
+    "src/video_core/renderer_vulkan/vk_rasterizer.cpp"
+  ],
+  "compiler_cases": 65,
+  "source_checks": [
+    "Old production lowering reproduces lost mip on captured descriptor",
+    "Corrected production function passes 65 descriptor/flag/LOD cases including dynamic mip",
+    "Other shader hashes retain original behavior in the tests",
+    "Release build/link successful; packaged --help exits 0",
+    "Main exe and per-game config hashes unchanged"
+  ]
+}
