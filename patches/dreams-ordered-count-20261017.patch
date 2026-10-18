@@ -1,0 +1,680 @@
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+@@ -702,7 +702,10 @@
+         ASSERT_MSG(Sirit::ValidId(ctx.workgroup_index_id) &&
+                        Sirit::ValidId(ctx.local_invocation_id),
+                    "Dreams 393 DOC has no workgroup/local invocation metadata");
+-        ASSERT_MSG(handle == 5, "Dreams 393 GDS handle changed: expected 5, got {}", handle);
++        // Resource tracking can insert numeric-table bindings before GDS. The IR supplies
++        // its resolved handle; validate the resource kind rather than a variant-specific slot.
++        ASSERT_MSG(buffer.buffer_type == BufferType::GdsBuffer,
++                   "Dreams 393 DOC handle {} is not GDS", handle);
+ 
+         u32 doc_index{};
+         switch (control) {
+@@ -1110,7 +1113,11 @@
+         ctx.info.pgm_hash == DreamsCompat::VisibilityCandidateCompactShader;
+     const bool is_dreams_gather_input =
+         ctx.info.pgm_hash == DreamsCompat::GatherInputCompactShader;
+-    if (is_dreams_b1_seed_writer || is_dreams_visibility_candidate || is_dreams_gather_input) {
++    const bool is_dreams_selection_list =
++        ctx.info.pgm_hash == DreamsCompat::SelectionListCompactShader &&
++        DreamsCompat::UseSelectionListExactOrderedCountReplay();
++    if (is_dreams_b1_seed_writer || is_dreams_visibility_candidate || is_dreams_gather_input ||
++        is_dreams_selection_list) {
+         // 4eb, d8 and 95c each have one DOC, one guest wave per workgroup, and no guest-visible
+         // store before DOC. Collect records the wave payload and stops; a host scan assigns
+         // prefixes in WorkgroupIndex order; replay then executes the output stores exactly once.
+@@ -1119,9 +1126,16 @@
+                 ? DreamsCompat::B1SeedWriterOrderedControl
+                 : (is_dreams_gather_input ? DreamsCompat::GatherInputOrderedControl
+                                           : DreamsCompat::VisibilityCandidateOrderedControl);
+-        ASSERT_MSG(packed_control == expected_control,
+-                   "Dreams single-DOC control changed for {:#x}: expected {:#x}, got {:#x}",
+-                   ctx.info.pgm_hash, expected_control, packed_control);
++        if (is_dreams_selection_list) {
++            // 81cf has one release+done ADD, a fixed GDS counter, and no pre-DOC memory
++            // writes. Resource insertion can change its descriptor slot.
++            ASSERT_MSG(control == 0x000c && buffer.buffer_type == BufferType::GdsBuffer,
++                       "Dreams 81cf DOC control/resource changed");
++        } else {
++            ASSERT_MSG(packed_control == expected_control,
++                       "Dreams single-DOC control changed for {:#x}: expected {:#x}, got {:#x}",
++                       ctx.info.pgm_hash, expected_control, packed_control);
++        }
+         ASSERT_MSG(Sirit::ValidId(ctx.dreams_ordered_phase),
+                    "Dreams radix DOC has no phase specialization constant");
+         ASSERT_MSG(Sirit::ValidId(ctx.workgroup_index_id) &&
+@@ -1139,7 +1153,7 @@
+         const Id has_one_z = ctx.OpIEqual(ctx.U1[1], num_workgroups_z, ctx.u32_one_value);
+         const Id has_exact_shape = ctx.OpLogicalAnd(
+             ctx.U1[1], has_x_capacity, ctx.OpLogicalAnd(ctx.U1[1], has_one_y, has_one_z));
+-        const u32 scratch_base = is_dreams_b1_seed_writer
++        const u32 scratch_base = (is_dreams_b1_seed_writer || is_dreams_selection_list)
+                                      ? DreamsCompat::B1SeedWriterOrderedScratchBaseDword
+                                      : DreamsCompat::VisibilityCandidateOrderedScratchBaseDword;
+         const Id scratch_entry = ctx.OpIAdd(
+@@ -1230,6 +1244,112 @@
+ 
+         ctx.AddLabel(phase_merge_label);
+         return result;
++    }
++
++    if (DreamsCompat::UseAdditionalExactOrderedCountReplay(ctx.info.pgm_hash)) {
++        const auto kernel = DreamsCompat::AdditionalOrderedKernelFor(ctx.info.pgm_hash);
++        const u32 doc_index = (control >> 8) / 4;
++        const bool is_wave_done = doc_index + 1 == kernel.docs;
++        ASSERT_MSG(doc_index < kernel.docs &&
++                       control == ((doc_index * 4) << 8 | (is_wave_done ? 0x0c : 0x04)),
++                   "Dreams additional DOC sequence changed hash={:#x} control={:#x}",
++                   ctx.info.pgm_hash, control);
++        ASSERT_MSG(buffer.buffer_type == BufferType::GdsBuffer &&
++                       Sirit::ValidId(ctx.dreams_ordered_phase) &&
++                       Sirit::ValidId(ctx.workgroup_index_id) &&
++                       Sirit::ValidId(ctx.num_workgroups_id),
++                   "Dreams additional DOC resource/metadata changed");
++        const Id num_workgroups = ctx.OpLoad(ctx.U32[3], ctx.num_workgroups_id);
++        const Id num_workgroups_x = ctx.OpCompositeExtract(ctx.U32[1], num_workgroups, 0);
++        const Id num_workgroups_y = ctx.OpCompositeExtract(ctx.U32[1], num_workgroups, 1);
++        const Id num_workgroups_z = ctx.OpCompositeExtract(ctx.U32[1], num_workgroups, 2);
++        const Id has_x_capacity =
++            ctx.OpULessThanEqual(ctx.U1[1], num_workgroups_x,
++                                 ctx.ConstU32(DreamsCompat::MaxTraversalWorkgroups));
++        const Id has_one_y = ctx.OpIEqual(ctx.U1[1], num_workgroups_y, ctx.u32_one_value);
++        const Id has_one_z = ctx.OpIEqual(ctx.U1[1], num_workgroups_z, ctx.u32_one_value);
++        const Id has_exact_shape = ctx.OpLogicalAnd(
++            ctx.U1[1], has_x_capacity, ctx.OpLogicalAnd(ctx.U1[1], has_one_y, has_one_z));
++        const Id scratch_entry = ctx.OpIAdd(
++            ctx.U32[1],
++            ctx.ConstU32(DreamsCompat::TraversalOrderedScratchBaseDword(doc_index)),
++            ctx.OpIMul(ctx.U32[1], ctx.workgroup_index_id,
++                       ctx.ConstU32(DreamsCompat::OrderedEntryDwords)));
++
++        const Id phase = ctx.dreams_ordered_phase;
++        const Id is_collect =
++            ctx.OpIEqual(ctx.U1[1], phase, ctx.ConstU32(DreamsCompat::OrderedPhaseCollect));
++        const Id collect_label = ctx.OpLabel();
++        const Id non_collect_label = ctx.OpLabel();
++        const Id phase_merge_label = ctx.OpLabel();
++        ctx.OpSelectionMerge(phase_merge_label, spv::SelectionControlMask::MaskNone);
++        ctx.OpBranchConditional(is_collect, collect_label, non_collect_label);
++
++        ctx.AddLabel(collect_label);
++        const Id collect_store_label = ctx.OpLabel();
++        const Id collect_store_merge_label = ctx.OpLabel();
++        const Id should_collect_store = ctx.OpLogicalAnd(ctx.U1[1], has_exact_shape, is_leader);
++        ctx.OpSelectionMerge(collect_store_merge_label, spv::SelectionControlMask::MaskNone);
++        ctx.OpBranchConditional(should_collect_store, collect_store_label,
++                                collect_store_merge_label);
++
++        ctx.AddLabel(collect_store_label);
++        ctx.OpStore(get_pointer(ctx.OpIAdd(
++                        ctx.U32[1], scratch_entry,
++                        ctx.ConstU32(DreamsCompat::SculptOrderedPayloadOffset))),
++                    value);
++        ctx.OpStore(get_pointer(ctx.OpIAdd(
++                        ctx.U32[1], scratch_entry,
++                        ctx.ConstU32(DreamsCompat::SculptOrderedTokenOffset))),
++                    ordered_token);
++        ctx.OpBranch(collect_store_merge_label);
++
++        ctx.AddLabel(collect_store_merge_label);
++        if (is_wave_done) {
++            ctx.OpReturn();
++        } else {
++            ctx.OpBranch(phase_merge_label);
++        }
++
++        ctx.AddLabel(non_collect_label);
++        const Id is_replay =
++            ctx.OpIEqual(ctx.U1[1], phase, ctx.ConstU32(DreamsCompat::OrderedPhaseReplay));
++        const Id replay_label = ctx.OpLabel();
++        const Id native_label = ctx.OpLabel();
++        const Id non_collect_merge_label = ctx.OpLabel();
++        // Unsupported indirect shapes intentionally execute a no-op collect and then run the
++        // original atomic/store path exactly once during replay.
++        const Id use_exact_replay = ctx.OpLogicalAnd(ctx.U1[1], is_replay, has_exact_shape);
++        ctx.OpSelectionMerge(non_collect_merge_label, spv::SelectionControlMask::MaskNone);
++        ctx.OpBranchConditional(use_exact_replay, replay_label, native_label);
++
++        ctx.AddLabel(replay_label);
++        const Id replay_result = ctx.OpLoad(
++            ctx.U32[1], get_pointer(ctx.OpIAdd(
++                            ctx.U32[1], scratch_entry,
++                            ctx.ConstU32(DreamsCompat::SculptOrderedPrefixOffset))));
++        ctx.OpBranch(non_collect_merge_label);
++
++        ctx.AddLabel(native_label);
++        const Id native_delta =
++            ctx.OpSelect(ctx.U32[1], is_leader, value, ctx.u32_zero_value);
++        const Id native_previous = ctx.OpAtomicIAdd(ctx.U32[1], counter_ptr, device_scope,
++                                                    acquire_release_semantics, native_delta);
++        const Id native_result =
++            ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], subgroup_scope, native_previous);
++        ctx.OpBranch(non_collect_merge_label);
++
++        ctx.AddLabel(non_collect_merge_label);
++        const Id non_collect_result =
++            ctx.OpPhi(ctx.U32[1], replay_result, replay_label, native_result, native_label);
++        ctx.OpBranch(phase_merge_label);
++
++        ctx.AddLabel(phase_merge_label);
++        if (is_wave_done) {
++            return non_collect_result;
++        }
++        return ctx.OpPhi(ctx.U32[1], ctx.u32_zero_value, collect_store_merge_label,
++                         non_collect_result, non_collect_merge_label);
+     }
+ 
+     if (DreamsCompat::UsesExactOrderedCountReplay(ctx.info.pgm_hash) &&
+--- a/src/shader_recompiler/dreams_compat.h
++++ b/src/shader_recompiler/dreams_compat.h
+@@ -30,6 +30,10 @@
+ constexpr u32 QueueProducerAltCacheRevision = 5;
+ constexpr u64 CompactClassifyShader = 0xcbac06d2;
+ constexpr u64 CompactScatterShader = 0xd4532ff4;
++// Stable list compactor; the terminal wave publishes its exclusive-prefix list length.
++constexpr u64 SelectionListCompactShader = 0x81cf58cf;
++constexpr u32 SelectionListCompactCacheRevision = 1;
++constexpr u32 SelectionListCompactCounterIndex = 0xa40;
+ constexpr u64 SceneCompactShader = 0x3937a849;
+ // Bump when the Dreams-only 393 SceneCompact ordered-count lowering changes incompatibly.
+ constexpr u32 SceneCompactCacheRevision = 2;
+@@ -1256,9 +1260,39 @@
+     return value != nullptr && value[0] == '1' && value[1] == '\0';
+ }
+ 
++inline bool UseSelectionListExactOrderedCountReplay() {
++    const char* value = std::getenv("SHADPS4_DREAMS_SELECTION_LIST_EXACT_DOC");
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++}
++
++// Audited, side-effect-free-before-DOC compaction kernels, opt-in as a group.
++struct AdditionalOrderedKernel {
++    u32 docs;
++    u32 counter_base;
++    bool radix_pass;
++};
++constexpr AdditionalOrderedKernel AdditionalOrderedKernelFor(u64 hash) {
++    switch (hash) {
++    case 0x252ccde6: case 0xfff20d00: return {1, 0x400, false};
++    case 0x6f408bbc: return {4, 0xe4, false};
++    case 0xa25580f7: return {4, 0xe8, false};
++    case 0xbce8c0fe: return {1, 0xda, true};
++    case 0xcbac06d2: return {2, 0x2e0, false};
++    default: return {};
++    }
++}
++inline bool UseAdditionalExactOrderedCountReplay(u64 hash) {
++    if (AdditionalOrderedKernelFor(hash).docs == 0) return false;
++    const char* value = std::getenv("SHADPS4_DREAMS_ADDITIONAL_EXACT_DOC");
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++}
++constexpr u32 AdditionalOrderedCacheRevision = 1;
++
+ inline bool UsesExactOrderedCountReplay(u64 hash) {
+     return UsesAlwaysExactOrderedCountReplay(hash) ||
+-           (hash == SceneCompactShader && UseSceneCompactExactOrderedCountReplay());
++           (hash == SceneCompactShader && UseSceneCompactExactOrderedCountReplay()) ||
++           (hash == SelectionListCompactShader && UseSelectionListExactOrderedCountReplay()) ||
++           UseAdditionalExactOrderedCountReplay(hash);
+ }
+ static_assert(NeedsBranchlessOrderedCountAdd(QueueProducerShader));
+ static_assert(!UsesAlwaysExactOrderedCountReplay(QueueProducerShader));
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -70,6 +70,15 @@
+     if (pgm_hash == Shader::DreamsCompat::B1SeedWriterShader) {
+         return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
+                            Shader::DreamsCompat::B1SeedWriterCacheRevision);
++    }
++    if (Shader::DreamsCompat::UseAdditionalExactOrderedCountReplay(pgm_hash)) {
++        return fmt::format("{:#018x}_{}_additional_doc{}", pgm_hash, perm_idx,
++                           Shader::DreamsCompat::AdditionalOrderedCacheRevision);
++    }
++    if (pgm_hash == Shader::DreamsCompat::SelectionListCompactShader &&
++        Shader::DreamsCompat::UseSelectionListExactOrderedCountReplay()) {
++        return fmt::format("{:#018x}_{}_doc{}", pgm_hash, perm_idx,
++                           Shader::DreamsCompat::SelectionListCompactCacheRevision);
+     }
+     if (pgm_hash == Shader::DreamsCompat::SceneCompactShader &&
+         Shader::DreamsCompat::UseSceneCompactExactOrderedCountReplay()) {
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -51,6 +51,10 @@
+ #endif
+ 
+ namespace Vulkan {
++
++static const char* DreamsDensitySourceCaptureDirectory() {
++    return DreamsEnvironment<"SHADPS4_DREAMS_DENSITY_SOURCE_CAPTURE_DIR">();
++}
+ 
+ // Keep the historical window only as a fallback for unaudited shaders. Dreams' raw lookup shaders
+ // use a statically proven access range below, so their descriptor size reflects every reachable
+@@ -17579,9 +17583,32 @@
+         cs_program.num_thread_y.full == 1 && cs_program.num_thread_z.full == 1;
+     const bool is_dreams_b1_seed_writer =
+         cs.pgm_hash == Shader::DreamsCompat::B1SeedWriterShader;
++    const bool is_dreams_selection_list =
++        cs.pgm_hash == Shader::DreamsCompat::SelectionListCompactShader &&
++        Shader::DreamsCompat::UseSelectionListExactOrderedCountReplay();
++    // Replay may only re-read stable inputs. 81cf reads Buffer #1, writes Buffer #0,
++    // then publishes its count to GDS. Reject overlapping guest input/output ranges.
++    const bool dreams_selection_list_replay_safe = !is_dreams_selection_list || [&] {
++        if (cs.buffers.size() < 2 || cs.buffers[0].IsSpecial() || cs.buffers[1].IsSpecial()) {
++            return false;
++        }
++        const auto output = cs.buffers[0].GetSharp(cs);
++        const auto input = cs.buffers[1].GetSharp(cs);
++        const u64 out_base = output.base_address;
++        const u64 in_base = input.base_address;
++        const u64 out_size = output.GetSize();
++        const u64 in_size = input.GetSize();
++        return out_base != 0 && in_base != 0 && out_size != 0 && in_size != 0 &&
++               (out_base < in_base ? out_size <= in_base - out_base
++                                   : in_size <= out_base - in_base);
++    }();
++    const u32 dreams_single_list_counter = is_dreams_selection_list
++        ? Shader::DreamsCompat::SelectionListCompactCounterIndex
++        : Shader::DreamsCompat::B1SeedWriterOrderedCounterIndex;
+     const bool use_dreams_b1_seed_writer_ordered_prefix =
+         Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
+-        is_dreams_b1_seed_writer && cs_program.dim_x != 0 &&
++        (is_dreams_b1_seed_writer || is_dreams_selection_list) &&
++        dreams_selection_list_replay_safe && cs_program.dim_x != 0 &&
+         cs_program.dim_x <= Shader::DreamsCompat::MaxTraversalWorkgroups &&
+         cs_program.dim_y == 1 && cs_program.dim_z == 1 &&
+         instance.IsSubgroupSize64Supported() &&
+@@ -17590,14 +17617,15 @@
+         cs_program.num_thread_x.full ==
+             Shader::DreamsCompat::B1SeedWriterOrderedLanesPerWorkgroup &&
+         cs_program.num_thread_y.full == 1 && cs_program.num_thread_z.full == 1;
+-    if (is_dreams_b1_seed_writer && !use_dreams_b1_seed_writer_ordered_prefix) {
++    if ((is_dreams_b1_seed_writer || is_dreams_selection_list) &&
++        !use_dreams_b1_seed_writer_ordered_prefix) {
+         static u32 logged_b1_seed_writer_fallbacks{};
+         if (logged_b1_seed_writer_fallbacks++ < 4) {
+             LOG_WARNING(
+                 Render_Vulkan,
+-                "Dreams 4eb exact-DOC fallback dims={}x{}x{} start={}x{}x{} threads={}x{}x{} "
++                "Dreams single-list exact-DOC fallback hash={:#x} dims={}x{}x{} start={}x{}x{} threads={}x{}x{} "
+                 "ordered_launch={} max_groups={} subgroup64={}",
+-                cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, cs_program.start_x,
++                cs.pgm_hash, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, cs_program.start_x,
+                 cs_program.start_y, cs_program.start_z, cs_program.num_thread_x.full,
+                 cs_program.num_thread_y.full, cs_program.num_thread_z.full,
+                 Shader::DreamsCompat::HasOrderedWaveLaunch(cs_program.dispatch_initiator),
+@@ -17718,7 +17746,50 @@
+         cs_program.num_thread_x.full ==
+             Shader::DreamsCompat::SceneCompactOrderedThreadsPerWorkgroup &&
+         cs_program.num_thread_y.full == 1 && cs_program.num_thread_z.full == 1;
+-    const bool use_dreams_exact_ordered_prefix =
++    const auto additional_kernel = Shader::DreamsCompat::AdditionalOrderedKernelFor(cs.pgm_hash);
++    const u32 additional_pass = additional_kernel.radix_pass && cs.flattened_ud_buf.size() > 24
++        ? cs.flattened_ud_buf[24] : 0;
++    const bool additional_replay_safe = [&] {
++        if (!Shader::DreamsCompat::UseAdditionalExactOrderedCountReplay(cs.pgm_hash)) return false;
++        // Every guest input range must be disjoint from every guest output range. GDS and
++        // flattened scalar inputs have separately audited fixed addresses or immutable copies.
++        for (const auto& output : cs.buffers) {
++            if (output.IsSpecial() || !output.is_written) continue;
++            const auto dst = output.GetSharp(cs);
++            if (dst.base_address == 0 || dst.GetSize() == 0) return false;
++            for (const auto& input : cs.buffers) {
++                if (input.IsSpecial() || input.is_written) continue;
++                const auto in = input.GetSharp(cs);
++                if (in.base_address == 0 || in.GetSize() == 0) return false;
++                const u64 d = dst.base_address, b = in.base_address;
++                if (d < b ? dst.GetSize() > b - d : in.GetSize() > d - b) return false;
++            }
++        }
++        if (std::ranges::any_of(cs.images, [](const auto& image) { return image.is_written; })) {
++            return false;
++        }
++        for (const auto& [image_id, image_desc] : image_bindings) {
++            if (!image_id) return false;
++            const auto& image = texture_cache.GetImage(image_id);
++            for (const auto& output : cs.buffers) {
++                if (output.IsSpecial() || !output.is_written) continue;
++                const auto dst = output.GetSharp(cs);
++                if (image.Overlaps(dst.base_address, dst.GetSize())) return false;
++            }
++        }
++        return !additional_kernel.radix_pass ||
++               (cs.flattened_ud_buf.size() > 24 && additional_pass < 32);
++    }();
++    const bool use_additional_ordered_prefix = additional_replay_safe &&
++        Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
++        instance.IsSubgroupSize64Supported() &&
++        Shader::DreamsCompat::HasOrderedWaveLaunch(cs_program.dispatch_initiator) &&
++        cs_program.start_x == 0 && cs_program.start_y == 0 && cs_program.start_z == 0 &&
++        cs_program.dim_x != 0 && cs_program.dim_x <= Shader::DreamsCompat::MaxTraversalWorkgroups &&
++        cs_program.dim_y == 1 && cs_program.dim_z == 1 &&
++        cs_program.num_thread_x.full == 64 && cs_program.num_thread_y.full == 1 &&
++        cs_program.num_thread_z.full == 1;
++    const bool use_dreams_exact_ordered_prefix = use_additional_ordered_prefix ||
+         use_dreams_b1_seed_writer_ordered_prefix ||
+         use_dreams_sculpt_surface_ordered_prefix || use_dreams_sculpt_ordered_prefix ||
+         use_dreams_indirect_args_ordered_prefix ||
+@@ -18928,14 +18999,50 @@
+     const bool cross_check_sculpt_gather = Dreams84aaGatherCrossCheck();
+     static bool sculpt_replay_validation_done{};
+     static u32 sculpt_replay_validation_skips{};
+-    if (use_dreams_b1_seed_writer_ordered_prefix) {
+-        static bool logged_b1_seed_writer_ordered_prefix{};
+-        if (!logged_b1_seed_writer_ordered_prefix) {
+-            logged_b1_seed_writer_ordered_prefix = true;
++    if (use_additional_ordered_prefix) {
++        static std::unordered_set<u64> logged;
++        if (logged.emplace(cs.pgm_hash).second) {
+             LOG_WARNING(Render_Vulkan,
+-                        "Dreams 4eb exact DOC path active: direct collect/prefix/replay "
++                        "Dreams additional exact DOC active hash={:#x} groups={} streams={} pass={}",
++                        cs.pgm_hash, dispatch_x, additional_kernel.docs, additional_pass);
++        }
++        auto* gds = buffer_cache.GetGdsBuffer();
++        std::array<HostPasses::DreamsOrderedPrefixPass::Stream, 4> streams{};
++        std::array<vk::BufferMemoryBarrier2, 4> barriers{};
++        for (u32 i = 0; i < additional_kernel.docs; ++i) {
++            const u32 scratch = Shader::DreamsCompat::TraversalOrderedScratchBaseDword(i);
++            streams[i] = {dispatch_x, additional_kernel.counter_base + additional_pass + i, scratch};
++            barriers[i] = {
++                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
++                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageRead |
++                                 vk::AccessFlagBits2::eShaderStorageWrite,
++                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
++                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
++                .buffer = gds->Handle(),
++                .offset = static_cast<vk::DeviceSize>(scratch) * sizeof(u32),
++                .size = static_cast<vk::DeviceSize>(dispatch_x) *
++                        Shader::DreamsCompat::OrderedEntryDwords * sizeof(u32),
++            };
++        }
++        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
++            .bufferMemoryBarrierCount = additional_kernel.docs, .pBufferMemoryBarriers = barriers.data()});
++        cmdbuf.dispatch(dispatch_x, 1, 1);
++        dreams_ordered_prefix_pass.RunBatch(cmdbuf, gds->Handle(), gds->SizeBytes(),
++            std::span{streams.data(), additional_kernel.docs}, Shader::DreamsCompat::OrderedEntryDwords);
++        push_data.host_data[Shader::PushData::DreamsOrderedPhase] = Shader::DreamsCompat::OrderedPhaseReplay;
++        const Pipeline::BufferBarriers no_barriers;
++        pipeline->BindResources(set_writes, no_barriers, push_data);
++        cmdbuf = scheduler.CommandBuffer();
++        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->HandleDreamsOrderedPhase(
++            push_data.host_data[Shader::PushData::DreamsOrderedPhase]));
++        cmdbuf.dispatch(dispatch_x, 1, 1);
++    } else if (use_dreams_b1_seed_writer_ordered_prefix) {
++        static std::unordered_set<u64> logged_b1_seed_writer_ordered_prefix;
++        if (logged_b1_seed_writer_ordered_prefix.emplace(cs.pgm_hash).second) {
++            LOG_WARNING(Render_Vulkan,
++                        "Dreams single-list exact DOC path active: hash={:#x} direct collect/prefix/replay "
+                         "groups={} counter={:#x}",
+-                        dispatch_x, Shader::DreamsCompat::B1SeedWriterOrderedCounterIndex);
++                        cs.pgm_hash, dispatch_x, dreams_single_list_counter);
+         }
+ 
+         const auto doc_profile = dreams_performance_profiler
+@@ -18969,7 +19076,7 @@
+         }
+         dreams_ordered_prefix_pass.Run(
+             cmdbuf, gds->Handle(), gds->SizeBytes(), dispatch_x,
+-            Shader::DreamsCompat::B1SeedWriterOrderedCounterIndex,
++            dreams_single_list_counter,
+             Shader::DreamsCompat::B1SeedWriterOrderedScratchBaseDword,
+             Shader::DreamsCompat::OrderedEntryDwords);
+ 
+@@ -22434,8 +22541,8 @@
+         LOG_WARNING(Render_Vulkan, "Compute profile hash={:#x} dims={}x{}x{} elapsed={:.3f}ms",
+                     cs.pgm_hash, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z, elapsed);
+     }
+-    if (static_cast<const char*>(nullptr) /* release: DIAGNOSTIC_GENERATION_DIR disabled */ &&
+-        dreams_frame_capture_active && dreams_frame_capture_event <= 512 &&
++    if (DreamsDensitySourceCaptureDirectory() && cs.pgm_hash == 0x7ba4de5d &&
++        dreams_frame_capture_active && dreams_frame_capture_event == 1 &&
+         cs.l_stage == Shader::LogicalStage::Compute) {
+         const auto input_path = dreams_frame_capture_event_path;
+         dreams_frame_capture_event_path /= "post";
+@@ -22443,6 +22550,7 @@
+         std::filesystem::create_directories(dreams_frame_capture_event_path, capture_error);
+         CaptureDreamsFrameResources(cs);
+         dreams_frame_capture_event_path = input_path;
++        CaptureDreamsFrameEnd();
+     }
+     DebugState.IncDispatch();
+     if (dreams_performance_profiler) {
+@@ -22547,6 +22655,26 @@
+             g_recent_compute_dispatch_index - 1;
+     }
+     g_dreams_generation_dispatch_has_work = true;
++    // Read only the pending diagnostic's indirect dimensions. Empty dispatches must
++    // leave the one-shot request armed; normal execution performs no extra readback.
++    if (cs.pgm_hash == 0x7ba4de5d &&
++        Common::ElfInfo::Instance().GameSerial() == "CUSA04301") {
++        if (const char* source_root = DreamsDensitySourceCaptureDirectory()) {
++            std::error_code source_error;
++            if (std::filesystem::exists(std::filesystem::path{source_root} / "source.request",
++                                        source_error)) {
++                std::array<u32, 3> source_dimensions{};
++                g_dreams_generation_dispatch_has_work = false;
++                if (memory->IsValidMapping(args_address, sizeof(source_dimensions))) {
++                    buffer_cache.ReadMemory(args_address, sizeof(source_dimensions));
++                    std::memcpy(source_dimensions.data(),
++                                std::bit_cast<const void*>(args_address), sizeof(source_dimensions));
++                    g_dreams_generation_dispatch_has_work = source_dimensions[0] != 0 &&
++                        source_dimensions[1] != 0 && source_dimensions[2] != 0;
++                }
++            }
++        }
++    }
+     const char* generation_capture = static_cast<const char*>(nullptr) /* release: DIAGNOSTIC_GENERATION_DIR disabled */;
+     const bool generation_candidate = cs.pgm_hash == 0x7ba4de5d ||
+         cs.pgm_hash == 0x61b54af5 || cs.pgm_hash == 0x44c189d5 ||
+@@ -25834,8 +25962,8 @@
+                         first_nonzero[0], first_nonzero[1], first_nonzero[2], first_nonzero[3]);
+         }
+     }
+-    if (static_cast<const char*>(nullptr) /* release: DIAGNOSTIC_GENERATION_DIR disabled */ &&
+-        dreams_frame_capture_active && dreams_frame_capture_event <= 512 &&
++    if (DreamsDensitySourceCaptureDirectory() && cs.pgm_hash == 0x7ba4de5d &&
++        dreams_frame_capture_active && dreams_frame_capture_event == 1 &&
+         cs.l_stage == Shader::LogicalStage::Compute) {
+         const auto input_path = dreams_frame_capture_event_path;
+         dreams_frame_capture_event_path /= "post";
+@@ -25843,6 +25971,7 @@
+         std::filesystem::create_directories(dreams_frame_capture_event_path, capture_error);
+         CaptureDreamsFrameResources(cs);
+         dreams_frame_capture_event_path = input_path;
++        CaptureDreamsFrameEnd();
+     }
+     DebugState.IncDispatch();
+     if (dreams_performance_profiler) {
+@@ -25888,7 +26017,8 @@
+ }
+ 
+ bool Rasterizer::BindResources(const Pipeline* pipeline) {
+-    CaptureDreamsFrameBegin(pipeline);
++    // Source selection reads the bindings of this dispatch, after texture synchronization.
++    if (!DreamsDensitySourceCaptureDirectory()) CaptureDreamsFrameBegin(pipeline);
+     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+         IsComputeImageClear(pipeline)) {
+         CaptureDreamsSelectorProducer(pipeline->GetStage(Shader::LogicalStage::Compute),
+@@ -25917,6 +26047,7 @@
+         stage->PushUd(binding, push_data);
+         BindBuffers(*stage, binding, push_data);
+         BindTextures(*stage, binding);
++        if (DreamsDensitySourceCaptureDirectory()) CaptureDreamsFrameBegin(pipeline);
+         CaptureDreamsFrameResources(*stage);
+         uses_dma |= stage->uses_dma;
+     }
+@@ -27622,6 +27753,140 @@
+ 
+ // Private one-shot diagnostic readback. No replacement shaders or extra scene draws.
+ void Rasterizer::CaptureDreamsFrameBegin(const Pipeline* pipeline) {
++    if (const char* source_root = DreamsDensitySourceCaptureDirectory()) {
++        // This diagnostic copies inputs and written outputs of one existing dispatch.
++        // It does not enable the old frame recorder, alter shaders, or enqueue extra work.
++        if (Common::ElfInfo::Instance().GameSerial() != "CUSA04301" ||
++            dreams_frame_capture_active || !g_dreams_generation_dispatch_has_work) return;
++        const bool source_stage = std::ranges::any_of(pipeline->GetStages(), [](const Shader::Info* stage) {
++            return stage && stage->l_stage == Shader::LogicalStage::Compute &&
++                   stage->pgm_hash == 0x7ba4de5d;
++        });
++        static u32 source_dispatches{};
++        std::error_code error;
++        const std::filesystem::path source_path{source_root};
++        if (!source_stage || !std::filesystem::exists(source_path / "source.request", error)) return;
++        if (source_dispatches >= 4) {
++            std::filesystem::remove(source_path / "source.request", error);
++            return;
++        }
++        const Shader::Info* source_info{};
++        for (const auto* stage : pipeline->GetStages()) {
++            if (stage && stage->l_stage == Shader::LogicalStage::Compute &&
++                stage->pgm_hash == 0x7ba4de5d) source_info = stage;
++        }
++        static std::vector<u64> source_candidate_signatures;
++        u64 candidate_signature{};
++        std::array<u32, 3> wanted{};
++        std::ifstream target_input{source_path / "source-footprint.txt"};
++        if (target_input >> wanted[0] >> wanted[1] >> wanted[2]) {
++            // Only the audited full-resolution cached-field basis is selected.
++            // Do not spend root-map probes on coarser generations.
++            if (!source_info || source_info->flattened_ud_buf.size() < 114 ||
++                source_info->flattened_ud_buf[97] != 0) return;
++            // Each armed probe reads only the 128 KiB occupancy root map. No tree,
++            // SDF buffers or whole atlas are downloaded until the footprint matches.
++            static u32 source_probes{};
++            if (source_probes >= 256) {
++                std::filesystem::remove(source_path / "source.request", error);
++                WriteDreamsCaptureText(source_path / "selection-exhausted.txt", "256 root-map probes; no further reads\n");
++                return;
++            }
++            if (image_bindings.size() <= 2 || !image_bindings[2].first) return;
++            auto& source_image = texture_cache.GetImage(image_bindings[2].first);
++            if (source_image.info.size.width != 32 || source_image.info.size.height != 32 ||
++                source_image.info.size.depth != 32 || source_image.info.num_bits != 32 ||
++                source_image.info.resources.layers != 1 || source_image.info.resources.levels != 1 ||
++                source_image.info.pixel_format != vk::Format::eR32Uint) return;
++            ++source_probes;
++            scheduler.EndRendering();
++            auto& download = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download);
++            constexpr u64 map_bytes = 32 * 32 * 32 * sizeof(u32);
++            const auto [map_data, map_offset] = download.Map(map_bytes, 4);
++            if (!map_data) return;
++            download.Commit();
++            const auto saved = source_image.backing->state;
++            const auto saved_subresources = source_image.backing->subresource_states;
++            const std::array copies{vk::BufferImageCopy{.bufferOffset = map_offset,
++                .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++                .imageExtent = {32, 32, 32}}};
++            source_image.Download(copies, download.Handle(), map_offset, map_bytes);
++            const auto restore_state = saved_subresources.empty() ? saved : saved_subresources[0];
++            const auto barriers = source_image.GetBarriers(restore_state.layout,
++                restore_state.access_mask, restore_state.pl_stage,
++                std::optional<VideoCore::SubresourceRange>{});
++            if (!barriers.empty()) scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++                .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
++                .pImageMemoryBarriers = barriers.data()});
++            source_image.backing->state = saved;
++            source_image.backing->subresource_states = saved_subresources;
++            scheduler.Finish();
++            download.InvalidateMappedRange(map_offset, map_bytes);
++            std::array<u32, 3> low{32, 32, 32}, high{};
++            bool occupied{};
++            for (u32 i = 0; i < 32 * 32 * 32; ++i) {
++                u32 node{}; std::memcpy(&node, map_data + i * sizeof(u32), sizeof(node));
++                if (node == 0xffffffffu) continue;
++                occupied = true;
++                const std::array<u32, 3> xyz{i % 32, (i / 32) % 32, i / 1024};
++                for (u32 axis = 0; axis < 3; ++axis) {
++                    low[axis] = std::min(low[axis], xyz[axis]);
++                    high[axis] = std::max(high[axis], xyz[axis] + 1);
++                }
++            }
++            std::array<u32, 3> extent{};
++            if (occupied) for (u32 axis = 0; axis < 3; ++axis) extent[axis] = (high[axis] - low[axis]) * 64;
++            // Model bounds include padding and need not fill every root cell.
++            // Accept adjacent footprint sizes, then verify saved SDF samples offline.
++            bool footprint_candidate = occupied;
++            for (u32 axis = 0; axis < 3; ++axis) {
++                footprint_candidate &= extent[axis] <= wanted[axis] + 64 &&
++                                       extent[axis] + 64 >= wanted[axis];
++            }
++            candidate_signature = 14695981039346656037ULL;
++            for (u64 i = 0; i < map_bytes; ++i) {
++                candidate_signature ^= static_cast<u8>(map_data[i]);
++                candidate_signature *= 1099511628211ULL;
++            }
++            for (u32 i = 97; i < 114; ++i) {
++                candidate_signature ^= source_info->flattened_ud_buf[i];
++                candidate_signature *= 1099511628211ULL;
++            }
++            const bool duplicate = std::ranges::find(source_candidate_signatures,
++                candidate_signature) != source_candidate_signatures.end();
++            const bool matches = footprint_candidate && !duplicate;
++            // Keep every probe's metadata; a failed selection must be auditable.
++            std::ofstream history{source_path / "selection-history.tsv", std::ios::app};
++            history << fmt::format("{}\t{}\t{},{},{}\t{},{},{}\t{},{},{}\t{}\t{}\t{:#x}\n",
++                source_probes, source_info->flattened_ud_buf[97],
++                low[0], low[1], low[2], high[0], high[1], high[2],
++                extent[0], extent[1], extent[2], footprint_candidate, duplicate, candidate_signature);
++            WriteDreamsCaptureText(source_path / "selection-progress.tsv",
++                fmt::format("probes\t{}\nbytes\t{}\nextent\t{},{},{}\nmatched\t{}\n",
++                    source_probes, source_probes * map_bytes, extent[0], extent[1], extent[2], matches));
++            if (!matches) return;
++        }
++        const bool collect_candidates = std::filesystem::exists(source_path / "collect-candidates.txt", error);
++        if (!collect_candidates || source_dispatches == 3) {
++            if (!std::filesystem::remove(source_path / "source.request", error)) return;
++        }
++        if (candidate_signature) source_candidate_signatures.push_back(candidate_signature);
++        dreams_frame_capture_root = std::filesystem::path{source_root} /
++            fmt::format("dispatch-{:02}", ++source_dispatches);
++        dreams_frame_capture_event_path = dreams_frame_capture_root / "event-001";
++        std::filesystem::create_directories(dreams_frame_capture_event_path, error);
++        if (error) return;
++        dreams_frame_capture_active = true;
++        dreams_frame_capture_material = true;
++        dreams_frame_capture_truncated = false;
++        dreams_frame_capture_event = 1;
++        dreams_frame_capture_posts = 0;
++        dreams_frame_capture_bytes = 0;
++        dreams_frame_capture_log = "schema\t1\nboundary\tone-source-generation-dispatch\n"
++            "command-replay\tfalse\ncustom-rendering\tfalse\nsource_shader\t0x7ba4de5d\n"
++            "readback_budget_bytes\t268435456\nwhole_volume_downloads\tfalse\n";
++        return;
++    }
+     const char* generation=static_cast<const char*>(nullptr) /* release: DIAGNOSTIC_GENERATION_DIR disabled */;
+     const char* root=generation?generation:static_cast<const char*>(nullptr) /* release: DIAGNOSTIC_FRAME_DIR disabled */;
+     if(!root || Common::ElfInfo::Instance().GameSerial()!="CUSA04301") return;
+@@ -27680,6 +27945,8 @@
+     if(!id) return false;
+     auto& image=texture_cache.GetImage(id);
+     const u64 bytes=u64{image.info.size.width}*image.info.size.height*image.info.size.depth*image.info.num_bits/8;
++    if (DreamsDensitySourceCaptureDirectory() &&
++        (bytes > 1_MB || dreams_frame_capture_bytes + bytes > 256_MB)) return false;
+     if(!bytes || bytes>16_MB || image.info.props.is_block ||
+        image.info.resources.layers!=1 || image.info.resources.levels!=1) return false;
+     if(dreams_frame_capture_bytes+bytes>(static_cast<const char*>(nullptr) /* release: DIAGNOSTIC_GENERATION_DIR disabled */?1024_MB:4096_MB)) {dreams_frame_capture_truncated=true;return false;}
+@@ -27712,6 +27979,9 @@
+ 
+ void Rasterizer::CaptureDreamsFrameResources(const Shader::Info& stage) {
+     if(!dreams_frame_capture_active || dreams_frame_capture_event>512) return;
++    const bool source_capture = DreamsDensitySourceCaptureDirectory() != nullptr;
++    if (source_capture && (stage.l_stage != Shader::LogicalStage::Compute ||
++                           stage.pgm_hash != 0x7ba4de5d)) return;
+     scheduler.EndRendering();
+     const auto prefix=fmt::format("stage-{}",static_cast<u32>(stage.l_stage));
+     u64 hash{};std::string meta=fmt::format("hash\t{:#x}\nstage\t{}\n",stage.pgm_hash,static_cast<u32>(stage.l_stage));
+@@ -27724,6 +27994,11 @@
+         const auto& desc=stage.buffers[index];if(desc.IsSpecial()) continue;
+         const auto sharp=desc.GetSharp(stage);const u64 bytes=sharp.GetSize();
+         meta+=fmt::format("buffer{}\t{:#x}+{}\n",index,sharp.base_address,bytes);
++        if (source_capture && (index < 7 || index > 13 || bytes > 64_MB ||
++            dreams_frame_capture_bytes + bytes > 256_MB)) {
++            meta += fmt::format("buffer{}_skipped\tsource-recorder-scope-or-budget\n", index);
++            continue;
++        }
+         if((dreams_frame_capture_event_path.filename()=="post" && !desc.is_written) || !dreams_frame_capture_material || !bytes || bytes>(static_cast<const char*>(nullptr) /* release: DIAGNOSTIC_GENERATION_DIR disabled */ && stage.pgm_hash==0x7ba4de5d?256_MB:(stage.l_stage==Shader::LogicalStage::Compute?64_MB:4_MB)) || dreams_frame_capture_bytes+bytes>(static_cast<const char*>(nullptr) /* release: DIAGNOSTIC_GENERATION_DIR disabled */?1024_MB:4096_MB) || !memory->IsValidMapping(sharp.base_address,bytes)) continue;
+         const auto [source,offset]=buffer_cache.ObtainBuffer(sharp.base_address,static_cast<u32>(bytes),false);
+         if(!source) continue;

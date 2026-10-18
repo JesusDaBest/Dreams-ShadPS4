@@ -1,0 +1,14 @@
+{
+  "exe_sha256": "966d8fbe75136e0093d49ad43a85f18c766e6be921c47912ef6b3cb8b3c5be4d",
+  "zip_sha256": "2e23416fe6750c27d7d3c134d2ef539b431f157f61401db16e4e28bcc0646a3b",
+  "zip_bytes": 33644787,
+  "source_files_verified": 957,
+  "changed_files": [
+    "src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp",
+    "src/shader_recompiler/dreams_compat.h",
+    "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp",
+    "src/video_core/renderer_vulkan/vk_rasterizer.cpp"
+  ],
+  "packaged_help_passed": true,
+  "zip_verified": true
+}

@@ -1,0 +1,141 @@
+{
+  "exe_sha256": "966d8fbe75136e0093d49ad43a85f18c766e6be921c47912ef6b3cb8b3c5be4d",
+  "gpu": {
+    "utc": "2026-10-17T23:26:54.598261+00:00",
+    "scope": "Six additional opt-in exact DOC kernels; two unsafe-to-replay kernels excluded",
+    "shaders": [
+      "0x252ccde6",
+      "0xfff20d00",
+      "0x6f408bbc",
+      "0xa25580f7",
+      "0xbce8c0fe",
+      "0xcbac06d2"
+    ],
+    "gpu_tests": [
+      {
+        "shader": 623693286,
+        "cases": 18,
+        "nonempty_cases": 1,
+        "words_checked": 4720896,
+        "validation_errors": 0,
+        "passed": true
+      },
+      {
+        "shader": 4294053120,
+        "cases": 18,
+        "nonempty_cases": 15,
+        "words_checked": 3538944,
+        "validation_errors": 0,
+        "passed": true
+      },
+      {
+        "shader": 1866501052,
+        "cases": 18,
+        "nonempty_cases": 18,
+        "words_checked": 3538944,
+        "validation_errors": 0,
+        "passed": true
+      },
+      {
+        "shader": 2723512567,
+        "cases": 18,
+        "nonempty_cases": 18,
+        "words_checked": 2359296,
+        "validation_errors": 0,
+        "passed": true
+      },
+      {
+        "shader": 3169370366,
+        "cases": 18,
+        "nonempty_cases": 12,
+        "words_checked": 2361600,
+        "validation_errors": 0,
+        "passed": true
+      },
+      {
+        "shader": 3417048786,
+        "cases": 18,
+        "nonempty_cases": 9,
+        "words_checked": 2361600,
+        "validation_errors": 0,
+        "passed": true
+      }
+    ],
+    "total_cases": 108,
+    "total_words_compared": 18881280,
+    "reference": "Same production-translated shader in native phase; one logical wave per vkCmdDispatchBase, ordered by compute memory barriers; compare against collect/production-prefix/replay",
+    "checks": [
+      "Collection leaves guest buffers and guest GDS unchanged",
+      "GPU replay guest buffers and GDS match ordered reference",
+      "All six shaders have a nonempty multi-workgroup fixture",
+      "No Vulkan validation errors",
+      "39 existing CPU semantic tests passed; one skipped"
+    ],
+    "limits": [
+      "Fixtures are synthetic, not complete scene captures",
+      "252ccde6 has only one nonempty fixture, with 33 groups",
+      "No measured game visual improvement or performance result for these six paths yet",
+      "4bc902cf needs shared-input checkpoint audit; d4532ff4 needs pre-DOC header handling",
+      "No complete general-purpose DS_ORDERED_COUNT implementation claimed"
+    ],
+    "normal_launcher_changed": false
+  },
+  "game": {
+    "exe_sha256": "966d8fbe75136e0093d49ad43a85f18c766e6be921c47912ef6b3cb8b3c5be4d",
+    "user_observation": "Thinks performance increased by 8 FPS; confirms improved visuals retained",
+    "additional_activation": [
+      {
+        "shader": "0xcbac06d2",
+        "groups": 24,
+        "streams": 2,
+        "pass_index": 0
+      }
+    ],
+    "unobserved_additional_paths": [
+      "0x252ccde6",
+      "0xfff20d00",
+      "0x6f408bbc",
+      "0xa25580f7",
+      "0xbce8c0fe"
+    ],
+    "performance_limit": "Different camera views across launches; not a controlled A/B and cannot confirm an exact 8 FPS increase. Initial 16.71 FPS sample overlapped capture and is excluded from primary comparison.",
+    "pending": [
+      "Five added kernels have synthetic GPU validation but no activation evidence in this run",
+      "4bc902cf and d4532ff4 remain unchanged pending safe state-preservation handling",
+      "No zero-overhead or complete DS_ORDERED_COUNT support claim"
+    ],
+    "frame_sample": {
+      "fps": 14.780304160812232,
+      "seconds": 15.01998860000458,
+      "frames": 222,
+      "limitation": "Guest frame delivery only; not simulation rate; no same-view baseline timing available for this scene."
+    }
+  },
+  "checks": [
+    "Collection leaves guest buffers and guest GDS unchanged",
+    "GPU replay guest buffers and GDS match ordered reference",
+    "All six shaders have a nonempty multi-workgroup fixture",
+    "No Vulkan validation errors",
+    "39 existing CPU semantic tests passed; one skipped",
+    "Release build/link passed",
+    "Packaged --help passed",
+    "cbac06d2 exact path activated with 24 workgroups",
+    "User confirms improved visuals retained",
+    "Captured kitchen floor remains below checkerboard with validated camera/model fit"
+  ],
+  "limitations": [
+    "Fixtures are synthetic, not complete scene captures",
+    "252ccde6 has only one nonempty fixture, with 33 groups",
+    "No measured game visual improvement or performance result for these six paths yet",
+    "4bc902cf needs shared-input checkpoint audit; d4532ff4 needs pre-DOC header handling",
+    "No complete general-purpose DS_ORDERED_COUNT implementation claimed"
+  ],
+  "changed_files": [
+    "src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp",
+    "src/shader_recompiler/dreams_compat.h",
+    "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp",
+    "src/video_core/renderer_vulkan/vk_rasterizer.cpp"
+  ],
+  "source_files_verified": 957,
+  "fresh_full_build": false
+}

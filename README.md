@@ -1,6 +1,6 @@
 # Dreams on shadPS4
 
-Updated **October 16, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
+Updated **October 17, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
 
 ![Dreams on shadPS4 showing sculpt shapes and paint, October 15, 2026](builds/cusa04301-shape-density-fix-20261015/dreams-shapes-20261015.png)
 
@@ -8,9 +8,17 @@ October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
 ## Latest tested build
 
+**[Download the October 17 ordered-count update (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-ordered-count-20261017/Dreams-ordered-count-20261017.zip)**
+
+This is the exact executable currently played by the owner (`966d8fbe`). Extract and double-click **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. The required settings are enabled automatically. It retains this branch's preceding shape, performance and occlusion fixes.
+
+Adds ordered-count handling for six additional Dreams shaders alongside scene-compaction and selection-list handling. Saved synthetic GPU validation passed 108 cases with no Vulkan validation errors; the owner confirmed improved visuals were retained. Performance observations are not a controlled benchmark. [Changes, matching source, tests and limitations](ORDERED_COUNT_BUILD_20261017.md).
+
+Previous October 16 occlusion checkpoint:
+
 **[Download the current occlusion rendering fix (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-occlusion-fix-20261016/Dreams-occlusion-fix-20261016.zip)**
 
-This is the exact build currently played by the owner. Extract and run **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. It retains the preceding October 16 performance/shape fixes and launch profile. No extra activation switch is needed for this correction.
+This is the preceding occlusion checkpoint. Extract and run **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. It retains the preceding October 16 performance/shape fixes and launch profile. No extra activation switch is needed for this correction.
 
 The owner confirmed the tested scene's corner corruption was gone. The fix preserves the requested mip when Dreams samples a plain 2D occlusion map with array-style coordinates. Other scenes and performance impact remain unmeasured; a bound-view mip-limit uncertainty remains documented. [Fix, findings, tests and matching source](OCCLUSION_FIX_20261016.md).
 
