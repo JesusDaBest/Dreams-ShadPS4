@@ -1,6 +1,6 @@
 # Dreams on shadPS4
 
-Updated **October 17, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
+Updated **October 19, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
 
 ![Dreams on shadPS4 showing sculpt shapes and paint, October 15, 2026](builds/cusa04301-shape-density-fix-20261015/dreams-shapes-20261015.png)
 
@@ -8,9 +8,17 @@ October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
 ## Latest tested build
 
+**[Download the October 19 shader-instruction update (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-shader-instructions-20261019/Dreams-shader-instructions-20261019.zip)**
+
+This is the exact executable currently played by the owner (`640a3ba8`). Extract and double-click **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. The tested settings are applied automatically.
+
+Corrects shader bit-field extraction, carry/borrow/overflow and floating-point class handling. Includes retained branch updates and the cumulative source patch. Saved instruction tests passed; cube and kitchen live checks are recorded. Performance gains and every scene remain unverified. [Changes, source, tests and limitations](SHADER_INSTRUCTIONS_BUILD_20261019.md).
+
+Previous October 17 checkpoint:
+
 **[Download the October 17 ordered-count update (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-ordered-count-20261017/Dreams-ordered-count-20261017.zip)**
 
-This is the exact executable currently played by the owner (`966d8fbe`). Extract and double-click **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. The required settings are enabled automatically. It retains this branch's preceding shape, performance and occlusion fixes.
+This is the preceding October 17 executable (`966d8fbe`). Extract and double-click **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. The required settings are enabled automatically. It retains this branch's preceding shape, performance and occlusion fixes.
 
 Adds ordered-count handling for six additional Dreams shaders alongside scene-compaction and selection-list handling. Saved synthetic GPU validation passed 108 cases with no Vulkan validation errors; the owner confirmed improved visuals were retained. Performance observations are not a controlled benchmark. [Changes, matching source, tests and limitations](ORDERED_COUNT_BUILD_20261017.md).
 
