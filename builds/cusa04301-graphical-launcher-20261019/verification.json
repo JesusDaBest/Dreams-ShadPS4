@@ -1,0 +1,21 @@
+{
+  "passed": true,
+  "core_sha256": "640a3ba83eba972702d25cbf9a7404134c09075f4ece098881b590dd1714f2ff",
+  "normal_qt_default_selection_verified": true,
+  "relocation_with_spaces_verified": true,
+  "automatic_settings_and_backup_verified_with_harmless_child": true,
+  "environment_and_no_capture_verified": true,
+  "gui_pe_subsystems_verified": true,
+  "game_started": false,
+  "gui_window_observed": true,
+  "gui_selected_core_label": "Dreams patched build (October 19)",
+  "zip_sha256": "c35bc3eefa2aa31ad8a3c74ed842a340ca297ca7a14b475682574c2d55a7a9c1",
+  "zip_bytes": 60891457,
+  "zip_files": 41,
+  "no_command_scripts": true,
+  "qt_launcher_source_commit": "99e9829e3787031e7eee61935ffd09e8ad8678d1",
+  "qt_launcher_source_archive_sha256": "8266516fb5b503bbf3266d0d3a8664f4899f26037eaa186ca6ddf04de1f4debe",
+  "normal_launcher_direct_entry": true,
+  "separate_dreams_entry_executable": false,
+  "portable_relative_core_selection": true
+}

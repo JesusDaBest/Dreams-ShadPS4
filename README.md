@@ -8,11 +8,11 @@ October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
 ## Latest tested build
 
-**[Download the October 19 shader-instruction update (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-shader-instructions-20261019/Dreams-shader-instructions-20261019.zip)**
+**[Download Dreams with the normal graphical launcher (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-graphical-launcher-20261019/Dreams-graphical-launcher-20261019.zip)**
 
-This is the exact executable currently played by the owner (`640a3ba8`). Extract and double-click **Launch-Dreams.cmd**, then enter your Dreams eboot.bin path. The tested settings are applied automatically.
+Extract the entire ZIP and double-click **shadPS4QtLauncher.exe**. The normal shadPS4 launcher opens with **Dreams patched build (October 19)** selected. Add your own Dreams game folder through the launcher, select Dreams and click **Play**. The included fixes and tested settings are applied automatically. No command prompt, command entry, CMD file or PowerShell script is needed.
 
-Corrects shader bit-field extraction, carry/borrow/overflow and floating-point class handling. Includes retained branch updates and the cumulative source patch. Saved instruction tests passed; cube and kitchen live checks are recorded. Performance gains and every scene remain unverified. [Changes, source, tests and limitations](SHADER_INSTRUCTIONS_BUILD_20261019.md).
+This package contains the unchanged October 19 tested core (`640a3ba8`), the Qt launcher and its runtime libraries. Keep the extracted package together. Your own game/system setup is required; existing saves stay in the normal shadPS4 profile. The tested profile covers CUSA04301. [Package checks and instructions](GRAPHICAL_LAUNCHER_20261019.md). [Emulator changes, source, tests and limitations](SHADER_INSTRUCTIONS_BUILD_20261019.md).
 
 Previous October 17 checkpoint:
 

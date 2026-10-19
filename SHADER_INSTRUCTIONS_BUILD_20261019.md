@@ -2,7 +2,7 @@
 
 Exact owner-played executable: `640a3ba83eba972702d25cbf9a7404134c09075f4ece098881b590dd1714f2ff`.
 
-Extract **Dreams-shader-instructions-20261019.zip**, double-click **Launch-Dreams.cmd**, and enter your own Dreams eboot.bin path. The launcher applies the tested configuration and environment automatically, backing up the existing per-game configuration. No manual activation commands are needed.
+Use the [normal graphical launcher package](GRAPHICAL_LAUNCHER_20261019.md): extract the complete ZIP and double-click **shadPS4QtLauncher.exe**, then select Dreams and click Play. It includes this exact core and applies the tested settings automatically.
 
 ## Changes
 
