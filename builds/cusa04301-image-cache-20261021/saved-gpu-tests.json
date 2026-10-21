@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "complete": true,
+  "returncode": 0,
+  "stdout": "GPU\tAMD Radeon(TM) 8060S Graphics\nparent changed-layer upload bytes=88080384\ncandidate changed-layer upload bytes=11022336\nPASS 156 content, dirty-range, lifetime and admission checks; validation_errors=0\n",
+  "limits": [
+    "Extracted production upload methods, unchanged real MemoryTracker/RegionManager headers, real Vulkan transfers and synchronization validation.",
+    "Production overlap resolution, buffer creation, joining, copying and deferred deletion are exercised; slot storage and registration/page-table notifications are fixtures.",
+    "PageManager notifications, guest backing and device budget are fixtures; OS page faults, BDA table writes and LRU bookkeeping are not modeled.",
+    "The GPU-owned CPU-write fallback verifies routing only. Runtime performance remains unmeasured."
+  ],
+  "source_hashes": {
+    "tren-image-cache-admission/sources/src/video_core/buffer_cache/buffer_cache.cpp": "24d9a564475a1c6fb92b2132f73432cc6b93a08fb23eca2ad21282dfa260c72e",
+    "tren-readback-staging-reuse/sources/src/video_core/buffer_cache/buffer_cache.cpp": "bb693c413ff96a5cb68ebcbbaa7c42a8cf48b3230908a5dddcc4392bec7e26af",
+    "menu-lag-investigation/cached-image-uploads/sources/src/video_core/buffer_cache/buffer_cache.cpp": "c71b9a057cbf15e46ef7d1d0e14343eec964fc11c5ced9aa53798e8c017c1947",
+    "tren-image-cache-admission/sources/src/video_core/buffer_cache/buffer_cache.h": "8d7e214c434d7b631a2a5fb58234b57c03e5f4eb6bbb4c1377ac0050b74f6697",
+    "60fps-fleck-density/remaining-mask-audit/sources/src/video_core/buffer_cache/buffer_cache.cpp": "16222ebb4cac217b69c5266c22497933b390716acf8b056dc8a39eaf5634de1f",
+    "tren-image-cache-admission/test_gpu.cpp.in": "82929495216c1580fc7b751d4778a4a7a9c857320b8a87b39a4d252c0e6c62e2",
+    "tren-image-cache-admission/test_gpu.py": "4c2cc891917102461f963b5dd9260a98e02dd898691bf1dc49d2e70a3a442af4",
+    "native-emulator/source/src/video_core/buffer_cache/memory_tracker.h": "50409f7f21fd4393a5914634d88cc9314292a2ab9a687270b9bb7bc091bb3875",
+    "native-emulator/source/src/video_core/buffer_cache/region_manager.h": "9777573babb084d8266ec1bf92e269007cf15685f690dc8218da650bad7c0f5d",
+    "native-emulator/source/src/video_core/buffer_cache/region_definitions.h": "bc53be50a3b5aafea25d193303128436483f3df00e36887e80d6a5e6c99d6f54",
+    "native-emulator/source/src/video_core/buffer_cache/buffer.h": "b0f1100045ecd253cd20614cb5c3c855d9550e40d3dafbaf632f8b3c83a5ed78"
+  },
+  "publication_reran_gpu_test": false
+}
