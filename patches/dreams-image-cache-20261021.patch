@@ -1,0 +1,982 @@
+--- a/src/input/controller.cpp
++++ b/src/input/controller.cpp
+@@ -16,6 +16,7 @@
+ #include "core/libraries/system/userservice.h"
+ #include "core/user_settings.h"
+ #include "input/controller.h"
++#include "input/dreams_background_control.h"
+ 
+ namespace Input {
+ 
+@@ -58,11 +59,11 @@
+ 
+ } // namespace
+ 
+-GameController::GameController() : m_states_queue(64) {}
++GameController::GameController() : m_states_queue(64) { DreamsBackground::Register(this); }
+ 
+ State GameController::ReadState() {
+     std::lock_guard lock{m_state_mutex};
+-    return m_state;
++    return DreamsBackground::Apply(this, m_state);
+ }
+ 
+ int GameController::ReadStates(State* states, int states_num) {
+@@ -72,14 +73,14 @@
+     }
+ 
+     if (!m_state.connected) {
+-        states[0] = m_state;
++        states[0] = DreamsBackground::Apply(this, m_state);
+         return 1;
+     }
+ 
+     if (states_num == 1) {
+         // Retained history can make a later multi-sample read return up to 64 stale reports, so
+         // mixed single- and multi-sample reads require dedicated tests.
+-        states[0] = m_state;
++        states[0] = DreamsBackground::Apply(this, m_state);
+         return 1;
+     }
+ 
+@@ -209,7 +210,7 @@
+     m_state.time = timestamp;
+     m_state.touch_time_since_held_down =
+         m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;
+-    m_states_queue.Push(m_state);
++    m_states_queue.Push(DreamsBackground::Apply(this, m_state));
+ }
+ 
+ void GameController::SetLightBarRGB(u8 const r, u8 const g, u8 const b) {
+--- /dev/null
++++ b/src/input/dreams_background_control.h
+@@ -0,0 +1,234 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++
++// Optional, process-local debug input endpoint. No Windows input injection.
++#ifdef _WIN32
++#include <windows.h>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include "input/controller.h"
++#include "video_core/renderdoc.h"
++
++namespace Input::DreamsBackground {
++
++constexpr uint32_t Magic = 0x44425031;
++constexpr uint32_t Version = 2;
++constexpr uint32_t Buttons = 0x0010fffe;
++constexpr uint32_t Motion = 1;
++constexpr uint32_t Touch = 2;
++constexpr uint32_t Screenshot = 4;
++constexpr uint64_t MaxLease = 2000;
++
++struct Command {
++    uint64_t issued_ms{};
++    uint64_t expires_ms{};
++    uint32_t enabled{};
++    uint32_t buttons{};
++    uint32_t axes[6]{128, 128, 128, 128, 0, 0};
++    uint32_t flags{};
++    uint32_t touch_down{};
++    float touch_x{}, touch_y{};
++    float gyro[3]{};
++    float orientation[4]{0, 0, 0, 1};
++};
++static_assert(sizeof(Command) == 96);
++
++struct Status {
++    uint64_t sampled_ms{};
++    uint64_t guest_timestamp{};
++    uint32_t accepted_sequence{};
++    uint32_t error{};
++    uint32_t active{};
++    uint32_t connected{};
++    uint32_t buttons{};
++    uint32_t axes[6]{};
++    uint32_t touch_down{};
++    float orientation[4]{};
++};
++static_assert(sizeof(Status) == 80);
++
++struct Shared {
++    uint32_t magic{}, version{}, bytes{}, pid{};
++    uint64_t process_birth{};
++    volatile LONG command_sequence{};
++    uint32_t reserved{};
++    Command command{};
++    volatile LONG status_sequence{};
++    uint32_t reserved2{};
++    Status status{};
++};
++static_assert(offsetof(Shared, command) == 32);
++static_assert(offsetof(Shared, status_sequence) == 128);
++static_assert(offsetof(Shared, status) == 136);
++static_assert(sizeof(Shared) == 216);
++
++inline bool Valid(const Command& c, uint64_t now) {
++    if (c.enabled > 1 || (c.buttons & ~Buttons) ||
++        (c.flags & ~(Motion | Touch | Screenshot)) ||
++        ((c.flags & Screenshot) && (c.enabled || c.flags != Screenshot)) ||
++        c.touch_down > 1 || c.issued_ms > now || c.expires_ms < c.issued_ms ||
++        c.expires_ms - c.issued_ms > MaxLease) {
++        return false;
++    }
++    for (auto a : c.axes) if (a > 255) return false;
++    if (!std::isfinite(c.touch_x) || !std::isfinite(c.touch_y) ||
++        c.touch_x < 0 || c.touch_x > 1 || c.touch_y < 0 || c.touch_y > 1) return false;
++    for (auto g : c.gyro) if (!std::isfinite(g) || std::abs(g) > 20) return false;
++    float norm = 0;
++    for (auto q : c.orientation) {
++        if (!std::isfinite(q)) return false;
++        norm += q * q;
++    }
++    return norm >= 0.99f && norm <= 1.01f;
++}
++
++// Pure overlay: the user's physical state and smoothing history are never changed.
++inline State Overlay(const State& physical, const Command& c, uint64_t now,
++                     uint64_t touch_started, uint8_t touch_id) {
++    State result = physical;
++    if (!physical.connected || !c.enabled || now >= c.expires_ms || !Valid(c, now))
++        return result;
++    result.buttonsState = static_cast<Libraries::Pad::OrbisPadButtonDataOffset>(c.buttons);
++    for (size_t i = 0; i < 6; ++i) result.axes[i] = static_cast<int>(c.axes[i]);
++    if (c.axes[4]) result.buttonsState |= Libraries::Pad::OrbisPadButtonDataOffset::L2;
++    if (c.axes[5]) result.buttonsState |= Libraries::Pad::OrbisPadButtonDataOffset::R2;
++    if (c.flags & Touch) {
++        result.touchpad[0] = {touch_id, c.touch_down != 0,
++                             static_cast<uint16_t>(c.touch_x * 1920),
++                             static_cast<uint16_t>(c.touch_y * 941)};
++        result.touchpad[1] = {};
++        result.touch_time_since_held_down = c.touch_down ? (now - touch_started) * 1000 : 0;
++    }
++    if (c.flags & Motion) {
++        result.angularVelocity = {c.gyro[0], c.gyro[1], c.gyro[2]};
++        result.orientation = {c.orientation[0], c.orientation[1],
++                              c.orientation[2], c.orientation[3]};
++    }
++    return result;
++}
++
++class Server {
++    std::mutex mutex;
++    HANDLE mapping{};
++    Shared* shared{};
++    const GameController* target{};
++    Command current{};
++    uint32_t sequence{};
++    uint32_t error{};
++    uint64_t touch_started{};
++    uint8_t touch_id{};
++    bool touch_was_down{};
++
++public:
++    Server() {
++        const char* enabled = std::getenv("SHADPS4_DREAMS_BACKGROUND_CONTROL");
++        if (!enabled || std::strcmp(enabled, "1") != 0) return;
++        const std::wstring name = L"Local\\shadPS4.DreamsControl." +
++                                  std::to_wstring(GetCurrentProcessId());
++        mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
++                                     sizeof(Shared), name.c_str());
++        if (!mapping) return;
++        // Do not trust an endpoint another process created first.
++        if (GetLastError() == ERROR_ALREADY_EXISTS) {
++            CloseHandle(mapping); mapping = nullptr; return;
++        }
++        shared = static_cast<Shared*>(
++            MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
++        if (!shared) { CloseHandle(mapping); mapping = nullptr; return; }
++        std::memset(shared, 0, sizeof(*shared));
++        FILETIME birth{}, exit{}, kernel{}, user{};
++        if (!GetProcessTimes(GetCurrentProcess(), &birth, &exit, &kernel, &user)) {
++            UnmapViewOfFile(shared); CloseHandle(mapping); shared = nullptr; mapping = nullptr;
++            return;
++        }
++        shared->version = Version;
++        shared->bytes = sizeof(Shared);
++        shared->pid = GetCurrentProcessId();
++        shared->process_birth = (uint64_t(birth.dwHighDateTime) << 32) | birth.dwLowDateTime;
++        MemoryBarrier();
++        InterlockedExchange(reinterpret_cast<volatile LONG*>(&shared->magic), Magic);
++    }
++    ~Server() {
++        if (shared) UnmapViewOfFile(shared);
++        if (mapping) CloseHandle(mapping);
++    }
++    void Register(const GameController* controller) {
++        if (!shared) return;
++        std::lock_guard lock(mutex);
++        if (!target) target = controller; // First controller is player one.
++    }
++    State Apply(const GameController* controller, const State& physical) {
++        if (!shared || controller != target) return physical;
++        std::lock_guard lock(mutex);
++        const uint64_t now = GetTickCount64();
++        const LONG first = InterlockedCompareExchange(&shared->command_sequence, 0, 0);
++        if (first != 0 && !(first & 1) && uint32_t(first) != sequence) {
++            Command incoming;
++            MemoryBarrier();
++            std::memcpy(&incoming, &shared->command, sizeof(incoming));
++            MemoryBarrier();
++            const LONG last = InterlockedCompareExchange(&shared->command_sequence, 0, 0);
++            if (first == last) {
++                sequence = uint32_t(first);
++                if (Valid(incoming, now)) {
++                    current = incoming;
++                    error = 0;
++                    if (incoming.flags & Screenshot) {
++                        if (now < incoming.expires_ms) {
++                            // Reuse the existing renderer's atomic screenshot queue.
++                            // This executes once per coherent command, never per sample.
++                            VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);
++                        } else {
++                            error = 2;
++                        }
++                    }
++                } else {
++                    current = {};
++                    error = 1;
++                }
++            }
++        }
++        const bool active = current.enabled && now < current.expires_ms &&
++                            physical.connected && Valid(current, now);
++        const bool down = active && (current.flags & Touch) && current.touch_down;
++        if (down && !touch_was_down) {
++            touch_started = now;
++            touch_id = touch_id >= 127 ? 1 : touch_id + 1;
++        }
++        touch_was_down = down;
++        const State result = Overlay(physical, current, now, touch_started, touch_id);
++        Status status{};
++        status.sampled_ms = now;
++        status.guest_timestamp = physical.time;
++        status.accepted_sequence = sequence;
++        status.error = error;
++        status.active = active;
++        status.connected = result.connected;
++        status.buttons = std::to_underlying(result.buttonsState);
++        for (size_t i = 0; i < 6; ++i) status.axes[i] = result.axes[i];
++        status.touch_down = result.touchpad[0].state;
++        status.orientation[0] = result.orientation.x;
++        status.orientation[1] = result.orientation.y;
++        status.orientation[2] = result.orientation.z;
++        status.orientation[3] = result.orientation.w;
++        InterlockedIncrement(&shared->status_sequence);
++        std::memcpy(&shared->status, &status, sizeof(status));
++        InterlockedIncrement(&shared->status_sequence);
++        return result;
++    }
++};
++
++inline Server& Instance() { static Server server; return server; }
++inline void Register(const GameController* c) { Instance().Register(c); }
++inline State Apply(const GameController* c, const State& s) { return Instance().Apply(c, s); }
++
++} // namespace Input::DreamsBackground
++#else
++namespace Input::DreamsBackground {
++inline void Register(const GameController*) {}
++inline State Apply(const GameController*, const State& s) { return s; }
++}
++#endif
+--- a/src/shader_recompiler/frontend/translate/scalar_alu.cpp
++++ b/src/shader_recompiler/frontend/translate/scalar_alu.cpp
+@@ -405,6 +405,19 @@
+ }
+ 
+ void Translator::S_OR_B64(NegateMode negate, bool is_xor, const GcnInst& inst) {
++    // 44c189d5:0x718 unions two saved ballots while only the metadata writer
++    // is active. Preserve all 64 bits instead of re-balloting that one lane.
++    if (info.l_stage == LogicalStage::Compute && info.pgm_hash == 0x44c189d5 &&
++        negate == NegateMode::None && !is_xor &&
++        inst.dst[0].field == OperandField::VccLo &&
++        inst.src[0].field == OperandField::ScalarGPR && inst.src[0].code == 14 &&
++        inst.src[1].field == OperandField::ScalarGPR && inst.src[1].code == 16) {
++        const IR::U64 result{ir.BitwiseOr(GetSrc64<IR::U64>(inst.src[0]),
++                                        GetSrc64<IR::U64>(inst.src[1]))};
++        ir.SetScc(ir.INotEqual(result, ir.Imm64(u64(0))));
++        SetDst64(inst.dst[0], result);
++        return;
++    }
+     const IR::U1 src0{GetSrc1(inst.src[0])};
+     IR::U1 src1{GetSrc1(inst.src[1])};
+     if (negate == NegateMode::Src1) {
+--- a/src/shader_recompiler/frontend/translate/vector_alu.cpp
++++ b/src/shader_recompiler/frontend/translate/vector_alu.cpp
+@@ -1423,14 +1423,15 @@
+     const bool is_neg_one = inst.src[1].field == OperandField::SignedConstIntNeg;
+     const bool is_mask_src = inst.src[0].field == OperandField::ScalarGPR ||
+                              inst.src[0].field == OperandField::VccLo;
+-    // GatherVoxels (0x3a4c) and the source-region classifier (0x648) compare a
+-    // saved surface ballot after restricting EXEC to the metadata writer. A
+-    // subgroup vote there sees only the writer's bit, not the saved 64-bit mask.
+-    // Read the scalar pair; preserve destination/EXEC masking below.
++    // These kernels test saved wave masks after narrowing EXEC to one writer.
++    // Read the saved dwords; voting over the remaining lane loses other bits.
++    // 44c189d5 also combines saved SGPR masks into VCC before its comparison.
+     const bool needs_full_mask = info.l_stage == LogicalStage::Compute &&
+-                                 (info.pgm_hash == DreamsCompat::GatherVoxelsShader ||
+-                                  info.pgm_hash == 0x5650b8f7) &&
+-                                 inst.src[0].field == OperandField::ScalarGPR;
++        ((inst.src[0].field == OperandField::ScalarGPR &&
++          (info.pgm_hash == DreamsCompat::GatherVoxelsShader ||
++           info.pgm_hash == 0x5650b8f7 || info.pgm_hash == 0x29569533 ||
++           info.pgm_hash == 0x44c189d5 || info.pgm_hash == 0x61b54af5)) ||
++         (inst.src[0].field == OperandField::VccLo && info.pgm_hash == 0x44c189d5));
+     const bool use_mask_fast_path =
+         !needs_full_mask && is_mask_src && (is_zero || is_neg_one) &&
+         (op == ConditionOp::EQ || op == ConditionOp::LG ||
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -1040,6 +1040,11 @@
+                         FIBER_EXIT;
+                         co_await CompletionAwaiter{*this, *rasterizer, dma_data->NumBytes()};
+                         FIBER_ENTER(dcb_task_name);
++                    } else {
++                        // The ordinary export also produces CPU-read results. Prepare learned
++                        // windows at this copy's tick before later graphics can delay their read.
++                        // The cache retains its feature gate, invalidation and GPU-completion wait.
++                        rasterizer->PrefetchCpuReadbacks();
+                     }
+                 } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                             dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+@@ -1553,9 +1558,11 @@
+                         rasterizer->Finish();
+                     }
+                 });
+-            if (rasterizer && queue.pipe_id == 3) {
+-                // Include any GDS export recorded by SignalFence. The opt-in cache submits
+-                // learned CPU-read windows here, before later graphics can delay their copy.
++            if (rasterizer) {
++                // Include any GDS export recorded by SignalFence. CPU-read results can come
++                // from any compute pipe, including Dreams' model-building queue on pipe 0.
++                // The opt-in cache submits eligible learned windows before later work can
++                // delay their copy; its ownership, invalidation and completion checks apply.
+                 rasterizer->PrefetchCpuReadbacks();
+             }
+             break;
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdlib>
+ #include <limits>
+ #include <string_view>
+@@ -236,17 +237,31 @@
+     }
+ }
+ 
++// Prefetch eligibility follows elapsed time, not the number of unrelated reads.
++// Tren can revisit a result within 40 ms after more than 100 other requests.
++// A quarter-second idle limit still stops speculative copies of abandoned windows.
++static constexpr u64 DreamsCpuReadbackMaxAgeNs = 250'000'000;
++
++static u64 DreamsCpuReadbackTimeNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
+ void BufferCache::RememberCpuReadback(VAddr address, u64 size) {
+     // Match the normal window. The optional larger cache retains at most 32 one-MiB
+     // snapshots, so a recurring working set does not continually evict its own windows.
+     if (!size || size > 512_KB || address % 4096 || size % 4096) {
+         return;
+     }
+-    const u64 sequence = ++cpu_readback_sequence;
++    ++cpu_readback_sequence;
++    // last_read is a monotonic timestamp for both LRU selection and idle expiry.
++    // Keep the request counter separate for the existing activation check/statistics.
++    const u64 last_read = DreamsCpuReadbackTimeNs();
+     const auto active_slots = std::span{cpu_readbacks}.first(DreamsCpuReadbackSlotCount());
+     for (auto& slot : active_slots) {
+         if (slot.address == address && slot.size == size) {
+-            slot.last_read = sequence;
++            slot.last_read = last_read;
+             return;
+         }
+     }
+@@ -262,7 +277,7 @@
+     if (oldest) {
+         oldest->address = address;
+         oldest->size = size;
+-        oldest->last_read = sequence;
++        oldest->last_read = last_read;
+         oldest->valid = false;
+         oldest->copies.clear();
+     }
+@@ -285,7 +300,13 @@
+         if (!slot.valid || slot.address != address || slot.size != size) {
+             continue;
+         }
+-        if (IsRegionCpuModified(address, size) || texture_cache.HasImageInRange(address, size)) {
++        // Only copied bytes can conflict with an image. A larger readback window can
++        // include an adjacent texture without any copied result overlapping it.
++        if (IsRegionCpuModified(address, size) ||
++            (texture_cache.HasImageInRange(address, size) &&
++             std::ranges::any_of(slot.copies, [&](const auto& copy) {
++                 return texture_cache.HasImageInRange(address + copy.srcOffset, copy.size);
++             }))) {
+             slot.valid = false;
+             return false;
+         }
+@@ -312,13 +333,13 @@
+     if (!DreamsCpuReadbackPrefetchEnabled()) {
+         return;
+     }
++    const u64 now = DreamsCpuReadbackTimeNs();
+     bool recorded = false;
+     for (auto& slot : std::span{cpu_readbacks}.first(DreamsCpuReadbackSlotCount())) {
+-        if (!slot.size || slot.valid || cpu_readback_sequence - slot.last_read > 64 ||
++        if (!slot.size || slot.valid ||
++            (now > slot.last_read && now - slot.last_read > DreamsCpuReadbackMaxAgeNs) ||
+             !IsRegionGpuModifiedExact(slot.address, slot.size) ||
+-            IsRegionCpuModified(slot.address, slot.size) ||
+-            texture_cache.HasImageInRange(slot.address, slot.size) ||
+-            (slot.tick && !scheduler.IsFree(slot.tick))) {
++            IsRegionCpuModified(slot.address, slot.size)) {
+             continue;
+         }
+         const BufferId id = page_table[slot.address >> CACHING_PAGEBITS].buffer_id;
+@@ -345,7 +366,20 @@
+         if (!slot.bytes || slot.bytes > 1_MB) {
+             continue;
+         }
++        // Retain the fast whole-window query for the common non-aliased case,
++        // then reject every actual image/copy overlap before recording GPU work.
++        if (texture_cache.HasImageInRange(slot.address, slot.size) &&
++            std::ranges::any_of(slot.copies, [&](const auto& copy) {
++                return texture_cache.HasImageInRange(slot.address + copy.srcOffset, copy.size);
++            })) {
++            continue;
++        }
++        const bool staging_busy = slot.tick && !scheduler.IsFree(slot.tick);
+         if (!slot.staging || slot.staging->SizeBytes() < slot.bytes) {
++            // Resizing would destroy storage still referenced by an earlier copy.
++            if (staging_busy) {
++                continue;
++            }
+             slot.staging = std::make_unique<Buffer>(
+                 instance, scheduler, MemoryUsage::Download, 0,
+                 vk::BufferUsageFlagBits::eTransferDst, Common::AlignUp(slot.bytes, u64{64_KB}));
+@@ -359,7 +393,14 @@
+             barriers[count++] = *barrier;
+         }
+         if (auto barrier = slot.staging->GetBarrier(vk::AccessFlagBits2::eTransferWrite,
+-                                                    vk::PipelineStageFlagBits2::eTransfer)) {
++                                                    vk::PipelineStageFlagBits2::eTransfer,
++                                                    0, staging_busy)) {
++            if (staging_busy) {
++                // The invalid snapshot has no consumer. Queue its replacement in the
++                // same allocation after the prior GPU copy; do not wait or free it.
++                barrier->srcStageMask |= vk::PipelineStageFlagBits2::eTransfer;
++                barrier->srcAccessMask |= vk::AccessFlagBits2::eTransferWrite;
++            }
+             barriers[count++] = *barrier;
+         }
+         if (count) {
+@@ -749,6 +790,15 @@
+     if (IsRegionGpuModified(gpu_addr, size)) {
+         return ObtainBuffer(gpu_addr, size, false, false);
+     }
++    // Keep large CPU-backed images in the existing dirty-page upload path.
++    // Resolve shared boundary pages through the normal buffer-merging code;
++    // the optional admission budget is checked against its complete result.
++    if (size >= 64_MB && size <= 128_MB && instance.CanReportMemoryUsage()) {
++        const BufferId image_buffer_id = CreateBuffer(gpu_addr, size, true);
++        if (image_buffer_id) {
++            return ObtainBuffer(gpu_addr, size, false, false, image_buffer_id);
++        }
++    }
+     // In all other cases, just do a CPU copy to the staging buffer.
+     const auto [data, offset] = staging_buffer.Map(size, 16);
+     memory->CopySparseMemory(gpu_addr, data, size);
+@@ -916,11 +966,33 @@
+     DeleteBuffer(overlap_id);
+ }
+ 
+-BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
++BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool image_admission) {
+     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
+     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+     wanted_size = static_cast<u32>(device_addr_end - device_addr);
+     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
++    if (image_admission) {
++        // Count the replacement once, including neighbors and stream growth.
++        // Existing overlap contents remain protected by JoinOverlap below.
++        const u64 allocation_size = overlap.end - overlap.begin;
++        u64 retained_size = allocation_size;
++        for (const Buffer& buffer : slot_buffers) {
++            if (!buffer.is_picked && buffer.SizeBytes() >= 32_MB &&
++                !IsRegionGpuModified(buffer.CpuAddr(), buffer.SizeBytes())) {
++                retained_size += buffer.SizeBytes();
++            }
++        }
++        // Device usage still includes the old buffers: allow for the complete
++        // new allocation while those buffers await their normal deferred release.
++        const u64 memory_used = instance.GetDeviceMemoryUsage();
++        if (retained_size > 256_MB || memory_used >= trigger_gc_memory ||
++            allocation_size > trigger_gc_memory - memory_used) {
++            for (const BufferId overlap_id : overlap.ids) {
++                slot_buffers[overlap_id].is_picked = false;
++            }
++            return {};
++        }
++    }
+     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+     const BufferId new_buffer_id =
+         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -216,7 +216,7 @@
+ 
+     void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
+ 
+-    BufferId CreateBuffer(VAddr device_addr, u32 wanted_size);
++    BufferId CreateBuffer(VAddr device_addr, u32 wanted_size, bool image_admission = false);
+ 
+     void Register(BufferId buffer_id);
+ 
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -150,6 +150,13 @@
+     }
+     if (info.l_stage == Shader::LogicalStage::Compute && info.pgm_hash == 0x5650b8f7) {
+         key += "_region_fullmask1";
++    }
++    // Saved wave masks must survive the one-lane metadata writer in these kernels.
++    // Preserve all other shader cache identities and the existing ordering suffixes.
++    if (info.l_stage == Shader::LogicalStage::Compute &&
++        (info.pgm_hash == 0x29569533 || info.pgm_hash == 0x44c189d5 ||
++         info.pgm_hash == 0x61b54af5)) {
++        key += "_saved_wave_mask1";
+     }
+     return key;
+ }
+--- a/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -956,7 +956,7 @@
+             },
+             vk::ImageMemoryBarrier{
+                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+-                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead,
++                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+                 .oldLayout = vk::ImageLayout::eGeneral,
+                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+@@ -974,9 +974,12 @@
+ 
+         bool swapchain_copied_for_screenshot = false;
+ 
++        // ImGui samples the prepared frame in its fragment shader. Scaling and
++        // window placement can read texels outside the destination pixel's region.
+         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+-                               vk::PipelineStageFlagBits::eColorAttachmentOutput,
+-                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
++                               vk::PipelineStageFlagBits::eColorAttachmentOutput |
++                                   vk::PipelineStageFlagBits::eFragmentShader,
++                               {}, {}, {}, pre_barriers);
+ 
+         { // Draw the game
+             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0.0f});
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -7640,6 +7640,155 @@
+     ScopeMarkerEnd();
+ }
+ 
++struct DreamsDynamicReadRange {
++    VAddr address;
++    u32 size;
++};
++using DreamsDynamicReads = boost::container::static_vector<DreamsDynamicReadRange, 3>;
++
++// Complete physical-address read sets of these shader versions, derived from their
++// compiled ReadConst expressions. Keep the 32-bit offset wrap used by the shaders.
++// A missing input or an address outside the guest GPU range retains the DMA fallback.
++static std::optional<DreamsDynamicReads> ResolveDreamsDynamicReads(
++    const Shader::Info& shader, std::span<const u32> code) {
++    if (!shader.uses_dma || Common::ElfInfo::Instance().GameSerial() != "CUSA04301") {
++        return {};
++    }
++    const auto& flat = shader.flattened_ud_buf;
++    const auto ud = shader.user_data;
++    // Runtime permutations can replace vertex user data with per-draw inputs;
++    // full DMA mode can also turn formerly flattened reads into physical reads.
++    // Accept only the complete, audited compiled modules. Others retain the
++    // mapped-buffer path. No cached raw module pointer survives cache replacement.
++    u64 expected_hash{};
++    size_t expected_bytes{};
++    switch (shader.pgm_hash) {
++    case 0x9e9c1c71: expected_hash = 0xcbe6aae3b2230cfeULL; expected_bytes = 13044; break;
++    case 0xdcc325c2: expected_hash = 0x3982fdf0d9f4ee4fULL; expected_bytes = 116240; break;
++    case 0xfffa32b6: expected_hash = 0xb04b52f8a8e23c2eULL; expected_bytes = 282672; break;
++    default: return {};
++    }
++    if (code.size_bytes() != expected_bytes ||
++        XXH3_64bits(code.data(), code.size_bytes()) != expected_hash) {
++        return {};
++    }
++    DreamsDynamicReads ranges;
++    const auto append = [&](u32 low, u32 high, u32 offset, u32 size) {
++        constexpr u64 limit = u64{1} << 40;
++        const u64 base = u64{low} | (u64{high} << 32);
++        if (base == 0 || base >= limit || offset > limit - base ||
++            size > limit - base - offset || (base & 3) != 0) {
++            return false;
++        }
++        ranges.push_back({base + offset, size});
++        return true;
++    };
++    switch (shader.pgm_hash) {
++    case 0x9e9c1c71:
++        if (shader.l_stage != Shader::LogicalStage::Vertex || ud.size() < 3 || flat.size() < 22 ||
++            !append(flat[20], flat[21], ud[2] * u32{192} + u32{128}, 64)) {
++            return {};
++        }
++        break;
++    case 0xdcc325c2:
++        if (shader.l_stage != Shader::LogicalStage::Fragment || ud.size() < 5 ||
++            !append(ud[0], ud[1], ud[4] << 4, 16)) {
++            return {};
++        }
++        break;
++    case 0xfffa32b6:
++        if (shader.l_stage != Shader::LogicalStage::Fragment || ud.size() < 3 || flat.size() < 169 ||
++            !append(ud[0], ud[1], (ud[2] << 4) + u32{192}, 16) ||
++            !append(flat[167], flat[168], ((ud[2] & 1) << 4) + u32{2304}, 12) ||
++            !append(flat[16], flat[17], (ud[2] << 4) + u32{256}, 16)) {
++            return {};
++        }
++        break;
++    default:
++        return {};
++    }
++    return ranges;
++}
++
++// A physical-address read is a use of the underlying cached buffer, even though it
++// has no ordinary descriptor. Preserve simultaneous descriptor writes and the
++// original producer scopes of barriers that have not yet been submitted.
++static void AppendDreamsDynamicReadBarrier(VideoCore::Buffer& buffer,
++                                          Pipeline::BufferBarriers& barriers,
++                                          vk::AccessFlags2 descriptor_access = {}) {
++    vk::AccessFlags2 access = vk::AccessFlagBits2::eShaderRead | descriptor_access;
++    bool pending_use = false;
++    for (const auto& pending : barriers) {
++        if (pending.buffer == buffer.Handle()) {
++            access |= pending.dstAccessMask;
++            pending_use = true;
++        }
++    }
++    auto combined = buffer.GetBarrier(access, vk::PipelineStageFlagBits2::eAllCommands, 0,
++        pending_use || bool(access & vk::AccessFlagBits2::eShaderWrite));
++    if (!combined) {
++        return; // Consecutive read-only uses need no additional dependency.
++    }
++    for (const auto& pending : barriers) {
++        if (pending.buffer == buffer.Handle()) {
++            combined->srcStageMask |= pending.srcStageMask;
++            combined->srcAccessMask |= pending.srcAccessMask;
++            combined->dstStageMask |= pending.dstStageMask;
++            combined->dstAccessMask |= pending.dstAccessMask;
++        }
++    }
++    for (size_t i = barriers.size(); i != 0; --i) {
++        if (barriers[i - 1].buffer == buffer.Handle()) {
++            barriers.erase(barriers.begin() + (i - 1));
++        }
++    }
++    barriers.emplace_back(*combined);
++}
++
++static void FinalizeDreamsDynamicReads(const Pipeline* pipeline, Rasterizer& rasterizer,
++                                       VideoCore::BufferCache& cache,
++                                       Pipeline::BufferBarriers& barriers,
++                                       std::span<const vk::DescriptorBufferInfo> bindings) {
++    for (const auto* stage : pipeline->GetStages()) {
++        if (!stage) {
++            continue;
++        }
++        const auto reads = ResolveDreamsDynamicReads(*stage,
++            rasterizer.GetPipelineCache().GetCurrentShaderSpirv(stage->l_stage));
++        if (!reads || !std::ranges::all_of(*reads, [&](const auto& read) {
++                return rasterizer.IsMapped(read.address, read.size);
++            })) {
++            continue;
++        }
++        // BindResources pre-created these ranges. Vertex/index/indirect bindings
++        // and the final descriptor refresh can have joined their buffers since
++        // then, so resolve the current backing and union its uses immediately
++        // before the barriers and draw are submitted.
++        for (const auto& read : *reads) {
++            auto& buffer = cache.GetBuffer(cache.FindBuffer(read.address, read.size));
++            vk::AccessFlags2 descriptor_access{};
++            size_t index{};
++            for (const auto* bound_stage : pipeline->GetStages()) {
++                if (!bound_stage) {
++                    continue;
++                }
++                for (const auto& desc : bound_stage->buffers) {
++                    ASSERT(index < bindings.size());
++                    if (bindings[index++].buffer == buffer.Handle()) {
++                        descriptor_access |= vk::AccessFlagBits2::eShaderRead;
++                        if (desc.is_written) {
++                            descriptor_access |= vk::AccessFlagBits2::eShaderWrite;
++                        }
++                    }
++                }
++            }
++            // A same-state descriptor binding may have emitted no barrier. Its
++            // write still belongs to this draw and must survive the added read.
++            AppendDreamsDynamicReadBarrier(buffer, barriers, descriptor_access);
++        }
++    }
++}
++
+ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+     RENDERER_TRACE;
+ 
+@@ -7768,6 +7917,8 @@
+     const auto& fetch_shader = pipeline->GetFetchShader();
+     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+ 
++    FinalizeDreamsDynamicReads(pipeline, *this, buffer_cache, buffer_barriers,
++        std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()});
+     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+     if (stabilize_graphics_buffers) {
+         ApplyDreamsGraphicsBufferBarrier(scheduler);
+@@ -13356,6 +13507,8 @@
+         }
+     }
+ 
++    FinalizeDreamsDynamicReads(pipeline, *this, buffer_cache, buffer_barriers,
++        std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()});
+     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+     if (use_sculpt_compacted_draw_count) {
+         // 7aa925e9 compactly writes the primary visibility list using its ordered-count
+@@ -14745,11 +14898,16 @@
+         const char* value = DreamsEnvironment<"SHADPS4_DREAMS_LINEAR_WRITE_RANGES">();
+         return value && value[0] == '1';
+     }();
+-    if (linear_writes_enabled && (cs.pgm_hash == 0xc4947c72 || cs.pgm_hash == 0xd9a5eaaf || cs.pgm_hash == 0x82719fa8) &&
++    if (linear_writes_enabled && (cs.pgm_hash == 0xc4947c72 || cs.pgm_hash == 0xd9a5eaaf || cs.pgm_hash == 0x82719fa8 ||
++        cs.pgm_hash == 0x6a7e1109 || cs.pgm_hash == 0xe69537e9 || cs.pgm_hash == 0x4f493234) &&
+         Common::ElfInfo::Instance().GameSerial() == "CUSA04301") {
+         std::array<u8,4496> code{};
+-        const size_t code_size = cs.pgm_hash == 0xc4947c72 ? 1152 : cs.pgm_hash == 0xd9a5eaaf ? 4496 : 3672;
+-        const u64 code_fingerprint = cs.pgm_hash == 0xc4947c72 ? 0x58e893e3968fdafeull : cs.pgm_hash == 0xd9a5eaaf ? 0xd00f87991319ea60ull : 0xb59413332d1cc779ull;
++        const size_t code_size = cs.pgm_hash == 0xc4947c72 ? 1152 : cs.pgm_hash == 0xd9a5eaaf ? 4496 :
++            cs.pgm_hash == 0x82719fa8 ? 3672 : cs.pgm_hash == 0x6a7e1109 ? 2680 : cs.pgm_hash == 0xe69537e9 ? 300 : 1428;
++        const u64 code_fingerprint = cs.pgm_hash == 0xc4947c72 ? 0x58e893e3968fdafeull : cs.pgm_hash == 0xd9a5eaaf ? 0xd00f87991319ea60ull :
++            cs.pgm_hash == 0x82719fa8 ? 0xb59413332d1cc779ull :
++            cs.pgm_hash == 0x6a7e1109 ? 0xc33547506ffebce3ull :
++            cs.pgm_hash == 0xe69537e9 ? 0x76a42e8df4715880ull : 0xa189c17bf4fb1d71ull;
+         const bool code_match = cs.pgm_base < (u64{1} << 40) &&
+             !buffer_cache.IsRegionGpuModifiedExact(cs.pgm_base, code_size) &&
+             memory->TryReadBacking(cs.pgm_base, code.data(), code_size) &&
+@@ -14759,9 +14917,11 @@
+             cs_program.start_x, cs_program.start_y, cs_program.start_z,
+             cs_program.num_thread_x.full, cs_program.num_thread_y.full, cs_program.num_thread_z.full,
+             static_cast<u32>(cs_program.settings.num_user_regs),
+-            static_cast<u32>(cs_program.settings.tgid_enable)};
+-        static std::array<bool,3> announced{};
+-        const size_t linear_index = cs.pgm_hash == 0xc4947c72 ? 0 : cs.pgm_hash == 0xd9a5eaaf ? 1 : 2;
++            static_cast<u32>(cs_program.settings.tgid_enable),
++            cs_program.user_data[2], cs_program.user_data[3]};
++        static std::array<bool,6> announced{};
++        const size_t linear_index = cs.pgm_hash == 0xc4947c72 ? 0 : cs.pgm_hash == 0xd9a5eaaf ? 1 :
++            cs.pgm_hash == 0x82719fa8 ? 2 : cs.pgm_hash == 0x6a7e1109 ? 3 : cs.pgm_hash == 0xe69537e9 ? 4 : 5;
+         if (!announced[linear_index]) {
+             LOG_WARNING(Render_Vulkan, "Dreams linear write range guard: code={} user_regs={} tgid={} local={}x{}x{} groups={}x{}x{}",
+                 code_match, static_cast<u32>(cs_program.settings.num_user_regs), static_cast<u32>(cs_program.settings.tgid_enable),
+@@ -22928,6 +23088,59 @@
+         primary_probe.pending_tail.clear();
+     }
+     ResetBindings();
++}
++
++// One indirect dispatch can read its arguments and access shader data in different ranges of
++// the same cache allocation. Preserve both uses in the state consumed by the next command.
++static void AppendDreamsIndirectArgumentBarrier(
++    VideoCore::Buffer& buffer, const Shader::Info& shader,
++    std::span<const vk::DescriptorBufferInfo> bindings, Pipeline::BufferBarriers& barriers) {
++    ASSERT(bindings.size() == shader.buffers.size());
++    vk::AccessFlags2 shader_access{};
++    for (size_t i = 0; i < bindings.size(); ++i) {
++        if (bindings[i].buffer == buffer.Handle()) {
++            shader_access |= vk::AccessFlagBits2::eShaderRead;
++            if (shader.buffers[i].is_written) {
++                shader_access |= vk::AccessFlagBits2::eShaderWrite;
++            }
++        }
++    }
++    if (!shader_access) {
++        if (auto barrier = buffer.GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
++                                            vk::PipelineStageFlagBits2::eDrawIndirect)) {
++            barriers.emplace_back(*barrier);
++        }
++        return;
++    }
++
++    // Retain the parent's broad shader stages. This is a simultaneous-access correction,
++    // not the rejected compute-stage narrowing. Force a dependency for repeated aliased uses.
++    auto combined = *buffer.GetBarrier(shader_access | vk::AccessFlagBits2::eIndirectCommandRead,
++                                      vk::PipelineStageFlagBits2::eAllCommands, 0, true);
++    for (const auto& pending : barriers) {
++        if (pending.buffer != buffer.Handle()) {
++            continue;
++        }
++        // Binding has already updated the state, but these barriers have not executed yet.
++        // Preserve their original producer scopes; barriers in one call do not form a chain.
++        combined.srcStageMask |= pending.srcStageMask;
++        combined.srcAccessMask |= pending.srcAccessMask;
++        combined.dstStageMask |= pending.dstStageMask;
++        combined.dstAccessMask |= pending.dstAccessMask;
++    }
++    for (size_t i = barriers.size(); i != 0; --i) {
++        if (barriers[i - 1].buffer == buffer.Handle()) {
++            barriers.erase(barriers.begin() + (i - 1));
++        }
++    }
++    barriers.emplace_back(combined);
++    static bool logged{};
++    if (!logged) {
++        logged = true;
++        LOG_WARNING(Render_Vulkan,
++                    "Dreams indirect shader/argument access union active: shader={:#x}",
++                    shader.pgm_hash);
++    }
+ }
+ 
+ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+@@ -25172,8 +25385,12 @@
+         }
+     }
+ 
+-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
+-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
++    if (Common::ElfInfo::Instance().GameSerial() == "CUSA04301") {
++        AppendDreamsIndirectArgumentBarrier(*buffer, cs,
++            std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()},
++            buffer_barriers);
++    } else if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
++                                                 vk::PipelineStageFlagBits2::eDrawIndirect)) {
+         buffer_barriers.emplace_back(*barrier);
+     }
+ 
+@@ -26420,6 +26637,8 @@
+     dreams_ce3_fragment_image_bindings.clear();
+ 
+     bool uses_dma = false;
++    bool unresolved_dma = false;
++    boost::container::small_vector<DreamsDynamicReadRange, 4> dynamic_reads;
+ 
+     // Bind resource buffers and textures.
+     Shader::Backend::Bindings binding{};
+@@ -26436,18 +26655,50 @@
+         if (DreamsDensitySourceCaptureDirectory()) CaptureDreamsFrameBegin(pipeline);
+         CaptureDreamsFrameResources(*stage);
+         uses_dma |= stage->uses_dma;
++        if (stage->uses_dma) {
++            const auto reads = ResolveDreamsDynamicReads(*stage,
++                pipeline_cache.GetCurrentShaderSpirv(stage->l_stage));
++            if (reads && std::ranges::all_of(*reads, [&](const auto& read) {
++                    return IsMapped(read.address, read.size);
++                })) {
++                dynamic_reads.insert(dynamic_reads.end(), reads->begin(), reads->end());
++            } else {
++                unresolved_dma = true;
++            }
++        }
+     }
+ 
+     if (uses_dma) {
+-        // We only use fault buffer for DMA right now.
+-        Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+-        for (auto& range : mapped_ranges) {
+-            buffer_cache.SynchronizeBuffersInRange(range.lower(), range.upper() - range.lower());
++        // Resolve every direct-address range before refreshing ordinary bindings:
++        // cache growth may join and retire a previously bound buffer. Do not use
++        // ObtainBuffer's small read-only stream copy: BDA must use the page table's
++        // cached allocation, not a different descriptor-only allocation.
++        for (const auto& read : dynamic_reads) {
++            buffer_cache.FindBuffer(read.address, read.size);
++        }
++        if (unresolved_dma) {
++            Common::RecursiveSharedLock lock{mapped_ranges_mutex};
++            for (auto& range : mapped_ranges) {
++                buffer_cache.SynchronizeBuffersInRange(range.lower(), range.upper() - range.lower());
++            }
++        } else {
++            for (const auto& read : dynamic_reads) {
++                buffer_cache.SynchronizeBuffersInRange(read.address, read.size);
++            }
+         }
+         fault_process_pending = true;
+     }
+ 
+     RefreshBufferResources(pipeline);
++    if (!dynamic_reads.empty()) {
++        static bool logged{};
++        if (!logged) {
++            logged = true;
++            LOG_WARNING(Render_Vulkan,
++                        "Dreams dynamic graphics reads tracked: ranges={} full_scan={}",
++                        dynamic_reads.size(), unresolved_dma);
++        }
++    }
+     return true;
+ }
+ 
+@@ -26462,8 +26713,9 @@
+         desc.is_formatted);
+     if (!bound) return ~u32{0};
+     if (*bound < size) {
+-        static std::array<bool,3> announced{};
+-        const size_t linear_index = stage.pgm_hash == 0xc4947c72 ? 0 : stage.pgm_hash == 0xd9a5eaaf ? 1 : 2;
++        static std::array<bool,6> announced{};
++        const size_t linear_index = stage.pgm_hash == 0xc4947c72 ? 0 : stage.pgm_hash == 0xd9a5eaaf ? 1 :
++            stage.pgm_hash == 0x82719fa8 ? 2 : stage.pgm_hash == 0x6a7e1109 ? 3 : stage.pgm_hash == 0xe69537e9 ? 4 : 5;
+         if (!announced[linear_index]) {
+             LOG_WARNING(Render_Vulkan, "Dreams linear write range active: shader={:#x} binding={} declared={:#x} tracked={:#x}", stage.pgm_hash, binding, size, *bound);
+             announced[linear_index] = true;
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -38,6 +38,27 @@
+         return;
+     }
+     EndRendering();
++
++    // Ending dynamic rendering stores its attachments. Loading them in another
++    // scope needs a dependency even when their layouts and access masks match.
++    // Resource binding can end a scope after Image::Transit, so order the store
++    // and load operations here. The same-scope fast path above remains batched.
++    static constexpr vk::MemoryBarrier2 attachment_dependency{
++        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
++                        vk::PipelineStageFlagBits2::eLateFragmentTests,
++        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
++                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
++        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
++                        vk::PipelineStageFlagBits2::eEarlyFragmentTests,
++        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
++                         vk::AccessFlagBits2::eColorAttachmentWrite |
++                         vk::AccessFlagBits2::eDepthStencilAttachmentRead |
++                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
++    };
++    current_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
++        .memoryBarrierCount = 1,
++        .pMemoryBarriers = &attachment_dependency,
++    });
+     is_rendering = true;
+     render_state = new_state;
+ 

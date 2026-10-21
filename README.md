@@ -1,12 +1,20 @@
 # Dreams on shadPS4
 
-Updated **October 19, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
+Updated **October 21, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
 
 ![Dreams on shadPS4 showing sculpt shapes and paint, October 15, 2026](builds/cusa04301-shape-density-fix-20261015/dreams-shapes-20261015.png)
 
 October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
 ## Latest tested build
+
+**[Download the October 21 graphical launcher package (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-image-cache-20261021/Dreams-graphical-launcher-20261021.zip)**
+
+Extract the ZIP, open **shadPS4QtLauncher.exe**, add your own Dreams game folder and click Play. The exact currently owner-played core (`bf9843bc`) and tested settings are included. No command prompt or command scripts are needed.
+
+Adds the current image-cache admission correction and retains this branch's later readback, staging, graphics-read and synchronization changes. Saved GPU checks passed; the owner reported correct visuals and movement. **Tren lag is still unresolved; no FPS improvement or NVIDIA fix is claimed.** [Changes, validation, source and limitations](IMAGE_CACHE_BUILD_20261021.md).
+
+Previous October 19 graphical package:
 
 **[Download Dreams with the normal graphical launcher (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-graphical-launcher-20261019/Dreams-graphical-launcher-20261019.zip)**
 

@@ -1,0 +1,2 @@
+a04f4e793d30167cdc4b74c8e4f7929e4187c2de23247bbab902b4d93c1e0d11  Dreams-graphical-launcher-20261021.zip
+8266516fb5b503bbf3266d0d3a8664f4899f26037eaa186ca6ddf04de1f4debe  qt-launcher-source-99e9829.tar.gz

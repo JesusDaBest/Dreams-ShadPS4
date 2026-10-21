@@ -1,0 +1,29 @@
+{
+  "core_sha256": "bf9843bce836d3893c0dcb9059c931517f4a18da43b35f0332b89d3e4dfdae98",
+  "zip_sha256": "a04f4e793d30167cdc4b74c8e4f7929e4187c2de23247bbab902b4d93c1e0d11",
+  "zip_bytes": 60900158,
+  "qt_default_route_verified": true,
+  "configuration_hash_verified": true,
+  "environment_verified": true,
+  "source_patch_verified": true,
+  "source_overlay_files": 30,
+  "changed_files": [
+    "src/input/controller.cpp",
+    "src/input/dreams_background_control.h",
+    "src/shader_recompiler/frontend/translate/scalar_alu.cpp",
+    "src/shader_recompiler/frontend/translate/vector_alu.cpp",
+    "src/video_core/amdgpu/liverpool.cpp",
+    "src/video_core/buffer_cache/buffer_cache.cpp",
+    "src/video_core/buffer_cache/buffer_cache.h",
+    "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp",
+    "src/video_core/renderer_vulkan/vk_presenter.cpp",
+    "src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+    "src/video_core/renderer_vulkan/vk_scheduler.cpp"
+  ],
+  "saved_gpu_checks": 156,
+  "saved_gpu_validation_errors": 0,
+  "publication_rebuilt_emulator": false,
+  "publication_started_game": false,
+  "performance_improvement_established": false,
+  "nvidia_fix_claimed": false
+}
