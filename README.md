@@ -1,12 +1,20 @@
 # Dreams on shadPS4
 
-Updated **October 21, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
+Updated **October 25, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
 
 ![Dreams on shadPS4 showing sculpt shapes and paint, October 15, 2026](builds/cusa04301-shape-density-fix-20261015/dreams-shapes-20261015.png)
 
 October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
-## Latest tested build
+## Current main build
+
+**[Download the October 25 graphical launcher package (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-clean-main-20261025/Dreams-graphical-launcher-20261025.zip)**
+
+Extract the ZIP, open **shadPS4QtLauncher.exe**, add your own Dreams game folder and click **Play**. The exact current main core (`35cb8a3c`) and matching settings are selected automatically, just like the previous graphical updates. No command prompt or command scripts are needed.
+
+Includes the ambient-shadow cache correction and retained texture/mip, shader and rendering fixes. **Custom debug tools and Builder Bridge are excluded**, along with all user saves and creations. An optional graphical tutorial bypass is included. The tested Tren board's colours returned; small or angle-dependent shadows and remaining lag/rendering glitches are still unresolved. [Changes, validation, source and known issues](CLEAN_MAIN_BUILD_20261025.md).
+
+Previous October 21 graphical package:
 
 **[Download the October 21 graphical launcher package (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-image-cache-20261021/Dreams-graphical-launcher-20261021.zip)**
 
@@ -100,6 +108,7 @@ Actual Dreams after the new fix, with paint tools open. Paint strokes now render
 
 ## Remaining work
 
+- Investigate the newly reported very small shadows that disappear at some viewing angles; the October 25 package preserves the current main build before that work.
 - Expand the October 15 shape fix tests beyond the saved cube, cylinder and stretched sphere, including more complex sculpts and editing operations.
 - Investigate sculpt-limit warnings, remaining low frame rates and other editing slowdowns. The demonstrated pause/unpause workload explosion is corrected locally.
 - Verify the new tweak-menu blur correction across other menus, GPUs and versions; other missing content may remain.

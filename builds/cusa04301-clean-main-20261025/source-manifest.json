@@ -1,0 +1,163 @@
+{
+  "public_base_commit": "b84847d1b6ca14d349bf9e11e91d14ae182e008d",
+  "patches": [
+    "patches/dreams-source-delta-20261016-performance.patch",
+    "patches/dreams-occlusion-array-lod-20261016.patch",
+    "patches/dreams-ordered-count-20261017.patch",
+    "patches/dreams-shader-instructions-20261019.patch",
+    "patches/dreams-image-cache-20261021.patch",
+    "patches/dreams-clean-main-20261025.patch"
+  ],
+  "changed_files": [
+    "src/shader_recompiler/frontend/translate/scalar_alu.cpp",
+    "src/shader_recompiler/ir/passes/resource_tracking_pass.cpp",
+    "src/video_core/host_shaders/tiling.comp",
+    "src/video_core/host_shaders/tiling_comp.h",
+    "src/video_core/renderer_vulkan/dreams_linear_write_bounds.h",
+    "src/video_core/renderer_vulkan/occlusion_clear.h",
+    "src/video_core/renderer_vulkan/vk_instance.cpp",
+    "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp",
+    "src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+    "src/video_core/texture_cache/image_info.cpp",
+    "src/video_core/texture_cache/partial_raw_clear.h",
+    "src/video_core/texture_cache/sampler.cpp",
+    "src/video_core/texture_cache/texture_cache.cpp",
+    "src/video_core/texture_cache/texture_cache.h",
+    "src/video_core/texture_cache/tile_manager.cpp",
+    "src/video_core/texture_cache/transfer_layout.h"
+  ],
+  "changed_translation_units": [
+    {
+      "source": "src/input/controller.cpp",
+      "object_sha256": "2d1c6b6dc10b98506cee8763561c6d41ca6b97135a416de51cb257ab3db5512b",
+      "source_sha256": "cd8bd8d88fc7fd2831448173e4938d35eee1c5f7fade0e37bf0eb808064e3fc0"
+    },
+    {
+      "source": "src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp",
+      "object_sha256": "d36b7d97afc9b31a45f40c3ee1a23414a198f4513334006c8b589db0d92dbb03",
+      "source_sha256": "f78af65a0034ed3a4b6f066b3b04f2c5f2615bcb560220416ac3c602e6ba938f"
+    },
+    {
+      "source": "src/shader_recompiler/frontend/translate/scalar_alu.cpp",
+      "object_sha256": "dcb8d6dc7864a89ed179809352d06abe2e17c23b70213207ef7ff4423894f103",
+      "source_sha256": "bfa87c84fcae4a0696874d1ec5d9bfc7c45725bab841c4831394eae27a90443b"
+    },
+    {
+      "source": "src/shader_recompiler/frontend/translate/vector_alu.cpp",
+      "object_sha256": "f28e3cce46660e5cbf5fac54e107d282371b785991df7b86d8d24a3f2ae6e896",
+      "source_sha256": "e7f4a83aba1055a03977a648142fe8db131793993a4523ad8464a244c52db0f4"
+    },
+    {
+      "source": "src/shader_recompiler/ir/passes/constant_propagation_pass.cpp",
+      "object_sha256": "7d658201e463ebc577679ab6345ac27bf5069659f7105f9f37def851e6b65a2b",
+      "source_sha256": "557500d9821f692c022a58b54b485af46a83ecd838ec5f0d51cd9892174acff9"
+    },
+    {
+      "source": "src/shader_recompiler/ir/passes/resource_tracking_pass.cpp",
+      "object_sha256": "361d41d7edae882e8c6b69de39837cd579c7f6ef88ffcf596c503d1c4d1991ac",
+      "source_sha256": "612dcdb2646f465172bb535920ddcc34c46bae8c685a2291ecccd2a69ed9dd3b"
+    },
+    {
+      "source": "src/video_core/amdgpu/liverpool.cpp",
+      "object_sha256": "c10461999836b505b807642159cd08873b4d60e54739d309d608baf8a78df583",
+      "source_sha256": "e80bb851e92cc6660f6a5faf4676fd041603cbd83c5f270994657ccef8f25961"
+    },
+    {
+      "source": "src/video_core/buffer_cache/buffer_cache.cpp",
+      "object_sha256": "22c561e67dcc7007021655c0e2951819f8a1760bab1df0709c60c3e1da17e38a",
+      "source_sha256": "d028a41f822e7992e14e8c15413ff4b32f0bd91ca56b74185eb29d485aa8ca24"
+    },
+    {
+      "source": "src/video_core/renderer_vulkan/vk_instance.cpp",
+      "object_sha256": "81b98046b81f11d35e4e5dbd09d4b64fd71ce91d1ab371559d027a80a7d135c4",
+      "source_sha256": "31a63ad0c4db4535de91c90a06b1b5d08f54de004d3a08ea9096992b5d2e5338"
+    },
+    {
+      "source": "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp",
+      "object_sha256": "e6877771e3740268c905572c62d6d64eac03b2ee54e6c661d3f219696dbf54e5",
+      "source_sha256": "17d134e112fe5c0874e83c55d42240f59d75c1df8b2dbb5350f785c73ae53ac8"
+    },
+    {
+      "source": "src/video_core/renderer_vulkan/vk_presenter.cpp",
+      "object_sha256": "9f45af4f950989284fc627c5124e14e9220dda0dd1e31d77d166c3e8e6fb1d7f",
+      "source_sha256": "c2a1f70798c4c8ffc3b34cb2298144aeea0041ecbcd37691cac7891ff7bdb8a9"
+    },
+    {
+      "source": "src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+      "object_sha256": "07e2ee215325a9195bfe48bb3b556ccec417a78fe8f120ade2e4a7f347d35a03",
+      "source_sha256": "9b37b56f5c8b8e7c865687f6f334bc165225b8f807eaff645682ea9ba7a7ae22"
+    },
+    {
+      "source": "src/video_core/renderer_vulkan/vk_scheduler.cpp",
+      "object_sha256": "58169fb671bcd227f7da02548a155d9daf984db1298d578b1d8245ab1c4cede5",
+      "source_sha256": "afa21ea45a9cee4e375b1eece133f0936f1ee6126813510978fd0ce81db09e20"
+    },
+    {
+      "source": "src/video_core/texture_cache/image_info.cpp",
+      "object_sha256": "badf43369e93220363c42733f2d8b53301b18fd558bb6c3754330b68ff2a0326",
+      "source_sha256": "4617f47d389f3ae0d9a612188fa1ade63d98163b21d25c51f5fb9cc3d367a8cd"
+    },
+    {
+      "source": "src/video_core/texture_cache/sampler.cpp",
+      "object_sha256": "752bd3b96b41cfc468316950efe50451c27b607cdc8a7335ad63bae793680b98",
+      "source_sha256": "048e48ba6c4a0564c030890786616f314126975c3fe2b745b60d5b8fdf0b69a2"
+    },
+    {
+      "source": "src/video_core/texture_cache/texture_cache.cpp",
+      "object_sha256": "13b7c7e8ac3629edce82be57afa5e3e0e92fe4bb616e91b81a360c282180a980",
+      "source_sha256": "0f2246dd1829e9447b171c1d66901a754134311c604f6a92a5d92d33a9c7794a"
+    },
+    {
+      "source": "src/video_core/texture_cache/tile_manager.cpp",
+      "object_sha256": "1fc9da191ff3025faccd5aa2597b180b0e4fdeb567fbbab41a612d25758931e0",
+      "source_sha256": "f631687b62192e3fa5ff7d6b2ee1622e9d2ec0d3e71860dd58df9e308ba7eb99"
+    }
+  ],
+  "frozen_overlay_files": {
+    "src/common/dreams_frame_fence_read.h": "55943a8b716bbde452a6e52134dc15ad052009ae9937d42822603ae34e899e74",
+    "src/input/controller.cpp": "cd8bd8d88fc7fd2831448173e4938d35eee1c5f7fade0e37bf0eb808064e3fc0",
+    "src/input/dreams_background_control.h": "6fabdfe9e1e3f375593638b01c1a9204063cf2c2a42abef3bad2698f395c6f2f",
+    "src/shader_recompiler/backend/spirv/dreams_stateful_order.h": "2a5135e2fd640d804ae2c62328ab7b9dc63241c63af95305c587e98969c3915a",
+    "src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp": "f78af65a0034ed3a4b6f066b3b04f2c5f2615bcb560220416ac3c602e6ba938f",
+    "src/shader_recompiler/dreams_compat.h": "b2ffe00640899b0512560346a6b31fe44e847d02ecb62bfe2eac64c6dfb344e8",
+    "src/shader_recompiler/frontend/translate/scalar_alu.cpp": "0c399962d9abbc3d5565ad49641c10ce826e7b6b13e85406442ebfebc4fa0c39",
+    "src/shader_recompiler/frontend/translate/vector_alu.cpp": "e7f4a83aba1055a03977a648142fe8db131793993a4523ad8464a244c52db0f4",
+    "src/shader_recompiler/ir/float_class_lowering.h": "60e8271c352d67da0a4d2566a0ceab20ee067577915248fa306e2933b454c263",
+    "src/shader_recompiler/ir/passes/constant_propagation_pass.cpp": "557500d9821f692c022a58b54b485af46a83ecd838ec5f0d51cd9892174acff9",
+    "src/shader_recompiler/ir/passes/resource_tracking_pass.cpp": "ef3b706ce257b7c7f2f40062d5dfe8aee81a840b08df0ea1adc667aa7c2a4af3",
+    "src/shader_recompiler/resource.h": "3aa2bb388de3a2ec09334dca5af0a8b3198596770b26809ff87a3cd3fd085cbc",
+    "src/video_core/amdgpu/liverpool.cpp": "e80bb851e92cc6660f6a5faf4676fd041603cbd83c5f270994657ccef8f25961",
+    "src/video_core/amdgpu/liverpool.h": "bbf3310a6dffd9623414f5b6fea0413565ea7506204f925165c142596d978779",
+    "src/video_core/amdgpu/pm4_cmds.h": "71f99fa0561be69b366688acd98e4f7d0edda37ffceb3e881abaa11ec5eb3cad",
+    "src/video_core/buffer_cache/buffer_cache.cpp": "d028a41f822e7992e14e8c15413ff4b32f0bd91ca56b74185eb29d485aa8ca24",
+    "src/video_core/buffer_cache/buffer_cache.h": "68ad33b3186812b7190e1b265fd731a59c2721d0a9d913a9611490448e9e71fd",
+    "src/video_core/host_shaders/tiling.comp": "ba5e9a385364d51da9c588d343b25690de93ac0426692b601891508cf5b08284",
+    "src/video_core/host_shaders/tiling_comp.h": "f7bed86463c3bea2d3ce462829336824674cf92999d66f618a9deeb20a268bfb",
+    "src/video_core/renderer_vulkan/detail_result_capture.inl": "5c0c136a6fc1f4b0ee24677c28624d8443cdc8e49495111a2f8164402e094a4a",
+    "src/video_core/renderer_vulkan/dreams_linear_write_bounds.h": "ad0358d5261f08a5b2b96cc055618200fe5a3cd95fed24c80597795bb6c3df79",
+    "src/video_core/renderer_vulkan/dreams_readback_gpu_span.h": "474f35e32c68563befe569fee99fecacf4e09870c31d92cc83c2f3bf0fe94f0c",
+    "src/video_core/renderer_vulkan/dreams_submission_span.h": "63ac76929cedfb200bed09e4364347c0d1f20f3bb073d4c2928b20b8ed052207",
+    "src/video_core/renderer_vulkan/fleck_hierarchy_capture.inl": "349c7af64032570b543633153958d75b2638ac0a42d3cfb4c924de92a9d87806",
+    "src/video_core/renderer_vulkan/fleck_producer_capture.inl": "d37248a8ba5994be86e9e568a3907e2d1d1a1cc2d123a24766a2832c0ff5d5bb",
+    "src/video_core/renderer_vulkan/large_sculpt_copy.inl": "4d7ede06bacf2f175235beaf5599197adf2e951842dc2646f12701ad4784c868",
+    "src/video_core/renderer_vulkan/occlusion_clear.h": "f6d48f929c5519d631dd8cc6c6bd75f3b787fc76db9db97324765919b8ec03a0",
+    "src/video_core/renderer_vulkan/source_density_output.inl": "ec67bd76049a1a7f7d762944de5eaab6ebdeaf5af5c6b9621a647ed7d0e96e84",
+    "src/video_core/renderer_vulkan/source_generation_capture.inl": "371ab3a19e1562d60877f5bfffef8a57dd5bfb8fd4a366d84725b42c970dd378",
+    "src/video_core/renderer_vulkan/vk_instance.cpp": "c5d3278200ce747f1144f23b34c0f5bbd4438bf20a290af79c30b445c759477c",
+    "src/video_core/renderer_vulkan/vk_instance.h": "c3097892857601b68b0aca07d4a4252ffd5d58667d9e14fc8ba89f48b059048e",
+    "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp": "7cf3953310bc8ae6cca4b013ff7eb75ebd6e1c2ec921a1819d8f04db5d7f7b95",
+    "src/video_core/renderer_vulkan/vk_presenter.cpp": "c2a1f70798c4c8ffc3b34cb2298144aeea0041ecbcd37691cac7891ff7bdb8a9",
+    "src/video_core/renderer_vulkan/vk_rasterizer.cpp": "9b37b56f5c8b8e7c865687f6f334bc165225b8f807eaff645682ea9ba7a7ae22",
+    "src/video_core/renderer_vulkan/vk_rasterizer.h": "c099b1763e5e439682feb52eaa27d554b5573df7f86af36a4a8752e1ad30fa3a",
+    "src/video_core/renderer_vulkan/vk_scheduler.cpp": "afa21ea45a9cee4e375b1eece133f0936f1ee6126813510978fd0ce81db09e20",
+    "src/video_core/renderer_vulkan/vk_scheduler.h": "7cd8466d842ee6c33e100b690add265ca84cbcaccc1dfa88b48ddd08e8a84e47",
+    "src/video_core/texture_cache/image_info.cpp": "4617f47d389f3ae0d9a612188fa1ade63d98163b21d25c51f5fb9cc3d367a8cd",
+    "src/video_core/texture_cache/partial_raw_clear.h": "f300a87d863d76ca4c75b1652f871ca9095533f8fdc205ab2725afed761bd8d2",
+    "src/video_core/texture_cache/sampler.cpp": "5349e8aafaf876d8537561a19e9e7af5748ff5cd42182a4ef9c4cf7a151c4031",
+    "src/video_core/texture_cache/texture_cache.cpp": "0f2246dd1829e9447b171c1d66901a754134311c604f6a92a5d92d33a9c7794a",
+    "src/video_core/texture_cache/texture_cache.h": "f97f7ba27aa9cdf8cbac59b3bf1511a8b7958f362398066118fc49c8df8fa5d0",
+    "src/video_core/texture_cache/tile_manager.cpp": "f631687b62192e3fa5ff7d6b2ee1622e9d2ec0d3e71860dd58df9e308ba7eb99",
+    "src/video_core/texture_cache/transfer_layout.h": "81d57f67fadddff8948fc134560c65d9dd78a457a6aac541843e5b6f7b4ecda1"
+  },
+  "source_scope": "Previous published source reconstruction plus frozen source/header overlays from the 17 selected replacement objects. Machine-local #line filenames are made project-relative; no executable bytes are changed. Patch application and source hashes verified. Fresh full-build reproducibility is not established."
+}

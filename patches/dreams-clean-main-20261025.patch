@@ -1,0 +1,1460 @@
+--- a/src/shader_recompiler/frontend/translate/scalar_alu.cpp
++++ b/src/shader_recompiler/frontend/translate/scalar_alu.cpp
+@@ -1,3 +1,4 @@
++#line 1 "src/shader_recompiler/frontend/translate/scalar_alu.cpp"
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -374,8 +375,27 @@
+     if (negate == NegateMode::Result) {
+         result = ir.LogicalNot(result);
+     }
++    // Prim[Selected]LightObjectPS:0x58 branches on this saved live mask before
++    // expanding it to whole quads. SCC must be uniform so discarded pixels can
++    // still execute as derivative helpers for surviving neighbors.
++    const bool dreams_glass_object_live_mask =
++        info.l_stage == LogicalStage::Fragment &&
++        (info.pgm_hash == 0x2b085c6c || info.pgm_hash == 0x15f114ff) &&
++        negate == NegateMode::Src1 &&
++        inst.dst[0].field == OperandField::ScalarGPR && inst.dst[0].code == 24 &&
++        inst.src[0].field == OperandField::ScalarGPR && inst.src[0].code == 24 &&
++        inst.src[1].field == OperandField::VccLo;
+     if (info.pgm_hash == DreamsCompat::TemporalResolveShader ||
+-        (info.l_stage == LogicalStage::Compute && info.pgm_hash == 0x5650b8f7)) {
++        (info.l_stage == LogicalStage::Compute && info.pgm_hash == 0x5650b8f7) ||
++        dreams_glass_object_live_mask ||
++        // PrimGlassPS 0x118 removes depth-rejected lanes from the final export
++        // mask. Its following scalar branch must test the entire saved mask,
++        // so rejected lanes can return as helpers for later quad operations.
++        (info.l_stage == LogicalStage::Fragment && info.pgm_hash == 0x619002ef &&
++         negate == NegateMode::Src1 &&
++         inst.dst[0].field == OperandField::ScalarGPR && inst.dst[0].code == 40 &&
++         inst.src[0].field == OperandField::ScalarGPR && inst.src[0].code == 40 &&
++         inst.src[1].field == OperandField::ExecLo)) {
+         const IR::U64 mask_src0{GetSrc64<IR::U64>(inst.src[0])};
+         IR::U64 mask_src1{GetSrc64<IR::U64>(inst.src[1])};
+         if (negate == NegateMode::Src1) {
+--- a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+@@ -1,3 +1,4 @@
++#line 1 "src/shader_recompiler/ir/passes/resource_tracking_pass.cpp"
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -1232,8 +1233,15 @@
+         (info.pgm_hash == DreamsCompat::TraversalShader || info.pgm_hash == 0x4bc902cf ||
+          info.pgm_hash == 0x34267ace || info.pgm_hash == 0x3091e6c1) &&
+         inst_info.is_array && view_type == AmdGpu::ImageType::Color2D;
+-    const IR::U32 dimension_lod = dreams_array_2d && unnormalized && inst_info.has_lod
+-        ? IR::U32{ir.ConvertFToU(32, ir.FPClamp(get_addr_reg(addr_reg + 3), ir.Imm32(0.0f),
++    // PrimGlassMipBlurDownCS supplies pixel coordinates in its selected source mip.
++    // Dividing by mip zero crops every reduction after the first to a smaller corner.
++    const bool dreams_glass_mip = info.l_stage == LogicalStage::Compute &&
++        info.pgm_hash == 0x345893a7 && !inst_info.is_array &&
++        view_type == AmdGpu::ImageType::Color2D;
++    const IR::U32 dimension_lod = (dreams_array_2d || dreams_glass_mip) &&
++                                    unnormalized && inst_info.has_lod
++        ? IR::U32{ir.ConvertFToU(32, ir.FPClamp(
++              get_addr_reg(addr_reg + (dreams_array_2d ? 3 : 2)), ir.Imm32(0.0f),
+               ir.Imm32(float(image.NumViewLevels(image_res.is_array) - 1))))}
+         : ir.Imm32(0u);
+     const bool fold_runtime_offset = !inst_info.is_gather && !is_msaa &&
+--- a/src/video_core/host_shaders/tiling.comp
++++ b/src/video_core/host_shaders/tiling.comp
+@@ -102,10 +102,11 @@
+ 
+ layout (set = 0, binding = 2, scalar) uniform TilingInfo {
+     uint bank_swizzle;
+-    uint num_slices;
++    uint micro_tiled_mips;
+     uint num_mips;
+     uint num_texels;
+     MipInfo mips[16];
++    uvec4 valid_extent[16];
+ } info;
+ 
+ uint32_t ComputePixelIndexWithinMicroTile(uint32_t x, uint32_t y, uint32_t z) {
+@@ -211,7 +212,6 @@
+     return pixel_number;
+ }
+ 
+-#if ARRAY_MODE == ARRAY_1D_TILED_THIN1 || ARRAY_MODE == ARRAY_1D_TILED_THICK
+ uint32_t ComputeSurfaceAddrFromCoordMicroTiled(uint32_t x, uint32_t y, uint32_t slice, uint32_t pitch, uint32_t height, uint32_t sample_index) {
+     uint32_t slice_bytes = BITS_TO_BYTES(pitch * height * MICRO_TILE_THICKNESS * BITS_PER_PIXEL * NUM_SAMPLES);
+ 
+@@ -238,7 +238,7 @@
+     uint32_t elem_offset = (sample_offset + pixel_offset) / 8;
+     return slice_offset + micro_tile_offset + elem_offset;
+ }
+-#else
++#if ARRAY_MODE != ARRAY_1D_TILED_THIN1 && ARRAY_MODE != ARRAY_1D_TILED_THICK
+ uint32_t ComputePipeFromCoord(uint32_t x, uint32_t y, uint32_t slice) {
+     uint32_t p0 = 0;
+     uint32_t p1 = 0;
+@@ -435,10 +435,22 @@
+ #if ARRAY_MODE == ARRAY_1D_TILED_THIN1 || ARRAY_MODE == ARRAY_1D_TILED_THICK
+     tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
+ #else
+-    tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0);
++    if ((info.micro_tiled_mips & (1u << mip)) != 0) {
++        tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
++    } else {
++        tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0);
++    }
+ #endif
+ 
+ #ifdef IS_TILER
++    // Image-to-buffer copies only initialize visible blocks, not row/depth padding.
++    // Retain the destination's existing bytes outside those copied extents.
++    if (any(greaterThanEqual(uvec3(x, y, slice), info.valid_extent[mip].xyz))) {
++        return;
++    }
++    if (tiled_offset / BYTES_PER_PIXEL >= tiled_data.length()) {
++        return;
++    }
+     tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
+ #else
+     linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+--- /dev/null
++++ b/src/video_core/host_shaders/tiling_comp.h
+@@ -0,0 +1,463 @@
++#pragma once
++#include <string_view>
++namespace HostShaders {
++constexpr std::string_view TILING_COMP = R"SHADER(// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#version 450 core
++
++#extension GL_GOOGLE_include_directive : require
++#extension GL_EXT_scalar_block_layout : require
++#extension GL_EXT_shader_explicit_arithmetic_types : require
++
++layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++// #define BITS_PER_PIXEL
++// #define NUM_SAMPLES
++// #define MICRO_TILE_MODE
++// #define ARRAY_MODE
++// #define MICRO_TILE_THICKNESS
++// #define PIPE_CONFIG
++// #define BANK_WIDTH
++// #define BANK_HEIGHT
++// #define NUM_BANKS
++// #define NUM_BANK_BITS
++// #define TILE_SPLIT_BYTES
++// #define MACRO_TILE_ASPECT
++
++#define BYTES_PER_PIXEL (BITS_PER_PIXEL / 8)
++
++#if BITS_PER_PIXEL == 8
++#define BLOCK_TYPE uint8_t
++#elif BITS_PER_PIXEL == 16
++#define BLOCK_TYPE uint16_t
++#elif BITS_PER_PIXEL == 32
++#define BLOCK_TYPE uint32_t
++#elif BITS_PER_PIXEL == 64
++#define BLOCK_TYPE u32vec2
++#elif BITS_PER_PIXEL == 96
++#define BLOCK_TYPE u32vec3
++#else
++#define BLOCK_TYPE u32vec4
++#endif
++
++#if PIPE_CONFIG == ADDR_SURF_P2
++#define NUM_PIPES 2
++#define NUM_PIPE_BITS 1
++#else
++#define NUM_PIPES 8
++#define NUM_PIPE_BITS 3
++#endif
++
++#define MICRO_TILE_WIDTH 8
++#define MICRO_TILE_HEIGHT 8
++#define MICRO_TILE_PIXELS (MICRO_TILE_WIDTH * MICRO_TILE_HEIGHT)
++#define MICRO_TILE_BITS (MICRO_TILE_PIXELS * MICRO_TILE_THICKNESS * BITS_PER_PIXEL * NUM_SAMPLES)
++#define MICRO_TILE_BYTES (MICRO_TILE_BITS / 8)
++
++#define NUM_PIPE_INTERLEAVE_BITS 8
++
++#define ADDR_SURF_DISPLAY_MICRO_TILING 0
++#define ADDR_SURF_THIN_MICRO_TILING 1
++#define ADDR_SURF_DEPTH_MICRO_TILING 2
++#define ADDR_SURF_ROTATED_MICRO_TILING 3
++
++#define ARRAY_LINEAR_GENERAL 0
++#define ARRAY_LINEAR_ALIGNED 1
++#define ARRAY_1D_TILED_THIN1 2
++#define ARRAY_1D_TILED_THICK 3
++#define ARRAY_2D_TILED_THIN1 4
++#define ARRAY_PRT_TILED_THIN1 5
++#define ARRAY_PRT_2D_TILED_THIN1 6
++#define ARRAY_2D_TILED_THICK 7
++#define ARRAY_2D_TILED_XTHICK 8
++#define ARRAY_PRT_TILED_THICK 9
++#define ARRAY_PRT_2D_TILED_THICK 10
++#define ARRAY_PRT_3D_TILED_THIN1 11
++#define ARRAY_3D_TILED_THIN1 12
++#define ARRAY_3D_TILED_THICK 13
++#define ARRAY_3D_TILED_XTHICK 14
++#define ARRAY_PRT_3D_TILED_THICK 15
++
++#define	ADDR_SURF_P2 0
++#define	ADDR_SURF_P8_32x32_8x16	10
++#define	ADDR_SURF_P8_32x32_16x16 12
++
++#define BITS_PER_BYTE 8
++#define BITS_TO_BYTES(x) (((x) + (BITS_PER_BYTE-1)) / BITS_PER_BYTE)
++
++#define _BIT(v, b) bitfieldExtract((v), (b), 1)
++
++struct MipInfo {
++    uint size;
++    uint pitch;
++    uint height;
++    uint offset;
++};
++
++layout (set = 0, binding = 0, scalar) buffer InputBuf {
++    BLOCK_TYPE tiled_data[];
++};
++
++layout (set = 0, binding = 1, scalar) buffer OutputBuf {
++    BLOCK_TYPE linear_data[];
++};
++
++layout (set = 0, binding = 2, scalar) uniform TilingInfo {
++    uint bank_swizzle;
++    uint micro_tiled_mips;
++    uint num_mips;
++    uint num_texels;
++    MipInfo mips[16];
++    uvec4 valid_extent[16];
++} info;
++
++uint32_t ComputePixelIndexWithinMicroTile(uint32_t x, uint32_t y, uint32_t z) {
++    uint32_t p0 = 0;
++    uint32_t p1 = 0;
++    uint32_t p2 = 0;
++    uint32_t p3 = 0;
++    uint32_t p4 = 0;
++    uint32_t p5 = 0;
++    uint32_t p6 = 0;
++    uint32_t p7 = 0;
++    uint32_t p8 = 0;
++
++    uint32_t x0 = _BIT(x, 0);
++    uint32_t x1 = _BIT(x, 1);
++    uint32_t x2 = _BIT(x, 2);
++    uint32_t y0 = _BIT(y, 0);
++    uint32_t y1 = _BIT(y, 1);
++    uint32_t y2 = _BIT(y, 2);
++    uint32_t z0 = _BIT(z, 0);
++    uint32_t z1 = _BIT(z, 1);
++    uint32_t z2 = _BIT(z, 2);
++
++#if MICRO_TILE_MODE == ADDR_SURF_DISPLAY_MICRO_TILING
++    #if BITS_PER_PIXEL == 8
++        p0 = x0;
++        p1 = x1;
++        p2 = x2;
++        p3 = y1;
++        p4 = y0;
++        p5 = y2;
++    #elif BITS_PER_PIXEL == 16
++        p0 = x0;
++        p1 = x1;
++        p2 = x2;
++        p3 = y0;
++        p4 = y1;
++        p5 = y2;
++    #elif BITS_PER_PIXEL == 32
++        p0 = x0;
++        p1 = x1;
++        p2 = y0;
++        p3 = x2;
++        p4 = y1;
++        p5 = y2;
++    #elif BITS_PER_PIXEL == 64
++        p0 = x0;
++        p1 = y0;
++        p2 = x1;
++        p3 = x2;
++        p4 = y1;
++        p5 = y2;
++    #elif BITS_PER_PIXEL == 128
++        p0 = y0;
++        p1 = x0;
++        p2 = x1;
++        p3 = x2;
++        p4 = y1;
++        p5 = y2;
++    #endif
++#elif MICRO_TILE_MODE == ADDR_SURF_THIN_MICRO_TILING || MICRO_TILE_MODE == ADDR_SURF_DEPTH_MICRO_TILING
++        p0 = x0;
++        p1 = y0;
++        p2 = x1;
++        p3 = y1;
++        p4 = x2;
++        p5 = y2;
++#else
++    #if BITS_PER_PIXEL == 8 || BITS_PER_PIXEL == 16
++        p0 = x0;
++        p1 = y0;
++        p2 = x1;
++        p3 = y1;
++        p4 = z0;
++        p5 = z1;
++    #elif BITS_PER_PIXEL == 32
++        p0 = x0;
++        p1 = y0;
++        p2 = x1;
++        p3 = z0;
++        p4 = y1;
++        p5 = z1;
++    #elif BITS_PER_PIXEL == 64 || BITS_PER_PIXEL == 128
++        p0 = x0;
++        p1 = y0;
++        p2 = z0;
++        p3 = x1;
++        p4 = y1;
++        p5 = z1;
++    #endif
++        p6 = x2;
++        p7 = y2;
++
++    #if MICRO_TILE_THICKNESS == 8
++        p8 = z2;
++    #endif
++#endif
++
++    uint32_t pixel_number =
++        ((p0) | (p1 << 1) | (p2 << 2) | (p3 << 3) | (p4 << 4) |
++         (p5 << 5) | (p6 << 6) | (p7 << 7) | (p8 << 8));
++
++    return pixel_number;
++}
++
++uint32_t ComputeSurfaceAddrFromCoordMicroTiled(uint32_t x, uint32_t y, uint32_t slice, uint32_t pitch, uint32_t height, uint32_t sample_index) {
++    uint32_t slice_bytes = BITS_TO_BYTES(pitch * height * MICRO_TILE_THICKNESS * BITS_PER_PIXEL * NUM_SAMPLES);
++
++    uint32_t micro_tiles_per_row = pitch / MICRO_TILE_WIDTH;
++    uint32_t micro_tile_index_x = x / MICRO_TILE_WIDTH;
++    uint32_t micro_tile_index_y = y / MICRO_TILE_HEIGHT;
++    uint32_t micro_tile_index_z = slice / MICRO_TILE_THICKNESS;
++
++    uint32_t slice_offset = micro_tile_index_z * slice_bytes;
++    uint32_t micro_tile_offset = (micro_tile_index_y * micro_tiles_per_row + micro_tile_index_x) * MICRO_TILE_BYTES;
++
++    uint32_t pixel_index = ComputePixelIndexWithinMicroTile(x, y, slice);
++
++    uint32_t sample_offset;
++    uint32_t pixel_offset;
++#if MICRO_TILE_MODE == ADDR_SURF_DEPTH_MICRO_TILING
++    sample_offset = sample_index * BITS_PER_PIXEL;
++    pixel_offset = pixel_index * BITS_PER_PIXEL * NUM_SAMPLES;
++#else
++    sample_offset = sample_index * (MICRO_TILE_BYTES * 8 / NUM_SAMPLES);
++    pixel_offset = pixel_index * BITS_PER_PIXEL;
++#endif
++
++    uint32_t elem_offset = (sample_offset + pixel_offset) / 8;
++    return slice_offset + micro_tile_offset + elem_offset;
++}
++#if ARRAY_MODE != ARRAY_1D_TILED_THIN1 && ARRAY_MODE != ARRAY_1D_TILED_THICK
++uint32_t ComputePipeFromCoord(uint32_t x, uint32_t y, uint32_t slice) {
++    uint32_t p0 = 0;
++    uint32_t p1 = 0;
++    uint32_t p2 = 0;
++
++    uint32_t tx = x / MICRO_TILE_WIDTH;
++    uint32_t ty = y / MICRO_TILE_HEIGHT;
++    uint32_t x3 = _BIT(tx, 0);
++    uint32_t x4 = _BIT(tx, 1);
++    uint32_t x5 = _BIT(tx, 2);
++    uint32_t y3 = _BIT(ty, 0);
++    uint32_t y4 = _BIT(ty, 1);
++    uint32_t y5 = _BIT(ty, 2);
++
++#if PIPE_CONFIG == ADDR_SURF_P2
++    p0 = x3 ^ y3;
++#elif PIPE_CONFIG == ADDR_SURF_P8_32x32_8x16
++    p0 = x4 ^ y3 ^ x5;
++    p1 = x3 ^ y4;
++    p2 = x5 ^ y5;
++#elif PIPE_CONFIG == ADDR_SURF_P8_32x32_16x16
++    p0 = x3 ^ y3 ^ x4;
++    p1 = x4 ^ y4;
++    p2 = x5 ^ y5;
++#endif
++
++    uint32_t pipe = p0 | (p1 << 1) | (p2 << 2);
++
++    uint32_t pipe_swizzle = 0;
++#if ARRAY_MODE == ARRAY_3D_TILED_THIN1 || ARRAY_MODE == ARRAY_3D_TILED_THICK || ARRAY_MODE == ARRAY_3D_TILED_XTHICK
++    pipe_swizzle += max(1, NUM_PIPES / 2 - 1) * (slice / MICRO_TILE_THICKNESS);
++#endif
++    pipe_swizzle &= (NUM_PIPES - 1);
++    pipe = pipe ^ pipe_swizzle;
++    return pipe;
++}
++
++uint32_t ComputeBankFromCoord(uint32_t x, uint32_t y, uint32_t slice, uint32_t tile_split_slice) {
++    uint32_t b0 = 0;
++    uint32_t b1 = 0;
++    uint32_t b2 = 0;
++    uint32_t b3 = 0;
++    uint32_t slice_rotation = 0;
++    uint32_t tile_split_rotation = 0;
++
++    uint32_t tx = x / MICRO_TILE_WIDTH / (BANK_WIDTH * NUM_PIPES);
++    uint32_t ty = y / MICRO_TILE_HEIGHT / BANK_HEIGHT;
++
++    uint32_t x3 = _BIT(tx, 0);
++    uint32_t x4 = _BIT(tx, 1);
++    uint32_t x5 = _BIT(tx, 2);
++    uint32_t x6 = _BIT(tx, 3);
++    uint32_t y3 = _BIT(ty, 0);
++    uint32_t y4 = _BIT(ty, 1);
++    uint32_t y5 = _BIT(ty, 2);
++    uint32_t y6 = _BIT(ty, 3);
++
++#if NUM_BANKS == 16
++    b0 = x3 ^ y6;
++    b1 = x4 ^ y5 ^ y6;
++    b2 = x5 ^ y4;
++    b3 = x6 ^ y3;
++#elif NUM_BANKS == 8
++    b0 = x3 ^ y5;
++    b1 = x4 ^ y4 ^ y5;
++    b2 = x5 ^ y3;
++#elif NUM_BANKS == 4
++    b0 = x3 ^ y4;
++    b1 = x4 ^ y3;
++#elif NUM_BANKS == 2
++    b0 = x3 ^ y3;
++#endif
++
++    uint32_t bank = b0 | (b1 << 1) | (b2 << 2) | (b3 << 3);
++
++#if ARRAY_MODE == ARRAY_2D_TILED_THIN1 || ARRAY_MODE == ARRAY_2D_TILED_THICK || ARRAY_MODE == ARRAY_2D_TILED_XTHICK
++    slice_rotation = ((NUM_BANKS / 2) - 1) * (slice / MICRO_TILE_THICKNESS);
++#elif ARRAY_MODE == ARRAY_3D_TILED_THIN1 || ARRAY_MODE == ARRAY_3D_TILED_THICK || ARRAY_MODE == ARRAY_3D_TILED_XTHICK
++    slice_rotation = max(1u, (NUM_PIPES / 2) - 1) * (slice / MICRO_TILE_THICKNESS) / NUM_PIPES;
++#endif
++
++#if ARRAY_MODE == ARRAY_2D_TILED_THIN1 || ARRAY_MODE == ARRAY_3D_TILED_THIN1 || \
++    ARRAY_MODE == ARRAY_PRT_2D_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_3D_TILED_THIN1
++                                                                tile_split_rotation = ((NUM_BANKS / 2) + 1) * tile_split_slice;
++#endif
++
++    bank ^= info.bank_swizzle + slice_rotation;
++    bank ^= tile_split_rotation;
++    bank &= (NUM_BANKS - 1);
++
++    return bank;
++}
++
++uint32_t ComputeSurfaceAddrFromCoordMacroTiled(uint32_t x, uint32_t y, uint32_t slice, uint32_t pitch, uint32_t height, uint32_t sample_index) {
++    uint32_t pixel_index = ComputePixelIndexWithinMicroTile(x, y, slice);
++
++    uint32_t sample_offset;
++    uint32_t pixel_offset;
++#if MICRO_TILE_MODE == ADDR_SURF_DEPTH_MICRO_TILING
++    sample_offset = sample_index * BITS_PER_PIXEL;
++    pixel_offset = pixel_index * BITS_PER_PIXEL * NUM_SAMPLES;
++#else
++    sample_offset = sample_index * (MICRO_TILE_BITS / NUM_SAMPLES);
++    pixel_offset = pixel_index * BITS_PER_PIXEL;
++#endif
++
++    uint32_t element_offset = (pixel_offset + sample_offset) / 8;
++
++    uint32_t slices_per_tile = 1;
++    uint32_t tile_split_slice = 0;
++#if MICRO_TILE_BYTES > TILE_SPLIT_BYTES && MICRO_TILE_THICKNESS == 1
++    slices_per_tile = MICRO_TILE_BYTES / TILE_SPLIT_BYTES;
++    tile_split_slice = element_offset / TILE_SPLIT_BYTES;
++    element_offset %= TILE_SPLIT_BYTES;
++    #undef MICRO_TILE_BYTES
++    #define MICRO_TILE_BYTES TILE_SPLIT_BYTES
++#endif
++
++    uint32_t macro_tile_pitch = (MICRO_TILE_WIDTH * BANK_WIDTH * NUM_PIPES) * MACRO_TILE_ASPECT;
++    uint32_t macro_tile_height = (MICRO_TILE_HEIGHT * BANK_HEIGHT * NUM_BANKS) / MACRO_TILE_ASPECT;
++
++    uint32_t macro_tile_bytes = MICRO_TILE_BYTES *
++                               (macro_tile_pitch / MICRO_TILE_WIDTH) *
++                               (macro_tile_height / MICRO_TILE_HEIGHT) / (NUM_PIPES * NUM_BANKS);
++
++    uint32_t macro_tiles_per_row = pitch / macro_tile_pitch;
++
++    uint32_t macro_tile_index_x = x / macro_tile_pitch;
++    uint32_t macro_tile_index_y = y / macro_tile_height;
++    uint32_t macro_tile_offset =
++        ((macro_tile_index_y * macro_tiles_per_row) + macro_tile_index_x) * macro_tile_bytes;
++    uint32_t macro_tiles_per_slice = macro_tiles_per_row * (height / macro_tile_height);
++
++    uint32_t slice_bytes = macro_tiles_per_slice * macro_tile_bytes;
++    uint32_t slice_offset =
++        slice_bytes * (tile_split_slice + slices_per_tile * (slice / MICRO_TILE_THICKNESS));
++
++    uint32_t tile_row_index = (y / MICRO_TILE_HEIGHT) % BANK_HEIGHT;
++    uint32_t tile_column_index = ((x / MICRO_TILE_WIDTH) / NUM_PIPES) % BANK_WIDTH;
++    uint32_t tile_index = (tile_row_index * BANK_WIDTH) + tile_column_index;
++    uint32_t tile_offset = tile_index * MICRO_TILE_BYTES;
++
++    uint32_t total_offset = slice_offset + macro_tile_offset + element_offset + tile_offset;
++
++#if ARRAY_MODE == ARRAY_PRT_TILED_THIN1 || ARRAY_MODE == ARRAY_PRT_TILED_THICK
++    x %= macro_tile_pitch;
++    y %= macro_tile_height;
++#endif
++
++    uint32_t pipe = ComputePipeFromCoord(x, y, slice);
++    uint32_t bank = ComputeBankFromCoord(x, y, slice, tile_split_slice);
++
++    uint32_t pipe_interleave_mask = (1 << NUM_PIPE_INTERLEAVE_BITS) - 1;
++    uint32_t pipe_interleave_offset = total_offset & pipe_interleave_mask;
++    uint32_t offset = total_offset >> NUM_PIPE_INTERLEAVE_BITS;
++
++    uint32_t addr = pipe_interleave_offset;
++    uint32_t pipe_bits = pipe << NUM_PIPE_INTERLEAVE_BITS;
++    uint32_t bank_bits = bank << (NUM_PIPE_INTERLEAVE_BITS + NUM_PIPE_BITS);
++    uint32_t offset_bits = offset << (NUM_PIPE_INTERLEAVE_BITS + NUM_PIPE_BITS + NUM_BANK_BITS);
++
++    addr |= pipe_bits;
++    addr |= bank_bits;
++    addr |= offset_bits;
++
++    return addr;
++}
++#endif
++
++uint GetMipLevel(inout uint texel) {
++    uint mip = 0;
++    uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
++    while (texel >= mip_size && mip + 1 < info.num_mips) {
++        texel -= mip_size;
++        ++mip;
++        mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
++    }
++    return mip;
++}
++
++void main() {
++    uint texel = gl_GlobalInvocationID.x;
++    if (texel >= info.num_texels) {
++        return;
++    }
++    uint mip = GetMipLevel(texel);
++    uint pitch = info.mips[mip].pitch;
++    uint height = info.mips[mip].height;
++    uint tiled_offset = info.mips[mip].offset;
++    uint x = texel % pitch;
++    uint y = (texel / pitch) % height;
++    uint slice = texel / (pitch * height);
++
++#if ARRAY_MODE == ARRAY_1D_TILED_THIN1 || ARRAY_MODE == ARRAY_1D_TILED_THICK
++    tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
++#else
++    if ((info.micro_tiled_mips & (1u << mip)) != 0) {
++        tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
++    } else {
++        tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0);
++    }
++#endif
++
++#ifdef IS_TILER
++    // Image-to-buffer copies only initialize visible blocks, not row/depth padding.
++    // Retain the destination's existing bytes outside those copied extents.
++    if (any(greaterThanEqual(uvec3(x, y, slice), info.valid_extent[mip].xyz))) {
++        return;
++    }
++    if (tiled_offset / BYTES_PER_PIXEL >= tiled_data.length()) {
++        return;
++    }
++    tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
++#else
++    linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
++#endif
++}
++)SHADER";
++}
+--- a/src/video_core/renderer_vulkan/dreams_linear_write_bounds.h
++++ b/src/video_core/renderer_vulkan/dreams_linear_write_bounds.h
+@@ -4,17 +4,46 @@
+ #include <optional>
+ #include "common/types.h"
+ namespace Vulkan::DreamsLinearWrites {
+-struct Context {bool active{};bool code_match{};u32 groups_x{},groups_y{},groups_z{};u32 start_x{},start_y{},start_z{};u32 local_x{},local_y{},local_z{},user_regs{},tgid_enable{};};
++struct Context {bool active{};bool code_match{};u32 groups_x{},groups_y{},groups_z{};u32 start_x{},start_y{},start_z{};u32 local_x{},local_y{},local_z{},user_regs{},tgid_enable{};u32 input_count{},output_offset{};};
+ inline thread_local Context current;
+ inline u64 Fingerprint(const u8* bytes,size_t size){u64 value=14695981039346656037ull;for(size_t i=0;i<size;++i){value^=bytes[i];value*=1099511628211ull;}return value;}
+ // The complete c4947c72 guest binary and current IR were audited; all six stores
+ // address a linear GlobalInvocationId.x record. Unknown layouts retain full marking.
+ inline std::optional<u32> Bound(const Context& c,u64 hash,u32 binding,u32 sharp_idx,u32 stride,
+                                 u64 declared_size,bool unusual_addressing,bool formatted){
+-    if(!c.active||!c.code_match||(hash!=0xc4947c72&&hash!=0xd9a5eaaf&&hash!=0x82719fa8)||!c.groups_x||c.groups_y!=1||c.groups_z!=1||
++    if(!c.active||!c.code_match||(hash!=0xc4947c72&&hash!=0xd9a5eaaf&&hash!=0x82719fa8&&hash!=0x6a7e1109&&hash!=0xe69537e9&&hash!=0x4f493234)||!c.groups_x||c.groups_y!=1||c.groups_z!=1||
+        c.start_x||c.start_y||c.start_z||c.local_x!=64||c.local_y!=1||c.local_z!=1||
+-       c.user_regs!=(hash==0xc4947c72?7u:hash==0xd9a5eaaf?2u:4u)||!(c.tgid_enable&1)||unusual_addressing||formatted||!declared_size||
++       c.user_regs!=((hash==0xc4947c72||hash==0x4f493234)?7u:hash==0xd9a5eaaf?2u:hash==0x6a7e1109?3u:4u)||!(c.tgid_enable&1)||unusual_addressing||formatted||!declared_size||
+        declared_size%4||declared_size>0xffffffffull)return {};
++    if(hash==0x4f493234){
++        // All 23 stores use the current global-X float4 record, including clears.
++        // Indexed reads and conditional branches cannot expand these output addresses.
++        if((binding!=0&&binding!=1&&binding!=3&&binding!=10&&binding!=11)||
++           sharp_idx!=66+4*binding||stride!=16)return {};
++        const u64 bytes=u64(c.groups_x)*64*16;
++        if(bytes>0xffffffffull)return {};
++        return u32(std::min(bytes,declared_size));
++    }
++    if(hash==0x6a7e1109){
++        // All twelve stores cover three float4 outputs indexed by global X.
++        // The input-count branch can only remove writes from this prefix.
++        if(binding>2||sharp_idx!=88+4*binding||stride!=16)return {};
++        const u64 bytes=u64(c.groups_x)*64*16;
++        if(bytes>0xffffffffull)return {};
++        return u32(std::min(bytes,declared_size));
++    }
++    if(hash==0xe69537e9){
++        // i=global X, j=user_data[3]+i. Outputs use i, j, or user_data[2]+j.
++        // Include the untouched leading records; retain all prior dirty tails.
++        const u32 expected_stride=(binding==1||binding==2)?4:16;
++        if(binding>4||sharp_idx!=36+4*binding||stride!=expected_stride)return {};
++        const u64 lanes=u64(c.groups_x)*64;
++        const u64 end=u64(c.input_count)+c.output_offset+lanes;
++        if(end*16>0xffffffffull)return {}; // No wrapped guest sums or byte indices.
++        const u64 records=binding==0?end:(binding==1||binding==3)?lanes:
++                          u64(c.output_offset)+lanes;
++        return u32(std::min(records*stride,declared_size));
++    }
+     if(hash==0x82719fa8){
+         // Each group reduces its lanes to one record, independent of read indices.
+         const u32 expected_stride = binding == 0 ? 4 : 16;
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/occlusion_clear.h
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++#include <array>
++#include "shader_recompiler/info.h"
++
++namespace VideoCore::DreamsOcclusionClear {
++// OcclusionClearBinaryOutput.cs: one linear, bounds-checked dword zero per lane.
++// Its allocation also backs the previous frame's spherical-harmonic image.
++inline bool Matches(const Shader::InfoPersistent& info) {
++    return info.pgm_hash == 0x2fa79a88 && info.l_stage == Shader::LogicalStage::Compute &&
++        info.images.empty() && info.buffers.size() == 2 &&
++        info.buffers[0].buffer_type == Shader::BufferType::Guest &&
++        info.buffers[0].is_written && !info.buffers[0].is_formatted &&
++        info.buffers[1].buffer_type == Shader::BufferType::Flatbuf &&
++        !info.buffers[1].is_written;
++}
++
++inline u64 CompleteBytes(const AmdGpu::Buffer& sharp, std::array<u32,3> local,
++                         std::array<u32,3> groups, u32 base_x) {
++    const u64 bytes = u64(sharp.num_records) * sizeof(u32);
++    if (!sharp.base_address || sharp.base_address % 4 || !sharp.num_records ||
++        sharp.type || sharp.stride != 4 || sharp.swizzle_enable || sharp.cache_swizzle ||
++        sharp.add_tid_enable || sharp.GetSize() != bytes ||
++        local != std::array<u32,3>{64,1,1} || groups[1] != 1 || groups[2] != 1 ||
++        base_x || u64(groups[0]) * 64 < sharp.num_records) return 0;
++    return bytes;
++}
++} // namespace VideoCore::DreamsOcclusionClear
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -1,3 +1,4 @@
++#line 1 "src/video_core/renderer_vulkan/vk_instance.cpp"
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -1,3 +1,4 @@
++#line 1 "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -157,6 +158,19 @@
+         (info.pgm_hash == 0x29569533 || info.pgm_hash == 0x44c189d5 ||
+          info.pgm_hash == 0x61b54af5)) {
+         key += "_saved_wave_mask1";
++    }
++    // Recompile only the glass-menu reduction shader after correcting its source-mip coordinates.
++    if (info.l_stage == Shader::LogicalStage::Compute && info.pgm_hash == 0x345893a7) {
++        key += "_glass_mip_coords1";
++    }
++    // Only these glass-object programs change their saved live-mask SCC branch.
++    if (info.l_stage == Shader::LogicalStage::Fragment &&
++        (info.pgm_hash == 0x2b085c6c || info.pgm_hash == 0x15f114ff)) {
++        key += "_glass_object_scc1";
++    }
++    // PrimGlassPS changes only its depth-rejection saved-mask scalar branch.
++    if (info.l_stage == Shader::LogicalStage::Fragment && info.pgm_hash == 0x619002ef) {
++        key += "_glass_final_scc1";
+     }
+     return key;
+ }
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,3 +1,4 @@
++#include "occlusion_clear.h"
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -17377,6 +17378,25 @@
+     ResetDreamsA3FocusCaptureIfRequested(
+         cs, scheduler, memory, buffer_cache,
+         {cs_program.dim_x, cs_program.dim_y, cs_program.dim_z});
++    VideoCore::DreamsPartialRawClear::Context partial_clear;
++    const auto previous_partial_clear = VideoCore::DreamsPartialRawClear::current;
++    SCOPE_EXIT { VideoCore::DreamsPartialRawClear::current = previous_partial_clear; };
++    VideoCore::DreamsPartialRawClear::current = nullptr;
++    if (Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
++        cs.pgm_hash == 0x85f67046 && VideoCore::DreamsPartialRawClear::BindingSet(cs.buffers) && cs.images.empty() &&
++        cs.user_data.size() >= 4 && !cs.buffers[0].IsSpecial() &&
++        !cs.buffers[0].is_formatted && cs.buffers[0].is_written &&
++        cs_program.num_thread_x.full == 64 && cs_program.num_thread_y.full == 1 &&
++        cs_program.num_thread_z.full == 1 && cs_program.dim_y == 1 && cs_program.dim_z == 1) {
++        const auto sharp = cs.buffers[0].GetSharp(cs);
++        const u64 bytes = u64(cs.user_data[2])*4;
++        if (sharp.stride == 4 && sharp.GetSize() == bytes && bytes && bytes <= 65536 &&
++            bytes % 8 == 0 && u64(cs_program.dim_x)*64 >= cs.user_data[2] &&
++            memory->IsValidMapping(sharp.base_address,bytes)) {
++            partial_clear = texture_cache.PrepareDreamsPartialRawClear(sharp.base_address,bytes);
++            if (!partial_clear.jobs.empty()) VideoCore::DreamsPartialRawClear::current = &partial_clear;
++        }
++    }
+     if (!BindResources(pipeline)) {
+         return;
+     }
+@@ -21009,6 +21029,36 @@
+         cmdbuf.dispatchBase(dispatch_base_x, 0, 0, dispatch_x, cs_program.dim_y, cs_program.dim_z);
+     } else {
+         cmdbuf.dispatch(dispatch_x, cs_program.dim_y, cs_program.dim_z);
++    }
++    // The full raw clear makes the buffer authoritative for this allocation.
++    // Otherwise Resolve's formatted read imports the previous SH image over
++    // the newly cleared/atomically populated occupancy bits.
++    if (VideoCore::DreamsOcclusionClear::Matches(cs) &&
++        Common::ElfInfo::Instance().GameSerial() == "CUSA04301") {
++        const auto sharp = cs.buffers[0].GetSharp(cs);
++        const u64 bytes = VideoCore::DreamsOcclusionClear::CompleteBytes(sharp,
++            {cs_program.num_thread_x.full, cs_program.num_thread_y.full,
++             cs_program.num_thread_z.full},
++            {dispatch_x, cs_program.dim_y, cs_program.dim_z}, dispatch_base_x);
++        if (bytes && memory->IsValidMapping(sharp.base_address, bytes)) {
++            texture_cache.InvalidateMemoryFromGPU(sharp.base_address, bytes);
++            static std::atomic_flag logged{};
++            if (!logged.test_and_set(std::memory_order_relaxed)) {
++                LOG_INFO(Render_Vulkan,
++                    "Dreams occlusion clear: invalidated stale image aliases at {:#x}, {} bytes",
++                    u64(sharp.base_address), bytes);
++            }
++        }
++    }
++    if (!partial_clear.jobs.empty()) {
++        const bool complete = dispatch_base_x == 0 && u64(dispatch_x)*64 >= cs.user_data[2];
++        if (complete && !buffer_infos.empty() && buffer_infos[0].range != VK_WHOLE_SIZE &&
++            buffer_infos[0].range >= partial_clear.bytes) {
++            texture_cache.ApplyDreamsPartialRawClear(partial_clear,buffer_infos[0].buffer,
++                buffer_infos[0].offset + buffer_infos[0].range - partial_clear.bytes);
++        } else {
++            texture_cache.InvalidateMemoryFromGPU(partial_clear.address,partial_clear.bytes);
++        }
+     }
+     if (dreams_performance_profiler) {
+         dreams_performance_profiler->EndCompute(cmdbuf, compute_profile);
+@@ -27603,8 +27653,14 @@
+                             desc.is_formatted, is_dreams_scene_stream);
+                     }
+                 }
+-                texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size,
+-                                                      is_dreams_scene_stream);
++                const auto* partial = VideoCore::DreamsPartialRawClear::current;
++                if (is_dreams_raw_image_clear && !desc.is_formatted && partial &&
++                    partial->address == vsharp.base_address && partial->bytes == size) {
++                    texture_cache.InvalidateDreamsRawClearExceptPrepared(*partial);
++                } else {
++                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size,
++                                                          is_dreams_scene_stream);
++                }
+             }
+         }
+ 
+--- a/src/video_core/texture_cache/image_info.cpp
++++ b/src/video_core/texture_cache/image_info.cpp
+@@ -295,8 +295,10 @@
+         }
+         }
+         if (props.is_block) {
+-            mip_info.pitch = std::max(mip_info.pitch * 4, 32u);
+-            mip_info.height = std::max(mip_info.height * 4, 32u);
++            // Sizing above used compressed blocks. Convert the actual padded dimensions
++            // back to texels; a linear tail need not be eight block rows high.
++            mip_info.pitch *= 4;
++            mip_info.height *= 4;
+         }
+         mip_info.size *= mip_d * resources.layers;
+         mip_info.offset = guest_size;
+@@ -365,7 +367,9 @@
+ }
+ 
+ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
+-    if (!IsCompatible(info)) {
++    if (mip < 0 || static_cast<u32>(mip) >= info.resources.levels ||
++        resources.levels != 1 || resources.layers == 0 || info.resources.layers == 0 ||
++        !IsCompatible(info)) {
+         return -1;
+     }
+ 
+@@ -388,19 +392,22 @@
+         return -1;
+     }
+ 
+-    // Check for size alignment.
+-    const u32 slice_size = info.mips_layout[mip].size / info.resources.layers;
+-    if (guest_size % slice_size != 0) {
+-        return -1;
+-    }
+-
+-    // Ensure that address is aligned too.
+-    const auto addr_diff = guest_address - (info.guest_address + info.mips_layout[mip].offset);
+-    if ((addr_diff % guest_size) != 0) {
+-        return -1;
+-    }
+-
+-    return addr_diff / guest_size;
++    const auto& parent_mip = info.mips_layout[mip];
++    const u32 slice_size = parent_mip.size / info.resources.layers;
++    if (slice_size == 0 || parent_mip.size % info.resources.layers != 0 ||
++        static_cast<u64>(slice_size) * resources.layers != guest_size) {
++        return -1;
++    }
++    const VAddr mip_base = info.guest_address + parent_mip.offset;
++    if (guest_address < mip_base) {
++        return -1;
++    }
++    const auto addr_diff = guest_address - mip_base;
++    if (addr_diff >= parent_mip.size || addr_diff % slice_size != 0 ||
++        guest_size > parent_mip.size - addr_diff) {
++        return -1;
++    }
++    return static_cast<s32>(addr_diff / slice_size);
+ }
+ 
+ } // namespace VideoCore
+--- /dev/null
++++ b/src/video_core/texture_cache/partial_raw_clear.h
+@@ -0,0 +1,69 @@
++#pragma once
++#include <algorithm>
++#include <vector>
++#include "shader_recompiler/resource.h"
++#include "video_core/texture_cache/image_info.h"
++
++namespace VideoCore::DreamsPartialRawClear {
++template<class Buffers> inline bool BindingSet(const Buffers& buffers) {
++    return buffers.size()==3 && buffers[0].buffer_type==Shader::BufferType::Guest &&
++        buffers[0].is_written && !buffers[0].is_formatted &&
++        buffers[1].buffer_type==Shader::BufferType::Guest &&
++        !buffers[1].is_written && !buffers[1].is_formatted &&
++        buffers[2].buffer_type==Shader::BufferType::Flatbuf && !buffers[2].is_written;
++}
++// This path handles a complete, dword shader clear of an aligned pixel prefix.
++// Unsupported layouts retain the existing synchronization path.
++inline std::vector<vk::BufferImageCopy> Plan(const ImageInfo& info, u64 bytes) {
++    if (!bytes || bytes > 65536 || bytes % 8 || bytes >= info.guest_size ||
++        info.pixel_format != vk::Format::eR16G16B16A16Sfloat || info.num_bits != 64 ||
++        info.num_samples != 1 || info.resources.levels != 1 || info.resources.layers != 1 ||
++        info.size.depth != 1 || info.props.is_volume || info.props.is_block ||
++        info.props.is_depth || info.props.has_stencil || info.alt_tile || info.bank_swizzle ||
++        !info.size.width || !info.size.height) return {};
++    const auto& mip = info.mips_layout[0];
++    if (mip.offset || mip.pitch < info.size.width || mip.height < info.size.height ||
++        mip.size != info.guest_size || u64(mip.pitch)*mip.height*8 != info.guest_size) return {};
++    const bool linear = !info.props.is_tiled &&
++        info.tile_mode == AmdGpu::TileMode::DisplayLinearAligned;
++    const bool macro = info.props.is_tiled && info.tile_mode == AmdGpu::TileMode::Thin2DThin &&
++        info.array_mode == AmdGpu::ArrayMode::Array2DTiledThin1 &&
++        mip.pitch % 128 == 0 && mip.height % 64 == 0;
++    if (!linear && !macro) return {};
++    std::vector<vk::BufferImageCopy> copies;
++    // A 64 KiB prefix occupies only the first 128x64 macrotile for this layout.
++    const u32 width = macro ? std::min(info.size.width,128u) : info.size.width;
++    const u32 height = macro ? std::min(info.size.height,64u) :
++        std::min(info.size.height,u32((bytes/8+mip.pitch-1)/mip.pitch));
++    for(u32 y=0;y<height;++y) for(u32 x=0;x<width;++x) {
++        u64 offset = (u64(y)*mip.pitch+x)*8;
++        if(macro) {
++            const u32 micro=(x&1)|((y&1)<<1)|((x&2)<<1)|((y&2)<<2)|((x&4)<<2)|((y&4)<<3);
++            const u32 pipe=((x>>3 ^ y>>3 ^ x>>4)&1) |
++                (((x>>4 ^ y>>4)&1)<<1) | (((x>>5 ^ y>>5)&1)<<2);
++            const u32 tx=x/64,ty=y/8;
++            const u32 bank=((tx ^ ty>>3)&1) | (((tx>>1 ^ ty>>2 ^ ty>>3)&1)<<1) |
++                (((tx>>2 ^ ty>>1)&1)<<2) | (((tx>>3 ^ ty)&1)<<3);
++            const u32 element=micro*8;
++            offset=(element&255)|(pipe<<8)|(bank<<11)|((element>>8)<<15);
++        }
++        if(offset+8>bytes) continue;
++        if(!copies.empty()) {
++            auto& last=copies.back();
++            if(last.imageOffset.y==s32(y) && last.imageOffset.x+s32(last.imageExtent.width)==s32(x) &&
++                last.bufferOffset+u64(last.imageExtent.width)*8==offset) {
++                ++last.imageExtent.width;continue;
++            }
++        }
++        copies.push_back(vk::BufferImageCopy{
++            .bufferOffset=offset,
++            .imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
++            .imageOffset={s32(x),s32(y),0},.imageExtent={1,1,1}});
++    }
++    return copies;
++}
++struct Job {ImageId id;u64 uid;std::vector<vk::BufferImageCopy> copies;};
++struct Context {VAddr address{};u64 bytes{};std::vector<Job> jobs;};
++inline thread_local const Context* current{};
++inline u64 applied_images{},applied_bytes{},fallback_images{};
++} // namespace VideoCore::DreamsPartialRawClear
+--- a/src/video_core/texture_cache/sampler.cpp
++++ b/src/video_core/texture_cache/sampler.cpp
+@@ -1,3 +1,4 @@
++#line 1 "src/video_core/texture_cache/sampler.cpp"
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -23,6 +23,8 @@
+ #include "video_core/texture_cache/host_compatibility.h"
+ #include "video_core/texture_cache/texture_cache.h"
+ #include "video_core/texture_cache/tile_manager.h"
++#include "video_core/texture_cache/transfer_layout.h"
++#include <vk_mem_alloc.h>
+ 
+ namespace VideoCore {
+ 
+@@ -202,39 +204,69 @@
+         return;
+     }
+     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+-    const u32 linear_size = image.info.pitch * image.info.size.height * image.info.size.depth *
+-                            image.info.resources.layers * (image.info.num_bits / 8);
+-    ASSERT(linear_size <= image.info.guest_size);
+-    const u32 writeback_size = image.info.props.is_tiled ? image.info.guest_size : linear_size;
+-    const auto [download, offset] = download_buffer.Map(writeback_size);
++    const auto& info = image.info;
++    const u32 writeback_size = info.guest_size;
++    const u64 alignment = std::max<u64>(instance.StorageMinAlignment(),
++                                        instance.NonCoherentAtomSize());
++    const u64 reserve_size = Common::AlignUp<u64>(writeback_size, alignment);
++    const auto [download, offset] = download_buffer.Map(reserve_size, alignment);
++    if (!download) {
++        LOG_ERROR(Render_Vulkan, "Image download exceeds staging capacity: {:#x}", writeback_size);
++        return;
++    }
+     download_buffer.Commit();
+-    std::array image_download{vk::BufferImageCopy{
+-        .bufferOffset = 0,
+-        .bufferRowLength = image.info.pitch,
+-        .bufferImageHeight = image.info.size.height,
+-        .imageSubresource =
+-            {
+-                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+-                                                        : vk::ImageAspectFlagBits::eColor,
+-                .mipLevel = 0,
+-                .baseArrayLayer = 0,
+-                .layerCount = image.info.resources.layers,
+-            },
+-        .imageOffset = {0, 0, 0},
+-        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+-    }};
+-    tile_manager.TileImage(image, image_download, download_buffer.Handle(), offset, linear_size);
+-
++
++    // An image does not own row/depth padding. Seed it from CPU backing rather than
++    // copying uninitialized scratch bytes over neighboring guest data. No extra copy
++    // is needed when all bytes belong to visible image blocks.
++    if (ImageHasTransferPadding(info)) {
++        auto* memory = Core::Memory::Instance();
++        if (!memory->TryReadBacking(info.guest_address, download, writeback_size)) {
++          for (u32 pos = 0; pos < writeback_size;) {
++            const u32 bytes = std::min<u32>(writeback_size - pos,
++                4096 - ((info.guest_address + pos) & 4095));
++            if (!memory->TryReadBacking(info.guest_address + pos, download + pos, bytes)) {
++                LOG_ERROR(Render_Vulkan, "Cannot preserve image padding at {:#x}",
++                          info.guest_address + pos);
++                return;
++            }
++            pos += bytes;
++          }
++        }
++        if (!download_buffer.is_coherent) {
++            const auto result = vmaFlushAllocation(instance.GetAllocator(),
++                download_buffer.buffer.allocation, offset, reserve_size);
++            ASSERT(result == VK_SUCCESS);
++        }
++    }
++    std::array<vk::BufferImageCopy, 16> image_download{};
++    for (u32 mip = 0; mip < info.resources.levels; ++mip) {
++        image_download[mip] = MakeImageDownloadCopy(info, mip);
++    }
++    tile_manager.TileImage(image, std::span{image_download}.first(info.resources.levels),
++                           download_buffer.Handle(), offset, writeback_size);
++    const vk::BufferMemoryBarrier2 host_barrier{
++        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
++        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
++        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
++        .buffer = download_buffer.Handle(), .offset = offset, .size = writeback_size,
++    };
++    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++        .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host_barrier,
++    });
++    const auto writeback = [this, device_addr = info.guest_address, download, offset,
++                           writeback_size] {
++        buffer_cache.GetUtilityBuffer(MemoryUsage::Download).InvalidateMappedRange(offset,
++                                                                                   writeback_size);
++        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
++                                                   writeback_size);
++    };
+     if (sync) {
+         scheduler.Finish();
+-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
+-                                                  download, writeback_size);
++        writeback();
+     } else {
+-        scheduler.DeferPriorityOperation(
+-            [this, device_addr = image.info.guest_address, download, writeback_size] {
+-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
+-                                                          writeback_size);
+-            });
++        scheduler.DeferPriorityOperation(writeback);
+     }
+ }
+ 
+@@ -275,7 +307,10 @@
+             continue;
+         }
+         Image& image = slot_images[dump.image_id];
+-        const u64 linear_size = static_cast<u64>(image.info.pitch) * image.info.size.height *
++        const u32 block = image.info.props.is_block ? 4 : 1;
++        const u32 row_length = Common::AlignUp(image.info.pitch, block);
++        const u32 image_height = Common::AlignUp(image.info.size.height, block);
++        const u64 linear_size = static_cast<u64>(row_length / block) * (image_height / block) *
+                                 image.info.size.depth * image.info.resources.layers *
+                                 (image.info.num_bits / 8);
+         if (linear_size == 0 || linear_size > download_buffer.SizeBytes()) {
+@@ -300,8 +335,8 @@
+         download_buffer.Commit();
+         std::array image_download{vk::BufferImageCopy{
+             .bufferOffset = offset,
+-            .bufferRowLength = image.info.pitch,
+-            .bufferImageHeight = image.info.size.height,
++            .bufferRowLength = row_length,
++            .bufferImageHeight = image_height,
+             .imageSubresource =
+                 {
+                     .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+@@ -423,7 +458,7 @@
+     const bool bpp_match = requested_info.num_bits == cache_image.info.num_bits;
+ 
+     // If an image in the cache has less slices we need to expand it
+-    bool recreate = cache_image.info.resources < requested_info.resources;
++    bool recreate = !ContainsResources(cache_image.info.resources, requested_info.resources);
+ 
+     switch (binding) {
+     case BindingType::Texture:
+@@ -457,7 +492,8 @@
+ 
+     if (recreate) {
+         auto new_info = requested_info;
+-        new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
++        ExpandImageResources(new_info, UnionResources(requested_info.resources,
++                                                      cache_image.info.resources));
+         const auto new_image_id =
+             slot_images.insert(instance, scheduler, blit_helper, slot_image_views, new_info);
+         RegisterImage(new_image_id);
+@@ -605,6 +641,16 @@
+             return {ExpandImage(image_info, cache_image_id), -1, -1};
+         }
+ 
++        // Mip and layer capacities are independent. A larger byte allocation or
++        // more mips does not imply that enough array layers are available.
++        if (image_info.type == cache_image.info.type &&
++            !ContainsResources(cache_image.info.resources, image_info.resources)) {
++            auto expanded_info = image_info;
++            ExpandImageResources(expanded_info,
++                UnionResources(image_info.resources, cache_image.info.resources));
++            return {ExpandImage(expanded_info, cache_image_id), -1, -1};
++        }
++
+         // Size and resources are less than or equal, use image view.
+         if (image_info.pixel_format != cache_image.info.pixel_format ||
+             image_info.guest_size <= cache_image.info.guest_size) {
+@@ -613,12 +659,6 @@
+             const bool is_compatible =
+                 IsVulkanFormatCompatible(result_image.info.pixel_format, image_info.pixel_format);
+             return {is_compatible ? result_id : ImageId{}, -1, -1};
+-        }
+-
+-        // Size and resources are greater, expand the image.
+-        if (image_info.type == cache_image.info.type &&
+-            image_info.resources > cache_image.info.resources) {
+-            return {ExpandImage(image_info, cache_image_id), -1, -1};
+         }
+ 
+         // Size is greater but resources are not, because the tiling mode is different.
+@@ -718,7 +758,7 @@
+                   (image_info.num_bits == cache_image.info.num_bits),
+                   (image_info.BlockDim() == cache_image.info.BlockDim()),
+                   (image_info.pitch == cache_image.info.pitch),
+-                  (cache_image.info.resources <= image_info.resources),
++                  ContainsResources(image_info.resources, cache_image.info.resources),
+                   cache_image.info.resources.levels, image_info.resources.levels,
+                   (cache_image.info.guest_size <= image_info.guest_size), expected_size,
+ 
+@@ -828,6 +868,9 @@
+         if (cache_image.info.size != info.size) {
+             continue;
+         }
++        if (!ContainsResources(cache_image.info.resources, info.resources)) {
++            continue;
++        }
+         if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+             (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+             continue;
+@@ -862,7 +905,8 @@
+         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
+             // Cannot reuse this image as we need the exact requested format.
+             image_id = {};
+-        } else if (image_resolved.info.resources < info.resources) {
++        } else if (!ContainsResourceRange(image_resolved.info.resources, info.resources,
++                                           std::max(view_mip, 0), std::max(view_slice, 0))) {
+             // The image was clearly picked up wrong.
+             FreeImage(image_id);
+             image_id = {};
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -19,6 +19,8 @@
+ #include "video_core/multi_level_page_table.h"
+ #include "video_core/texture_cache/blit_helper.h"
+ #include "video_core/texture_cache/image.h"
++#include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "partial_raw_clear.h"
+ #include "video_core/texture_cache/image_view.h"
+ #include "video_core/texture_cache/sampler.h"
+ #include "video_core/texture_cache/tile_manager.h"
+@@ -120,6 +122,71 @@
+ 
+     /// Retrieves image whose address matches provided
+     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
++
++    DreamsPartialRawClear::Context PrepareDreamsPartialRawClear(VAddr address,u64 bytes) {
++        DreamsPartialRawClear::Context context{address,bytes,{}};
++        if(!address || address>~VAddr{0}-bytes) return context;
++        std::scoped_lock lock{mutex};
++        ForEachImageInRegion(address,1,[&](ImageId id,Image& image) {
++            if(image.info.guest_address!=address || !image.SafeToDownload() ||
++                image.backing->num_samples!=1) return;
++            auto copies=DreamsPartialRawClear::Plan(image.info,bytes);
++            if(!copies.empty()) context.jobs.push_back({id,image.image_uid,std::move(copies)});
++        });
++        return context;
++    }
++    void InvalidateDreamsRawClearExceptPrepared(const DreamsPartialRawClear::Context& context) {
++        std::scoped_lock lock{mutex};
++        ForEachImageInRegion(context.address,1,[&](ImageId id,Image& image) {
++            if(image.info.guest_address!=context.address) return;
++            for(const auto& job:context.jobs) if(job.id==id && job.uid==image.image_uid) return;
++            image.flags |= ImageFlagBits::GpuDirty;
++        });
++    }
++    void ApplyDreamsPartialRawClear(const DreamsPartialRawClear::Context& context,
++        vk::Buffer source,u64 source_offset) {
++        std::scoped_lock lock{mutex};
++        scheduler.EndRendering();
++        auto command=scheduler.CommandBuffer();
++        const vk::BufferMemoryBarrier2 before{
++            .srcStageMask=vk::PipelineStageFlagBits2::eAllCommands,
++            .srcAccessMask=vk::AccessFlagBits2::eMemoryWrite,
++            .dstStageMask=vk::PipelineStageFlagBits2::eCopy,
++            .dstAccessMask=vk::AccessFlagBits2::eTransferRead,
++            .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
++            .buffer=source,.offset=source_offset,.size=context.bytes};
++        command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount=1,.pBufferMemoryBarriers=&before});
++        // Re-enumeration checks live image identity rather than dereferencing a retired slot.
++        ForEachImageInRegion(context.address,1,[&](ImageId id,Image& image) {
++            for(const auto& job:context.jobs) {
++                if(job.id!=id || job.uid!=image.image_uid) continue;
++                if(!image.SafeToDownload() || image.backing->num_samples!=1) {
++                    image.flags |= ImageFlagBits::GpuDirty;
++                    ++DreamsPartialRawClear::fallback_images;return;
++                }
++                auto copies=job.copies;
++                for(auto& copy:copies) copy.bufferOffset+=source_offset;
++                image.Transit(vk::ImageLayout::eTransferDstOptimal,vk::AccessFlagBits2::eTransferWrite,{});
++                command.copyBufferToImage(source,image.GetImage(),vk::ImageLayout::eTransferDstOptimal,copies);
++                image.Transit(vk::ImageLayout::eGeneral,
++                    vk::AccessFlagBits2::eShaderRead|vk::AccessFlagBits2::eTransferRead,{});
++                ++DreamsPartialRawClear::applied_images;
++                DreamsPartialRawClear::applied_bytes+=context.bytes;
++                if(DreamsPartialRawClear::applied_images<=8) LOG_WARNING(Render_Vulkan,
++                    "Dreams bounded partial clear: image={} bytes={} regions={} total={}",
++                    image.image_uid,context.bytes,copies.size(),DreamsPartialRawClear::applied_images);
++                return;
++            }
++        });
++        const vk::BufferMemoryBarrier2 after{
++            .srcStageMask=vk::PipelineStageFlagBits2::eCopy,
++            .srcAccessMask=vk::AccessFlagBits2::eTransferRead,
++            .dstStageMask=vk::PipelineStageFlagBits2::eAllCommands,
++            .dstAccessMask=vk::AccessFlagBits2::eMemoryRead|vk::AccessFlagBits2::eMemoryWrite,
++            .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
++            .buffer=source,.offset=source_offset,.size=context.bytes};
++        command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount=1,.pBufferMemoryBarriers=&after});
++    }
+ 
+     /// Retrieves an image view with the properties of the specified image id.
+     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+--- a/src/video_core/texture_cache/tile_manager.cpp
++++ b/src/video_core/texture_cache/tile_manager.cpp
+@@ -10,6 +10,7 @@
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+ #include "video_core/texture_cache/image.h"
+ #include "video_core/texture_cache/image_info.h"
++#include "video_core/texture_cache/transfer_layout.h"
+ #include "video_core/texture_cache/image_view.h"
+ #include "video_core/texture_cache/tile_manager.h"
+ 
+@@ -28,13 +29,7 @@
+     return enabled && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
+ }
+ 
+-struct TilingInfo {
+-    u32 bank_swizzle;
+-    u32 num_slices;
+-    u32 num_mips;
+-    u32 num_texels;
+-    std::array<ImageInfo::MipInfo, 16> mips;
+-};
++
+ 
+ TileManager::TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+                          StreamBuffer& stream_buffer_)
+@@ -185,20 +180,7 @@
+         return {in_buffer, in_offset};
+     }
+ 
+-    TilingInfo params{};
+-    params.bank_swizzle = info.bank_swizzle;
+-    params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
+-    params.num_mips = info.resources.levels;
+-    const u32 bytes_per_texel = info.num_bits / 8;
+-    for (u32 mip = 0; mip < params.num_mips; ++mip) {
+-        auto& mip_info = params.mips[mip];
+-        mip_info = info.mips_layout[mip];
+-        params.num_texels += mip_info.size / bytes_per_texel;
+-        if (info.props.is_block) {
+-            mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
+-            mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
+-        }
+-    }
++    const TilingInfo params = MakeTilingInfo(info, info.resources.levels);
+ 
+     const vk::DescriptorBufferInfo params_buffer_info{
+         .buffer = stream_buffer.Handle(),
+@@ -272,22 +254,15 @@
+         return;
+     }
+ 
+-    TilingInfo params{};
+-    params.bank_swizzle = info.bank_swizzle;
+-    params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
+-    params.num_mips = static_cast<u32>(buffer_copies.size());
+-    const u32 bytes_per_texel = info.num_bits / 8;
+-    u32 mip_texels{};
++    const TilingInfo params = MakeTilingInfo(info, static_cast<u32>(buffer_copies.size()));
++    ASSERT(copy_size == params.num_texels * (info.num_bits / 8));
+     for (u32 mip = 0; mip < params.num_mips; ++mip) {
+-        auto& mip_info = params.mips[mip];
+-        mip_info = info.mips_layout[mip];
+-        mip_texels += mip_info.size / bytes_per_texel;
+-        if (info.props.is_block) {
+-            mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
+-            mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
+-        }
+-    }
+-    params.num_texels = std::min(copy_size / bytes_per_texel, mip_texels);
++        const auto& copy = buffer_copies[mip];
++        ASSERT(copy.imageSubresource.mipLevel == mip &&
++               copy.imageSubresource.baseArrayLayer == 0 &&
++               copy.imageSubresource.layerCount == info.resources.layers &&
++               copy.bufferOffset == info.mips_layout[mip].offset);
++    }
+ 
+     const vk::DescriptorBufferInfo params_buffer_info{
+         .buffer = stream_buffer.Handle(),
+@@ -295,7 +270,7 @@
+         .range = sizeof(params),
+     };
+ 
+-    const auto [temp_buffer, temp_allocation] = GetScratchBuffer(info.guest_size);
++    const auto [temp_buffer, temp_allocation] = GetScratchBuffer(copy_size);
+     scheduler.DeferOperation([this, temp_buffer, temp_allocation]() {
+         vmaDestroyBuffer(instance.GetAllocator(), temp_buffer, temp_allocation);
+     });
+@@ -308,13 +283,13 @@
+     const vk::DescriptorBufferInfo tiled_buffer_info{
+         .buffer = out_buffer,
+         .offset = out_offset,
+-        .range = info.guest_size,
++        .range = copy_size,
+     };
+ 
+     const vk::DescriptorBufferInfo linear_buffer_info{
+         .buffer = temp_buffer,
+         .offset = 0,
+-        .range = info.guest_size,
++        .range = copy_size,
+     };
+ 
+     const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+--- /dev/null
++++ b/src/video_core/texture_cache/transfer_layout.h
+@@ -0,0 +1,132 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++
++#include <algorithm>
++#include <bit>
++#include <limits>
++#include "video_core/texture_cache/image_info.h"
++#include "video_core/texture_cache/tile.h"
++
++namespace VideoCore {
++
++constexpr bool ContainsResources(SubresourceExtent available, SubresourceExtent requested) {
++    return available.levels >= requested.levels && available.layers >= requested.layers;
++}
++
++constexpr bool ContainsResourceRange(SubresourceExtent available, SubresourceExtent requested,
++                                     u32 mip, u32 layer) {
++    return mip <= available.levels && requested.levels <= available.levels - mip &&
++           layer <= available.layers && requested.layers <= available.layers - layer;
++}
++
++constexpr SubresourceExtent UnionResources(SubresourceExtent a, SubresourceExtent b) {
++    return {std::max(a.levels, b.levels), std::max(a.layers, b.layers)};
++}
++
++inline void ExpandImageResources(ImageInfo& info, SubresourceExtent resources) {
++    if (info.resources == resources) {
++        return;
++    }
++    ASSERT(ContainsResources(resources, info.resources));
++    const auto old_resources = info.resources;
++    ASSERT(old_resources.levels > 0 && old_resources.layers > 0 && resources.levels <= 16);
++    std::array<ImageInfo::MipInfo, 16> old_layout{};
++    std::copy_n(info.mips_layout.begin(), old_resources.levels, old_layout.begin());
++    info.resources = resources;
++    info.UpdateSize();
++    u64 offset = 0;
++    for (u32 mip = 0; mip < resources.levels; ++mip) {
++        auto& layout = info.mips_layout[mip];
++        if (mip < old_resources.levels) {
++            // Render/depth targets can specify a larger stored slice than their visible
++            // dimensions. Preserve that existing stride when adding mips or layers.
++            layout = old_layout[mip];
++            ASSERT(layout.size % old_resources.layers == 0);
++            const u64 bytes = static_cast<u64>(layout.size / old_resources.layers) * resources.layers;
++            ASSERT(bytes <= std::numeric_limits<u32>::max());
++            layout.size = static_cast<u32>(bytes);
++        }
++        ASSERT(offset + layout.size <= std::numeric_limits<u32>::max());
++        layout.offset = static_cast<u32>(offset);
++        offset += layout.size;
++    }
++    info.guest_size = static_cast<u32>(offset);
++}
++
++struct TilingInfo {
++    u32 bank_swizzle{};
++    u32 micro_tiled_mips{};
++    u32 num_mips{};
++    u32 num_texels{};
++    std::array<ImageInfo::MipInfo, 16> mips{};
++    std::array<std::array<u32, 4>, 16> valid_extent{};
++};
++static_assert(sizeof(TilingInfo) == 528);
++static_assert(offsetof(TilingInfo, valid_extent) == 272);
++
++inline TilingInfo MakeTilingInfo(const ImageInfo& info, u32 levels) {
++    ASSERT(levels > 0 && levels <= info.resources.levels && levels <= 16);
++    TilingInfo params{};
++    params.bank_swizzle = info.bank_swizzle;
++    params.num_mips = levels;
++    const u32 block = info.props.is_block ? 4 : 1;
++    for (u32 mip = 0; mip < levels; ++mip) {
++        params.mips[mip] = info.mips_layout[mip];
++        auto& layout = params.mips[mip];
++        params.num_texels += layout.size / (info.num_bits / 8);
++        layout.pitch /= block;
++        layout.height /= block;
++        params.valid_extent[mip] = {
++            (std::max(info.size.width >> mip, 1u) + block - 1) / block,
++            (std::max(info.size.height >> mip, 1u) + block - 1) / block,
++            std::max(info.size.depth >> mip, 1u) * info.resources.layers, 0};
++        if (mip > 0 && AmdGpu::IsMacroTiled(info.array_mode)) {
++            // Match the unaligned dimensions passed by ImageInfo::UpdateSize.
++            u32 width = std::max((info.pitch >> mip) + block - 1, block) / block;
++            u32 height = std::max((info.size.height >> mip) + block - 1, block) / block;
++            if (info.props.is_pow2) {
++                width = std::bit_ceil(width);
++                height = std::bit_ceil(height);
++            }
++            const auto [tile_width, tile_height] =
++                GetMacroTileExtents(info.tile_mode, info.num_bits, info.num_samples, info.alt_tile);
++            if (width < tile_width || height < tile_height) {
++                params.micro_tiled_mips |= 1u << mip;
++            }
++        }
++    }
++    return params;
++}
++
++inline vk::BufferImageCopy MakeImageDownloadCopy(const ImageInfo& info, u32 mip) {
++    const auto& layout = info.mips_layout[mip];
++    return {
++        .bufferOffset = layout.offset,
++        .bufferRowLength = layout.pitch,
++        .bufferImageHeight = layout.height,
++        .imageSubresource = {
++            .aspectMask = info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
++                                             : vk::ImageAspectFlagBits::eColor,
++            .mipLevel = mip, .baseArrayLayer = 0, .layerCount = info.resources.layers,
++        },
++        .imageOffset = {0, 0, 0},
++        .imageExtent = {std::max(info.size.width >> mip, 1u),
++                        std::max(info.size.height >> mip, 1u),
++                        std::max(info.size.depth >> mip, 1u)},
++    };
++}
++
++inline bool ImageHasTransferPadding(const ImageInfo& info) {
++    const auto params = MakeTilingInfo(info, info.resources.levels);
++    for (u32 mip = 0; mip < params.num_mips; ++mip) {
++        const auto& valid = params.valid_extent[mip];
++        const auto& layout = params.mips[mip];
++        const u64 visible_bytes = static_cast<u64>(valid[0]) * valid[1] * valid[2] * (info.num_bits / 8);
++        if (layout.pitch != valid[0] || layout.height != valid[1] || layout.size != visible_bytes) {
++            return true;
++        }
++    }
++    return false;
++}
++} // namespace VideoCore

@@ -1,3 +1,11 @@
+# October 25 current main update
+
+The [clean main build](CLEAN_MAIN_BUILD_20261025.md) is published with the normal graphical launcher and automatic settings. It contains the guarded ambient-shadow cache correction, identical to the private live-tested implementation, plus the retained texture/mip and rendering fixes. The owner confirmed restored board colours in Tren. Custom debug tools, Builder Bridge, saves and creations are excluded.
+
+Very small shadows disappearing at some angles are now reported and remain uninvestigated. Remaining lag and intermittent rendering glitches are not claimed fixed. The clean binary has startup/package checks and identical fix code, not a separate full gameplay regression run. See the current update record for scope and source.
+
+## Historical status records
+
 # October 16 occlusion update
 
 The [owner-tested occlusion build](OCCLUSION_FIX_20261016.md) is now the front-page download. It is the exact EXE used in the affected creation: the owner reported the corner corruption gone, and the corrected dynamic mip sampling was verified in the active shader. It retains the preceding performance/shape branch. The 65-case compiler test and source/package verification pass. Other scenes/GPUs, performance impact and changed bound-view mip counts remain unverified. This does not merge the separate October 6 branch.
