@@ -19,8 +19,6 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 - Rendering, shader and texture fixes, including the correction for overly dark ambient shadows.
 - The graphical launcher and an optional tutorial-skip tool.
 
-No game files, user saves, Builder Bridge or custom debug tools are included.
-
 ## Known issues
 
 This is experimental. Lag, intermittent black patches/white flashes, and small shadows that disappear at some angles remain unresolved. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64; other GPUs and versions are unverified.

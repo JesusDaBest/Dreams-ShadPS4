@@ -2,16 +2,16 @@
 
 **[Download the graphical launcher package](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-clean-main-20261025/Dreams-graphical-launcher-20261025.zip)**
 
-Extract the complete ZIP, open **shadPS4QtLauncher.exe**, add your own Dreams game folder and click **Play**. The October 25 core and matching settings are selected automatically, as in the October 21 update. No command prompt, CMD, PowerShell, Python, Codex or Builder Bridge is required to play. Keep the extracted folder together; your own game/system setup is required.
+Extract the complete ZIP, open **shadPS4QtLauncher.exe**, add your own Dreams game folder and click **Play**. The October 25 core and matching settings are selected automatically, as in the October 21 update. No command prompt is needed. Keep the extracted folder together; your own game/system setup is required.
 
-This is the exact executable now selected by the author's main launcher:
+Core executable SHA-256:
 `35cb8a3c407cb3b15b4e1fe05c10e127338ab4dd21aa251fc7ad0365cce7c921`.
 
 ## What changed
 
 Dreams reused an allocation for geometry occupancy after it had held a lighting image. The emulator could copy that stale image back over the cleared and updated geometry bits. The resulting false occupancy blocked ambient light and made the tested Tren board almost black. A guarded correction invalidates the old image aliases after the verified complete raw clear, so later reads retain the new geometry data. It does not increase brightness or reduce a global shadow-strength setting.
 
-This update also includes the retained October 23 texture-size, mip-layout, bounded raw-clear and shader corrections. Compared with that clean pre-debug build, only the rasterizer object changes for the new ambient-shadow correction. The custom right-click debug menu, live signal/resource capture tools and debug-control endpoint are excluded. Builder Bridge and its installers are excluded. Background control and runtime recorders are disabled; ordinary emulator diagnostics and earlier dormant diagnostic code remain in the core.
+This update also includes the retained October 23 texture-size, mip-layout, bounded raw-clear and shader corrections. Compared with that clean pre-debug build, only the rasterizer object changes for the new ambient-shadow correction. The custom right-click debug menu, live signal/resource capture tools and debug-control endpoint are excluded. Background control and runtime recorders are disabled; ordinary emulator diagnostics and earlier dormant diagnostic code remain in the core.
 
 ## Validation and limitations
 
@@ -35,4 +35,4 @@ The optional **tutorial-skip/Skip Dreams Tutorial.exe** provides a graphical ver
 - [Source manifest](builds/cusa04301-clean-main-20261025/source-manifest.json) and [source delta from October 21](patches/dreams-clean-main-20261025.patch). Start from public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d` and apply the manifest's patches in order. The previous 970 source-file hashes and 44 selected source/header overlays were checked, and the new patch applies cleanly. Machine-local `#line` filenames are made project-relative. A full fresh source rebuild is not claimed.
 - The unchanged Qt launcher/runtime is taken from the verified October 21 package. Its [corresponding launcher source](builds/cusa04301-image-cache-20261021/qt-launcher-source-99e9829.tar.gz) and existing third-party notices/licenses remain applicable. The updated [settings adapter](builds/cusa04301-clean-main-20261025/DreamsCore.cs) and [optional tutorial helper](builds/cusa04301-clean-main-20261025/SkipDreamsTutorial.cs) are included as source.
 
-Every ZIP member was allowlisted, hashed and checked. Publication does not restart the author's running game or modify their profile, saves or preserved Builder Bridge.
+Every ZIP member was allowlisted, hashed and checked.

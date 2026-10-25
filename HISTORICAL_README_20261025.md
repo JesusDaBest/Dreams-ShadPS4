@@ -18,7 +18,7 @@ October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
 Extract the ZIP, open **shadPS4QtLauncher.exe**, add your own Dreams game folder and click **Play**. The exact current main core (`35cb8a3c`) and matching settings are selected automatically, just like the previous graphical updates. No command prompt or command scripts are needed.
 
-Includes the ambient-shadow cache correction and retained texture/mip, shader and rendering fixes. **Custom debug tools and Builder Bridge are excluded**, along with all user saves and creations. An optional graphical tutorial bypass is included. The tested Tren board's colours returned; small or angle-dependent shadows and remaining lag/rendering glitches are still unresolved. [Changes, validation, source and known issues](CLEAN_MAIN_BUILD_20261025.md).
+Includes the ambient-shadow cache correction and retained texture/mip, shader and rendering fixes. An optional graphical tutorial bypass is included. The tested Tren board's colours returned; small or angle-dependent shadows and remaining lag/rendering glitches are still unresolved. [Changes, validation, source and known issues](CLEAN_MAIN_BUILD_20261025.md).
 
 Previous October 21 graphical package:
 
