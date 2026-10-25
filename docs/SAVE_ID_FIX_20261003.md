@@ -4,7 +4,7 @@
 
 The checkpoint's `sceRandomGetRandomNumber` generates bytes using `std::rand()`. In the Windows compiler runtime tested here, separate fresh processes return the same default stream, and eight newly created threads independently return that same stream. Random device creation elsewhere can also reseed the host rand stream. Dreams imports this API. The previously preserved metadata contained different creations sharing version ID `vd66ce184be2329`.
 
-[host-entropy-random-20261003.patch](patches/host-entropy-random-20261003.patch) replaces this API's rand stream with `std::random_device` and a byte distribution. Calls are serialized, output is staged before copying to the guest, invalid nonzero null requests are rejected, and provider exceptions return the API's fatal error. This does not change every random device implementation in the emulator. Entropy-provider behavior was tested on the Windows build only; no cross-platform entropy guarantee is claimed.
+[host-entropy-random-20261003.patch](../patches/host-entropy-random-20261003.patch) replaces this API's rand stream with `std::random_device` and a byte distribution. Calls are serialized, output is staged before copying to the guest, invalid nonzero null requests are rejected, and provider exceptions return the API's fatal error. This does not change every random device implementation in the emulator. Entropy-provider behavior was tested on the Windows build only; no cross-platform entropy guarantee is claimed.
 
 ## Validation
 

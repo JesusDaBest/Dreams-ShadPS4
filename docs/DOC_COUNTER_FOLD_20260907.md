@@ -46,7 +46,7 @@ the experimental DOC path disabled. No gameplay or full-performance improvement
 is verified. The installed best emulator remains unchanged, SHA256
 `183D9914A395D8AD804428B418E13474D71172A6146386DD9E7D159F26AE14CC`.
 
-- [Standalone production patch](patches/generic-shift-constant-fold-20260907.patch)
+- [Standalone production patch](../patches/generic-shift-constant-fold-20260907.patch)
 - GPU tests and provenance (`D:/CodexData/Workspaces/2026-09-04/usi/work/doc-shared-gpu/README.md`; local evidence)
 - Actual compiler replay (`D:/CodexData/Workspaces/2026-09-04/usi/work/doc-input-capture/README.md`; local evidence)
 - [Previous milestone](DOC_GDS_READS_20260907.md)

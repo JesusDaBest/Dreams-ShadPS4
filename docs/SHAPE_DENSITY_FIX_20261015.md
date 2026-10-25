@@ -40,15 +40,15 @@ existing path. This compiler correction is separate from ordered-count implement
 - The publication checks verify the EXE hash and source-patch reconstruction. They are not a
   fresh in-game test or a general compatibility certification.
 
-[Validation record](builds/cusa04301-shape-density-fix-20261015/validation.json) · [EXE checksum](builds/cusa04301-shape-density-fix-20261015/SHA256SUMS.txt) ·
-[Publication checks](builds/cusa04301-shape-density-fix-20261015/publication-check.json)
+[Validation record](../builds/cusa04301-shape-density-fix-20261015/validation.json) · [EXE checksum](../builds/cusa04301-shape-density-fix-20261015/SHA256SUMS.txt) ·
+[Publication checks](../builds/cusa04301-shape-density-fix-20261015/publication-check.json)
 
 ## Source
 
-- [Focused compiler correction](patches/dreams-shape-density-inline-tables-20261015.patch)
-- [Matching project-source delta](patches/dreams-source-delta-20261015-shape-density.patch)
-- [Project-source hash manifest](builds/cusa04301-shape-density-fix-20261015/source-manifest.json)
-- [Sources for the embedded optional experiment](builds/cusa04301-shape-density-fix-20261015/source-support)
+- [Focused compiler correction](../patches/dreams-shape-density-inline-tables-20261015.patch)
+- [Matching project-source delta](../patches/dreams-source-delta-20261015-shape-density.patch)
+- [Project-source hash manifest](../builds/cusa04301-shape-density-fix-20261015/source-manifest.json)
+- [Sources for the embedded optional experiment](../builds/cusa04301-shape-density-fix-20261015/source-support)
 
 The focused patch changes only `resource_tracking_pass.cpp`. The matching source delta also
 contains the pre-existing fixes and diagnostic code compiled into the tested executable.
@@ -76,5 +76,5 @@ Use the upstream Windows compiler/dependency prerequisites. The tested private b
 Clang-CL, Ninja and Release configuration, with local Abseil and fmt source overrides.
 The patch reconstruction has been checked; a fresh dependency download and full rebuild were
 not repeated for publication. Independent toolchains may produce different EXE hashes.
-The emulator retains its GPL-2.0-or-later licensing; see [LICENSE](builds/cusa04301-shape-density-fix-20261015/LICENSE).
+The emulator retains its GPL-2.0-or-later licensing; see [LICENSE](../builds/cusa04301-shape-density-fix-20261015/LICENSE).
 Game data, saves, private configuration and raw game shader captures are excluded.

@@ -20,7 +20,7 @@ Launch with the Dreams `eboot.bin` as the sole argument and use the normal runti
 The matching source state is preserved by
 [`patches/dreams-focused-20260829-full-covered-filled.patch`](../../patches/dreams-focused-20260829-full-covered-filled.patch),
 based on upstream shadPS4 commit `555c458c9fdd33cb4686492374519c7bb112a891`. Apply the
-separate Sirit patch documented in [DEVELOPMENT.md](../../DEVELOPMENT.md) before building. Do not
+separate Sirit patch documented in [DEVELOPMENT.md](../../docs/DEVELOPMENT.md) before building. Do not
 replace this executable with later experiments unless they are separately validated.
 
 ![Validated full-covered/full-filled cube](validated-full-covered-filled.png)

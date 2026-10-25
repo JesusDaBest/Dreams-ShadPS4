@@ -1,6 +1,6 @@
 # October 25 current main update
 
-The [clean main build](CLEAN_MAIN_BUILD_20261025.md) is published with the normal graphical launcher and automatic settings. It contains the guarded ambient-shadow cache correction, identical to the private live-tested implementation, plus the retained texture/mip and rendering fixes. The owner confirmed restored board colours in Tren. Custom debug tools, Builder Bridge, saves and creations are excluded.
+The [clean main build](../CLEAN_MAIN_BUILD_20261025.md) is published with the normal graphical launcher and automatic settings. It contains the guarded ambient-shadow cache correction, identical to the private live-tested implementation, plus the retained texture/mip and rendering fixes. The owner confirmed restored board colours in Tren. Custom debug tools, Builder Bridge, saves and creations are excluded.
 
 Very small shadows disappearing at some angles are now reported and remain uninvestigated. Remaining lag and intermittent rendering glitches are not claimed fixed. The clean binary has startup/package checks and identical fix code, not a separate full gameplay regression run. See the current update record for scope and source.
 
@@ -25,7 +25,7 @@ The user validated the [tweak-menu blur correction](TWEAK_MENU_BLUR_FIX_20261006
 
 # Status — October 4, 2026
 
-The earlier alignment [tested executable](builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe) contains the user-confirmed sculpt alignment correction and the earlier imp/tweak-menu cache correction.
+The earlier alignment [tested executable](../builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe) contains the user-confirmed sculpt alignment correction and the earlier imp/tweak-menu cache correction.
 
 - The user confirmed that the cube now looks like an actual cube.
 - Live GPU captures show the cube/floor tiled normal seams removed.
@@ -38,13 +38,13 @@ Other sculpt shapes, severe sculpt-editing lag, distance-dependent tweak-menu co
 
 ## New selector reset and paint rendering update
 
-The [latest executable](builds/cusa04301-selector-reset-fix-20261004/shadps4.exe) also preserves the real counter reset and selector compaction dispatches. The user confirmed paint strokes now render and the severe pause/unpause lag stopped. Before the correction, the affected pass jumped from 3,585 to 525,193 instances and took about 1.6–1.8 seconds. After correction, captured lists had 56 and 41 valid, distinct IDs with zero invalid IDs. See [validation and limitations](SELECTOR_RESET_FIX_20261004.md).
+The [latest executable](../builds/cusa04301-selector-reset-fix-20261004/shadps4.exe) also preserves the real counter reset and selector compaction dispatches. The user confirmed paint strokes now render and the severe pause/unpause lag stopped. Before the correction, the affected pass jumped from 3,585 to 525,193 instances and took about 1.6–1.8 seconds. After correction, captured lists had 56 and 41 valid, distinct IDs with zero invalid IDs. See [validation and limitations](SELECTOR_RESET_FIX_20261004.md).
 
 SHA-256: `DA5B2166B8245803E6D8F2BE4FC082B0CAB33E5D5366CE904118028BAB98C79C`. Other sculpt defects and low frame rates remain unresolved.
 
-![New Dreams paint-mode screenshot after selector reset correction](builds/cusa04301-selector-reset-fix-20261004/current-dreams-paint-mode.jpg)
+![New Dreams paint-mode screenshot after selector reset correction](../builds/cusa04301-selector-reset-fix-20261004/current-dreams-paint-mode.jpg)
 
-The earlier cube screenshot is retained in the [front-page status section](README.md#current-in-game-screenshot).
+The earlier cube screenshot is retained in the [archived screenshot](HISTORICAL_README_20261025.md#earlier-october-4-in-game-screenshot).
 
 ## Historical status records
 

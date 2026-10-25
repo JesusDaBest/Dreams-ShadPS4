@@ -8,10 +8,10 @@ The source compiled and linked successfully with a single build worker. Inspecti
 
 ## Download
 
-- [Exact tested executable](builds/cusa04301-tweak-menu-blur-fix-20261006/shadps4.exe)
-- [Validation](builds/cusa04301-tweak-menu-blur-fix-20261006/validation.json) and [SHA-256](builds/cusa04301-tweak-menu-blur-fix-20261006/SHA256SUMS.txt)
-- [Focused source patch](patches/dreams-tweak-menu-blur-fix-20261006.patch)
-- [Cumulative main-source diagnostic snapshot](patches/dreams-diagnostic-source-20261006-tweak-menu-blur.patch)
+- [Exact tested executable](../builds/cusa04301-tweak-menu-blur-fix-20261006/shadps4.exe)
+- [Validation](../builds/cusa04301-tweak-menu-blur-fix-20261006/validation.json) and [SHA-256](../builds/cusa04301-tweak-menu-blur-fix-20261006/SHA256SUMS.txt)
+- [Focused source patch](../patches/dreams-tweak-menu-blur-fix-20261006.patch)
+- [Cumulative main-source diagnostic snapshot](../patches/dreams-diagnostic-source-20261006-tweak-menu-blur.patch)
 
 Download the EXE and use it with your existing launcher/runtime dependencies and Precise GPU readbacks. The tweak-menu correction is enabled automatically; no activation script or environment setting is required. No game files or raw proprietary shader dumps are included.
 

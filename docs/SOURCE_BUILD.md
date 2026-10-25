@@ -2,7 +2,7 @@
 
 ## Current October 25 build
 
-Use the [October 25 source manifest](builds/cusa04301-clean-main-20261025/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply the listed patches in order through `dreams-clean-main-20261025.patch`. The source overlays and patch application were verified; full fresh-build reproducibility has not been established. Do not combine this recipe with the separate older October 4/6 diagnostic stack below. See [the update record](CLEAN_MAIN_BUILD_20261025.md#source-and-packaging-evidence) for provenance and validation limits.
+Use the [October 25 source manifest](../builds/cusa04301-clean-main-20261025/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply the listed patches in order through `dreams-clean-main-20261025.patch`. The source overlays and patch application were verified; full fresh-build reproducibility has not been established. Do not combine this recipe with the separate older October 4/6 diagnostic stack below. See [the update record](../CLEAN_MAIN_BUILD_20261025.md#source-and-packaging-evidence) for provenance and validation limits.
 
 ## Earlier source instructions
 
@@ -69,7 +69,7 @@ Select your newly compiled executable in your launcher, set Dreams readbacks to 
 
 ## Optional October 2 save-handling delta
 
-The running local executable identified on October 3 hashes to `DFC6AD73E02CABEEC01DDA48016CAE291ACA40D7C23444BCAA47F4BFFF033E90`. An identical build artifact exists beside the October 2 source. That source's committed tree equals the published August 29 source tree; its only tracked local changes are the two save-handling files exported in [save-mount-lifecycle-20261002.patch](patches/save-mount-lifecycle-20261002.patch).
+The running local executable identified on October 3 hashes to `DFC6AD73E02CABEEC01DDA48016CAE291ACA40D7C23444BCAA47F4BFFF033E90`. An identical build artifact exists beside the October 2 source. That source's committed tree equals the published August 29 source tree; its only tracked local changes are the two save-handling files exported in [save-mount-lifecycle-20261002.patch](../patches/save-mount-lifecycle-20261002.patch).
 
 This delta serializes mount-slot access, checks duplicate saves across all slots with user/title identity, and avoids a fatal assertion when unmounting an inactive instance. It is separate from the rendering corrections and is not a demonstrated remedy for the 2.65 black screen. It passed patch-application and source-equivalence checks here; no new concurrency/save regression or game test was run during this audit.
 

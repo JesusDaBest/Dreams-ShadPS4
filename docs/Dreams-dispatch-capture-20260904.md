@@ -53,7 +53,7 @@ The shader key and shader hashes were absent as searched literals in both execut
 
 ## Evidence
 
-- [Structured launch facts and run details](Dreams-dispatch-capture-20260904.json)
-- [Compact evidence bundle](Dreams-dispatch-evidence-20260904.zip)
+- [Structured launch facts and run details](evidence/Dreams-dispatch-capture-20260904.json)
+- [Compact evidence bundle](evidence/Dreams-dispatch-evidence-20260904.zip)
 
 Workspace reproduction: `work/run-dispatch-capture.ps1 -Seconds 30` uses the isolated diagnostic runtime; `work/analyze-dispatch-capture.py` parses and checks the target capture. Source diagnostics are in `work/upstream-review/src/video_core/renderer_vulkan/vk_rasterizer.cpp` and `vk_pipeline_cache.cpp`. These remain local, unsubmitted changes.

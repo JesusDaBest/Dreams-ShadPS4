@@ -1,12 +1,12 @@
 # Archived investigation overview — August/September 2026
 
-This is a historical record. Statements such as “current”, “latest”, and “next” below refer to their original dates. For the October 4 build and verified corrections, use [the current README](README.md).
+This is a historical record. Statements such as “current”, “latest”, and “next” below refer to their original dates. For the October 4 build and verified corrections, use [the current README](../README.md).
 
 ## Research update — September 7, 2026
 
 This update publishes investigation records and experimental patch deltas. It does not replace the downloadable August 29 emulator checkpoint or claim a newer playable build.
 
-The [September 4 configuration comparison](Dreams-runtime-setting-fix-20260904.md) restored the patterned cube using Precise readbacks in the tested profile. This is a checkpoint-specific observation, not a universal compatibility fix. Screenshots and bounded logs are included in [the runtime evidence archive](Dreams-runtime-fix-evidence-20260904.zip).
+The [September 4 configuration comparison](Dreams-runtime-setting-fix-20260904.md) restored the patterned cube using Precise readbacks in the tested profile. This is a checkpoint-specific observation, not a universal compatibility fix. Screenshots and bounded logs are included in [the runtime evidence archive](evidence/Dreams-runtime-fix-evidence-20260904.zip).
 
 The official-core experiments below are separate from the retained research checkpoint. Their failed runs do not mean that the retained checkpoint stopped reaching edit mode. September 7 results concern standalone fixtures and offline shader compilation; renderer integration and gameplay remain unverified.
 
@@ -43,9 +43,9 @@ This repository tracks source-level work on `Dreams` (`CUSA04301`) in `shadPS4`.
   is unresolved, and that build is preserved only as an explicitly unverified source snapshot—not
   as the current best build.
 - The exact validated executable, screenshot, hashes, and investigation record are included in
-  [`builds/cusa04301-full-covered-filled-20260829`](builds/cusa04301-full-covered-filled-20260829).
+  [`builds/cusa04301-full-covered-filled-20260829`](../builds/cusa04301-full-covered-filled-20260829).
 
-![Validated full-covered/full-filled checkpoint](builds/cusa04301-full-covered-filled-20260829/validated-full-covered-filled.png)
+![Validated full-covered/full-filled checkpoint](../builds/cusa04301-full-covered-filled-20260829/validated-full-covered-filled.png)
 
 ## Latest confirmed correction
 
@@ -90,13 +90,13 @@ checkpoint.
 - [ISSUES.md](ISSUES.md): prioritized unresolved work
 - [REPRO.md](REPRO.md): clean reproduction and focused capture procedure
 - [DEVELOPMENT.md](DEVELOPMENT.md): exact patch and build continuation workflow
-- [`builds/cusa04301-full-covered-filled-20260829`](builds/cusa04301-full-covered-filled-20260829):
+- [`builds/cusa04301-full-covered-filled-20260829`](../builds/cusa04301-full-covered-filled-20260829):
   validated executable, screenshot, and checkpoint investigation
-- [`patches/dreams-focused-20260829-full-covered-filled.patch`](patches/dreams-focused-20260829-full-covered-filled.patch):
+- [`patches/dreams-focused-20260829-full-covered-filled.patch`](../patches/dreams-focused-20260829-full-covered-filled.patch):
   cumulative shadPS4 source patch
-- [`patches/sirit-group-nonuniform-shuffle-20260829.patch`](patches/sirit-group-nonuniform-shuffle-20260829.patch):
+- [`patches/sirit-group-nonuniform-shuffle-20260829.patch`](../patches/sirit-group-nonuniform-shuffle-20260829.patch):
   required Sirit submodule addition
-- [`patches/0001-WIP-preserve-September-2-Dreams-ordered-count-invest.patch`](patches/0001-WIP-preserve-September-2-Dreams-ordered-count-invest.patch):
+- [`patches/0001-WIP-preserve-September-2-Dreams-ordered-count-invest.patch`](../patches/0001-WIP-preserve-September-2-Dreams-ordered-count-invest.patch):
   complete September 2 diagnostic source snapshot, including an unverified address-unit experiment
 
 The exact source/build tree is also preserved on branch

@@ -23,4 +23,4 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 
 This is experimental. Lag, intermittent black patches/white flashes, and small shadows that disappear at some angles remain unresolved. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64; other GPUs and versions are unverified.
 
-[Latest release details](CLEAN_MAIN_BUILD_20261025.md) | [Source and build instructions](SOURCE_BUILD.md) | [Previous updates and screenshots](HISTORICAL_README_20261025.md)
+[Latest release details](CLEAN_MAIN_BUILD_20261025.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)

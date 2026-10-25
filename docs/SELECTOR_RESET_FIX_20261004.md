@@ -17,13 +17,13 @@ The tested system is AMD Radeon 8060S with CUSA04301 VERSION 02.64 (APP_VER 01.0
 
 Actual Dreams screenshot after the selector reset fix, with paint tools open. Paint rendering was confirmed separately by the user. This screenshot also shows remaining sculpt surface defects; it is not evidence that all fleck shapes, transparency or sculpt primitives are correct.
 
-![Dreams after selector reset fix, with paint tools open](builds/cusa04301-selector-reset-fix-20261004/current-dreams-paint-mode.jpg)
+![Dreams after selector reset fix, with paint tools open](../builds/cusa04301-selector-reset-fix-20261004/current-dreams-paint-mode.jpg)
 
 ## Build and source
 
-- [Download tested executable](builds/cusa04301-selector-reset-fix-20261004/shadps4.exe), [hashes](builds/cusa04301-selector-reset-fix-20261004/SHA256SUMS.txt), [validation summary](builds/cusa04301-selector-reset-fix-20261004/validation.json).
-- [Focused fix](patches/dreams-selector-reset-fix-20261004.patch).
-- [Cumulative tracked main-source diagnostic snapshot](patches/dreams-diagnostic-source-20261004-selector-reset.patch), based on upstream `555c458c9fdd33cb4686492374519c7bb112a891`. This includes earlier corrections and diagnostic code; it excludes external submodules and untracked files. Retain the separate Sirit patch from the documented build workflow.
+- [Download tested executable](../builds/cusa04301-selector-reset-fix-20261004/shadps4.exe), [hashes](../builds/cusa04301-selector-reset-fix-20261004/SHA256SUMS.txt), [validation summary](../builds/cusa04301-selector-reset-fix-20261004/validation.json).
+- [Focused fix](../patches/dreams-selector-reset-fix-20261004.patch).
+- [Cumulative tracked main-source diagnostic snapshot](../patches/dreams-diagnostic-source-20261004-selector-reset.patch), based on upstream `555c458c9fdd33cb4686492374519c7bb112a891`. This includes earlier corrections and diagnostic code; it excludes external submodules and untracked files. Retain the separate Sirit patch from the documented build workflow.
 - Executable SHA-256: `DA5B2166B8245803E6D8F2BE4FC082B0CAB33E5D5366CE904118028BAB98C79C`.
 
 The executable also retains the earlier cube alignment, imp/tweak-menu cache and scene-save corrections. Use it with the existing launcher/runtime dependencies; it is not a complete portable runtime package.

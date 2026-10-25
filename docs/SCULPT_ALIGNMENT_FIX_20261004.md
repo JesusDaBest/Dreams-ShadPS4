@@ -6,7 +6,7 @@ The test cube previously had a regular tiled surface and dark seams. Correcting 
 
 The material shader `0xdcc325c2` reads packed neighboring sculpt blocks to calculate surface normals. The translator implemented `V_ALIGNBIT_B32` and `V_ALIGNBYTE_B32` by combining two 32-bit shifts. At offset zero, the high-word term shifted by 32. That is outside the defined range for a 32-bit SPIR-V shift; on the tested GPU it behaved like a shift by zero and mixed the next word into the result. See the [SPIR-V shift specification](https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html).
 
-The focused [source patch](patches/generic-align-zero-offset-fix-20261004.patch) explicitly contributes zero from the high word at offset zero and keeps every emitted high-word shift in the range 0–31. Both bit and byte alignment instructions are corrected without a game-specific gate.
+The focused [source patch](../patches/generic-align-zero-offset-fix-20261004.patch) explicitly contributes zero from the high word at offset zero and keeps every emitted high-word shift in the range 0–31. Both bit and byte alignment instructions are corrected without a game-specific gate.
 
 ## Validation
 
@@ -18,23 +18,23 @@ The focused [source patch](patches/generic-align-zero-offset-fix-20261004.patch)
 
 Before:
 
-![Tiled GPU surface normals](builds/cusa04301-sculpt-alignment-fix-20261004/normals-before.png)
+![Tiled GPU surface normals](../builds/cusa04301-sculpt-alignment-fix-20261004/normals-before.png)
 
 After:
 
-![Corrected GPU surface normals](builds/cusa04301-sculpt-alignment-fix-20261004/normals-after.png)
+![Corrected GPU surface normals](../builds/cusa04301-sculpt-alignment-fix-20261004/normals-after.png)
 
 ## Executable and source
 
 Current in-game view, captured directly from the running tested executable:
 
-![Dreams cube after the alignment correction](builds/cusa04301-sculpt-alignment-fix-20261004/current-dreams-cube.jpg)
+![Dreams cube after the alignment correction](../builds/cusa04301-sculpt-alignment-fix-20261004/current-dreams-cube.jpg)
 
-Download [shadps4.exe](builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe). This is the exact experimental diagnostic executable used for the successful live test. It also contains the retained imp/tweak-menu cache, random-byte and save-handling changes. Optional capture/replay diagnostics remain in the build; run with diagnostic environment flags unset. Use the existing launcher/runtime dependencies and Precise readbacks. The older executable remains available for comparison.
+Download [shadps4.exe](../builds/cusa04301-sculpt-alignment-fix-20261004/shadps4.exe). This is the exact experimental diagnostic executable used for the successful live test. It also contains the retained imp/tweak-menu cache, random-byte and save-handling changes. Optional capture/replay diagnostics remain in the build; run with diagnostic environment flags unset. Use the existing launcher/runtime dependencies and Precise readbacks. The older executable remains available for comparison.
 
 Executable SHA-256: `8C2E36874EEA2A4B83625D099E92F874F287EFE3894981CD93B6BC710454F904`.
 
-The [cumulative tracked main-source patch](patches/dreams-diagnostic-source-20261004-sculpt-alignment.patch) records this build's tracked main-source changes against upstream `555c458c9fdd33cb4686492374519c7bb112a891`. It includes earlier research and diagnostic changes, so apply it to that base instead of stacking it with the historical cumulative patch. External/submodule changes and untracked scratch files are excluded; the retained [Sirit delta](patches/sirit-group-nonuniform-shuffle-20260829.patch) remains separately documented in [SOURCE_BUILD.md](SOURCE_BUILD.md). A fresh build from this exported cumulative snapshot has not been run. Local source HEAD before working changes was `ee046166afab8ca04759d5d34b63025a48fae2ae`.
+The [cumulative tracked main-source patch](../patches/dreams-diagnostic-source-20261004-sculpt-alignment.patch) records this build's tracked main-source changes against upstream `555c458c9fdd33cb4686492374519c7bb112a891`. It includes earlier research and diagnostic changes, so apply it to that base instead of stacking it with the historical cumulative patch. External/submodule changes and untracked scratch files are excluded; the retained [Sirit delta](../patches/sirit-group-nonuniform-shuffle-20260829.patch) remains separately documented in [SOURCE_BUILD.md](SOURCE_BUILD.md). A fresh build from this exported cumulative snapshot has not been run. Local source HEAD before working changes was `ee046166afab8ca04759d5d34b63025a48fae2ae`.
 
 The focused patch is the recommended change for code review or adding just the alignment correction to an existing source build. See [SOURCE_BUILD.md](SOURCE_BUILD.md) for the retained patch workflow.
 

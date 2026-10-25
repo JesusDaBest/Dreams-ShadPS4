@@ -6,7 +6,7 @@ Moving the imp left persistent copies in menus, including the pause menu. In edi
 
 Dreams compute shader `0x85f67046` clears image-backed allocations through a raw buffer. The menu trace recorded its output at `0x2e2890000` (16,711,680 bytes), reused as a sprite render target and later sampled as an image. The raw write did not enter the image-cache invalidation path, which previously handled formatted writes and a separate scene-stream shader.
 
-[The focused patch](patches/dreams-raw-image-clear-cache-refresh-20261004.patch) includes written output buffer 0 of this Dreams compute shader in the existing `InvalidateMemoryFromGPU` path. Matching cached images become GPU-dirty and refresh from the GPU buffer. It does not substitute geometry or disable depth/stencil tests.
+[The focused patch](../patches/dreams-raw-image-clear-cache-refresh-20261004.patch) includes written output buffer 0 of this Dreams compute shader in the existing `InvalidateMemoryFromGPU` path. Matching cached images become GPU-dirty and refresh from the GPU buffer. It does not substitute geometry or disable depth/stencil tests.
 
 ## Validation and limits
 
@@ -18,7 +18,7 @@ Sculpt rendering remains incorrect. Distance-dependent missing tweak-menu conten
 
 ## Download and source
 
-The [tested executable](builds/cusa04301-imp-smush-cache-fix-20261004/shadps4.exe) has SHA-256:
+The [tested executable](../builds/cusa04301-imp-smush-cache-fix-20261004/shadps4.exe) has SHA-256:
 
 `E7BAD86D62581BC2D0493D4B880346DE0BCCC31D8AD0DC43EA89484F0DF7599D`
 

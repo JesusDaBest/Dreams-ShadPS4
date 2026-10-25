@@ -1,6 +1,6 @@
 # Previous front page - October 25, 2026
 
-Archived release descriptions, screenshots and investigation links. For the current download and setup, see the [front page](README.md).
+Archived release descriptions, screenshots and investigation links. For the current download and setup, see the [front page](../README.md).
 
 ---
 
@@ -8,7 +8,7 @@ Archived release descriptions, screenshots and investigation links. For the curr
 
 Updated **October 25, 2026**. This repository contains experimental shadPS4 fixes and tested builds for Dreams (`CUSA04301`).
 
-![Dreams on shadPS4 showing sculpt shapes and paint, October 15, 2026](builds/cusa04301-shape-density-fix-20261015/dreams-shapes-20261015.png)
+![Dreams on shadPS4 showing sculpt shapes and paint, October 15, 2026](../builds/cusa04301-shape-density-fix-20261015/dreams-shapes-20261015.png)
 
 October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
@@ -18,7 +18,7 @@ October 15 screenshot: sculpt shapes and paint in Dreams running on shadPS4.
 
 Extract the ZIP, open **shadPS4QtLauncher.exe**, add your own Dreams game folder and click **Play**. The exact current main core (`35cb8a3c`) and matching settings are selected automatically, just like the previous graphical updates. No command prompt or command scripts are needed.
 
-Includes the ambient-shadow cache correction and retained texture/mip, shader and rendering fixes. An optional graphical tutorial bypass is included. The tested Tren board's colours returned; small or angle-dependent shadows and remaining lag/rendering glitches are still unresolved. [Changes, validation, source and known issues](CLEAN_MAIN_BUILD_20261025.md).
+Includes the ambient-shadow cache correction and retained texture/mip, shader and rendering fixes. An optional graphical tutorial bypass is included. The tested Tren board's colours returned; small or angle-dependent shadows and remaining lag/rendering glitches are still unresolved. [Changes, validation, source and known issues](../CLEAN_MAIN_BUILD_20261025.md).
 
 Previous October 21 graphical package:
 
@@ -104,13 +104,13 @@ is not implied for every item.
 
 Captured directly from Dreams running the October 4 alignment-fix executable. The cube now renders with clean faces. This image shows the game itself; the separate GPU-normal comparison is in the [validation record](SCULPT_ALIGNMENT_FIX_20261004.md).
 
-![October 4 Dreams in-game cube after the alignment fix](builds/cusa04301-sculpt-alignment-fix-20261004/current-dreams-cube.jpg)
+![October 4 Dreams in-game cube after the alignment fix](../builds/cusa04301-sculpt-alignment-fix-20261004/current-dreams-cube.jpg)
 
 ## New selector reset / paint-mode screenshot
 
 Actual Dreams after the new fix, with paint tools open. Paint strokes now render according to the user; sculpt surface defects remain visible. The previous cube screenshot above is retained.
 
-![Dreams after selector reset fix](builds/cusa04301-selector-reset-fix-20261004/current-dreams-paint-mode.jpg)
+![Dreams after selector reset fix](../builds/cusa04301-selector-reset-fix-20261004/current-dreams-paint-mode.jpg)
 
 ## Remaining work
 
@@ -125,18 +125,18 @@ The successful local test used an **AMD Radeon 8060S**, **CUSA04301 VERSION 02.6
 ## Source and records
 
 - [October 15 shape fix and validation](SHAPE_DENSITY_FIX_20261015.md)
-- [Focused shape-table patch](patches/dreams-shape-density-inline-tables-20261015.patch)
-- [Matching October 15 source delta](patches/dreams-source-delta-20261015-shape-density.patch)
+- [Focused shape-table patch](../patches/dreams-shape-density-inline-tables-20261015.patch)
+- [Matching October 15 source delta](../patches/dreams-source-delta-20261015-shape-density.patch)
 
 - [Selector reset fix and validation](SELECTOR_RESET_FIX_20261004.md)
-- [Focused selector reset patch](patches/dreams-selector-reset-fix-20261004.patch)
-- [October 4 cumulative main-source snapshot](patches/dreams-diagnostic-source-20261004-selector-reset.patch)
+- [Focused selector reset patch](../patches/dreams-selector-reset-fix-20261004.patch)
+- [October 4 cumulative main-source snapshot](../patches/dreams-diagnostic-source-20261004-selector-reset.patch)
 
 - [Source build instructions](SOURCE_BUILD.md)
-- [Focused alignment patch](patches/generic-align-zero-offset-fix-20261004.patch)
-- [Cumulative main-source diagnostic patch](patches/dreams-diagnostic-source-20261004-sculpt-alignment.patch)
+- [Focused alignment patch](../patches/generic-align-zero-offset-fix-20261004.patch)
+- [Cumulative main-source diagnostic patch](../patches/dreams-diagnostic-source-20261004-sculpt-alignment.patch)
 - [Current status](STATUS.md) and [remaining issues](ISSUES.md)
 - [August/September investigation archive](HISTORICAL_README_20260907.md)
-- [Historical August 29 build](builds/cusa04301-full-covered-filled-20260829) and [earlier October 4 imp/smush build](builds/cusa04301-imp-smush-cache-fix-20261004)
+- [Historical August 29 build](../builds/cusa04301-full-covered-filled-20260829) and [earlier October 4 imp/smush build](../builds/cusa04301-imp-smush-cache-fix-20261004)
 
 This repository contains no game files, firmware, keys, PSN credentials, or user saves. The emulator builds are experimental.

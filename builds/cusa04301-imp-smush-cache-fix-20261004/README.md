@@ -1,6 +1,6 @@
 # Tested imp/smush cache correction
 
-This is the October 4 user-tested executable, not the later experimental material-capture build. See [the correction and validation record](../../IMP_SMUSH_FIX_20261004.md).
+This is the October 4 user-tested executable, not the later experimental material-capture build. See [the correction and validation record](../../docs/IMP_SMUSH_FIX_20261004.md).
 
 Use the normal launcher profile with Precise readbacks and diagnostic environment flags unset. Sculpts and some tweak-menu content still render incorrectly.
 
