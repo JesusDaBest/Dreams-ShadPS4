@@ -1,0 +1,602 @@
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -6,6 +6,7 @@
+ #include <boost/container/static_vector.hpp>
+ #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
++#include "shader_recompiler/view_min_lod.h"
+ #include "shader_recompiler/dreams_compat.h"
+ #include "shader_recompiler/ir/attribute.h"
+ 
+@@ -370,6 +371,14 @@
+ 
+ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
+                    const IR::Value& offset) {
++    const auto& resource = ctx.info.images[handle & 0xffff];
++    if (ctx.profile.needs_image_view_min_lod && resource.uses_min_lod_read &&
++        ViewMinLodInteger(resource, resource.GetSharp(ctx.info)) != 0) {
++        // Gather always reads the base mip. Robust image access returns zero
++        // when that level is excluded; sampler LOD clamping does not apply.
++        const Id zero = ctx.ConstF32(0.f);
++        return ctx.OpCompositeConstruct(ctx.F32[4], zero, zero, zero, zero);
++    }
+     const auto& texture = ctx.images[handle & 0xFFFF];
+     const Id image = ctx.OpLoad(texture.image_type, texture.id);
+     const Id result_type = texture.data_types->Get(4);
+@@ -586,7 +595,21 @@
+         const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+         texel = ctx.OpImageRead(color_type, image, coords, operands.mask, operands.operands);
+     }
+-    return texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texel) : texel;
++    Id result = texture.is_integer ? ctx.OpBitcast(ctx.F32[4], texel) : texel;
++    const auto& resource = ctx.info.images[handle & 0xffff];
++    if (ctx.profile.needs_image_view_min_lod && resource.uses_min_lod_read) {
++        const u32 minimum = ViewMinLodInteger(resource, resource.GetSharp(ctx.info));
++        if (minimum != 0) {
++            const Id level = Sirit::ValidId(lod) ? lod : ctx.ConstU32(0u);
++            const Id excluded = ctx.OpULessThan(ctx.U1[1], level, ctx.ConstU32(minimum));
++            const Id zero = ctx.ConstF32(0.f);
++            const Id zeros = ctx.OpCompositeConstruct(ctx.F32[4], zero, zero, zero, zero);
++            const Id mask = ctx.OpCompositeConstruct(ctx.TypeVector(ctx.U1[1], 4),
++                                                     excluded, excluded, excluded, excluded);
++            result = ctx.OpSelect(ctx.F32[4], mask, zeros, result);
++        }
++    }
++    return result;
+ }
+ 
+ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms,
+--- a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+@@ -16,6 +16,7 @@
+ #include "shader_recompiler/ir/program.h"
+ #include "shader_recompiler/ir/reinterpret.h"
+ #include "shader_recompiler/profile.h"
++#include "shader_recompiler/view_min_lod.h"
+ #include "video_core/amdgpu/resource.h"
+ 
+ namespace Shader::Optimization {
+@@ -1132,7 +1133,7 @@
+ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info, const Profile& profile,
+                           const ImageResource& image_res, const AmdGpu::Image& image) {
+     const auto handle = inst.Arg(0);
+-    const auto& sampler_res = info.samplers[(handle.U32() >> 16) & 0xFFFF];
++    auto& sampler_res = info.samplers[(handle.U32() >> 16) & 0xFFFF];
+     const auto sampler = sampler_res.GetSharp(info);
+ 
+     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+@@ -1328,13 +1329,43 @@
+ 
+     ASSERT(!inst_info.has_lod || !inst_info.has_lod_clamp);
+     const bool explicit_lod = inst_info.has_lod || inst_info.force_level0;
+-    const IR::F32 lod = inst_info.has_lod        ? get_addr_reg(addr_reg++)
++    IR::F32 lod = inst_info.has_lod        ? get_addr_reg(addr_reg++)
+                         : inst_info.force_level0 ? ir.Imm32(0.0f)
+                                                  : IR::F32{};
+     const IR::F32 lod_clamp = inst_info.has_lod_clamp ? get_addr_reg(addr_reg++) : IR::F32{};
++    IR::Value offset_dimensions = dimensions;
++    if (fold_runtime_offset && explicit_lod && !inst_info.has_derivatives) {
++        // Mark eligibility inputs even when this particular descriptor uses the
++        // old route: a later sampler/view change must select a new permutation.
++        sampler_res.uses_offset_lod = true;
++        info.images[handle.U32() & 0xffff].uses_offset_lod = true;
++        if (!image.IsCube() && image.min_lod == 0 && CanLowerPointOffsetLod(sampler)) {
++            const auto clamped_lod = ir.FPClamp(ir.FPAdd(lod, ir.Imm32(sampler.LodBias())),
++                ir.Imm32(sampler.MinLod()), ir.Imm32(sampler.MaxLod()));
++            IR::F32 point_lod = ir.FPFloor(ir.FPAdd(clamped_lod, ir.Imm32(0.5f)));
++            // Either nearest mip is legal at a half-way tie. Choose one which
++            // can be forced away from the tie inside the sampler's clamp range.
++            if ((sampler.max_lod.Value() & 255u) == 128u) {
++                point_lod = IR::F32{ir.Select(ir.FPEqual(clamped_lod, ir.Imm32(sampler.MaxLod())),
++                    ir.FPSub(point_lod, ir.Imm32(1.0f)), point_lod)};
++            }
++            const auto base_size = ir.ImageQueryDimension(handle, ir.Imm32(0u), ir.Imm1(true), inst_info);
++            const auto last_mip = ir.ISub(IR::U32{ir.CompositeExtract(base_size, 3)}, ir.Imm32(1u));
++            const auto selected_mip = ir.ConvertFToU(32, ir.FPClamp(point_lod, ir.Imm32(0.0f),
++                ir.ConvertUToF(32, 32, last_mip)));
++            offset_dimensions = ir.ImageQueryDimension(handle, IR::U32{selected_mip}, ir.Imm1(false), inst_info);
++            // Keep magnification/minification selection intact at mip zero.
++            // Sending the chosen LOD also makes the coordinate normalization
++            // independent of the host's allowed nearest-mip tie preference.
++            const auto minifying_zero = ir.LogicalAnd(ir.FPEqual(point_lod, ir.Imm32(0.0f)),
++                ir.FPGreaterThan(clamped_lod, ir.Imm32(0.0f)));
++            const IR::F32 sample_lod{ir.Select(minifying_zero, ir.Imm32(0.25f), point_lod)};
++            lod = ir.FPSub(sample_lod, ir.Imm32(sampler.LodBias()));
++        }
++    }
+     const IR::Value sample_coords =
+         fold_runtime_offset
+-            ? ApplyRuntimeOffsetToCoords(ir, view_type, coords, offset, dimensions)
++            ? ApplyRuntimeOffsetToCoords(ir, view_type, coords, offset, offset_dimensions)
+             : coords;
+     const IR::Value sample_offset = fold_runtime_offset ? IR::Value{} : offset;
+ 
+@@ -1847,6 +1878,21 @@
+         }
+     }
+ 
++    // Mark only read operations whose missing view-minimum behavior is handled
++    // by the backend. Do this after storage/read separation and argument lowering.
++    if (profile.needs_image_view_min_lod) {
++        for (IR::Block* block : program.post_order_blocks) {
++            for (IR::Inst& inst : block->Instructions()) {
++                if (inst.GetOpcode() != IR::Opcode::ImageRead &&
++                    inst.GetOpcode() != IR::Opcode::ImageGather) {
++                    continue;
++                }
++                auto& image = info.images[inst.Arg(0).U32() & 0xffff];
++                image.uses_min_lod_read |= SupportsViewMinLodRead(image, image.GetSharp(info));
++            }
++        }
++    }
++
+     // Capture already-resolved addresses and the exact SSA values consumed by the stores. Insert
+     // after resource patching so the probe cannot accidentally record a pre-addressing operand.
+     InjectDreamsQueueProducerCapture(program, descriptors);
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -52,6 +52,9 @@
+     bool needs_unorm_fixup{};
+     bool needs_clip_distance_emulation{};
+     bool supports_shader_stencil_export{};
++    // This host lacks VK_EXT_image_view_min_lod. Metadata separately keys
++    // the affected read guards; native hosts retain their existing shaders.
++    bool needs_image_view_min_lod{};
+ 
+     bool operator==(const Profile&) const = default;
+ };
+--- a/src/shader_recompiler/resource.h
++++ b/src/shader_recompiler/resource.h
+@@ -83,6 +83,8 @@
+     bool is_array{};
+     bool is_written{};
+     bool is_r128{};
++    bool uses_offset_lod : 1 {}; // same byte; old metadata stores only bit zero
++    bool uses_min_lod_read : 1 {};
+     MipStorageFallbackMode mip_fallback_mode{};
+     u32 constant_mip_index{};
+ 
+@@ -133,6 +135,7 @@
+     u32 associated_image : 4;
+     u32 disable_aniso : 1;
+     u32 is_compare : 1;
++    u32 uses_offset_lod : 1 {};
+ 
+     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
+         return is_inline_sampler ? inline_sampler
+@@ -140,6 +143,29 @@
+     }
+ };
+ using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;
++
++// Only shader constants and eligibility checks used by explicit offset lowering.
++// Keep unrelated address, comparison and border settings out of this key.
++constexpr u64 OffsetLodSamplerKey(const AmdGpu::Sampler& sampler) {
++    return ((sampler.raw0 >> 32) & 0xffffffu) |
++           ((sampler.raw1 & 0x3fffu) << 24) |
++           (((sampler.raw1 >> 20) & 0xffu) << 38) | (u64{1} << 63);
++}
++
++inline bool CanLowerPointOffsetLod(const AmdGpu::Sampler& sampler) {
++    // Vulkan guarantees at least +/-2 LOD bias. Keep positive bias on the
++    // original route: forcing a nearest mip can produce a negative constant
++    // LOD, which the tested driver handles differently from a dynamic LOD.
++    const bool fixed_half_lod = sampler.min_lod == sampler.max_lod &&
++                               (sampler.min_lod.Value() & 255u) == 128u;
++    return sampler.mip_filter == AmdGpu::MipFilter::Point &&
++           !AmdGpu::IsAnisoFilter(sampler.xy_min_filter) &&
++           !AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) &&
++           sampler.LodBias() >= -2.0f && sampler.LodBias() <= 0.0f &&
++           sampler.min_lod <= sampler.max_lod && !fixed_half_lod;
++}
++static_assert(sizeof(ImageResource) == 20);
++static_assert(sizeof(SamplerResource) == 32);
+ 
+ struct FMaskResource {
+     u32 sharp_idx;
+--- a/src/shader_recompiler/specialization.h
++++ b/src/shader_recompiler/specialization.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <bitset>
+ 
+ #include "common/types.h"
+@@ -10,6 +11,7 @@
+ #include "shader_recompiler/frontend/fetch_shader.h"
+ #include "shader_recompiler/info.h"
+ #include "shader_recompiler/profile.h"
++#include "shader_recompiler/view_min_lod.h"
+ 
+ namespace Shader {
+ 
+@@ -91,6 +93,12 @@
+     boost::container::small_vector<FMaskSpecialization, 8> fmasks;
+     boost::container::small_vector<SamplerSpecialization, 16> samplers;
+     Backend::Bindings start{};
++    bool offset_lod_analysis{};
++    bool view_min_lod_analysis{};
++    boost::container::small_vector<u8, 16> view_min_lods;
++    // Empty for the native-offset path and shaders without explicit offsets.
++    std::bitset<NUM_IMAGES> offset_min_lod_images{};
++    boost::container::small_vector<u64, 16> offset_sampler_keys;
+ 
+     StageSpecialization() = default;
+     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
+@@ -157,6 +165,35 @@
+                          spec.force_degamma = sharp.force_degamma;
+                      });
+ 
++        offset_lod_analysis = !profile_.supports_runtime_image_sample_offsets && !info->samplers.empty();
++        if (offset_lod_analysis &&
++            std::ranges::any_of(info->samplers, [](const auto& s) { return s.uses_offset_lod; })) {
++            offset_sampler_keys.resize(info->samplers.size());
++            for (size_t i = 0; i < info->samplers.size(); ++i) {
++                const auto& desc = info->samplers[i];
++                if (desc.uses_offset_lod) {
++                    offset_sampler_keys[i] = OffsetLodSamplerKey(desc.GetSharp(*info));
++                }
++            }
++            for (size_t i = 0; i < info->images.size(); ++i) {
++                const auto& desc = info->images[i];
++                offset_min_lod_images[i] = desc.uses_offset_lod && desc.GetSharp(*info).min_lod != 0;
++            }
++        }
++
++        // The read guard depends on the integer minimum relative to the view,
++        // not the raw fractional descriptor or sampler clamps.
++        view_min_lod_analysis = profile_.needs_image_view_min_lod && !info->images.empty();
++        if (view_min_lod_analysis) {
++            view_min_lods.resize(info->images.size());
++            for (size_t i = 0; i < info->images.size(); ++i) {
++                const auto& desc = info->images[i];
++                if (desc.uses_min_lod_read) {
++                    view_min_lods[i] = ViewMinLodInteger(desc, desc.GetSharp(*info));
++                }
++            }
++        }
++
+         // Initialize runtime_info fields that rely on analysis in tessellation passes
+         if (info->l_stage == LogicalStage::TessellationControl ||
+             info->l_stage == LogicalStage::TessellationEval) {
+@@ -196,6 +233,17 @@
+ 
+     bool operator==(const StageSpecialization& other) const {
+         if (!Valid()) {
++            return false;
++        }
++
++        if (view_min_lod_analysis != other.view_min_lod_analysis ||
++            view_min_lods != other.view_min_lods) {
++            return false;
++        }
++
++        if (offset_min_lod_images != other.offset_min_lod_images ||
++            offset_sampler_keys != other.offset_sampler_keys ||
++            offset_lod_analysis != other.offset_lod_analysis) {
+             return false;
+         }
+ 
+@@ -255,6 +303,9 @@
+     void Serialize(Serialization::Archive& ar) const;
+     bool Deserialize(Serialization::Archive& ar,
+                      size_t runtime_info_size = sizeof(RuntimeInfo));
++    bool Deserialize(Serialization::Archive& ar, size_t runtime_info_size, bool offset_lod_state);
++    bool Deserialize(Serialization::Archive& ar, size_t runtime_info_size, bool offset_lod_state,
++                     bool view_min_lod_state);
+ };
+ 
+ } // namespace Shader
+--- /dev/null
++++ b/src/shader_recompiler/view_min_lod.h
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++#include <algorithm>
++#include "shader_recompiler/resource.h"
++
++namespace Shader {
++inline bool SupportsViewMinLodRead(const ImageResource& desc, const AmdGpu::Image& image) {
++    const auto type = image.GetViewType(desc.is_array);
++    return !desc.is_written && !desc.is_atomic && !desc.is_depth && !image.IsCube() &&
++           desc.mip_fallback_mode == MipStorageFallbackMode::None &&
++           (type == AmdGpu::ImageType::Color2D || type == AmdGpu::ImageType::Color2DArray);
++}
++
++inline u32 ViewMinLodInteger(const ImageResource& desc, const AmdGpu::Image& image) {
++    if (!SupportsViewMinLodRead(desc, image)) return 0;
++    const u32 base = image.base_level;
++    const u32 last = base + image.NumViewLevels(desc.is_array) - 1;
++    return std::clamp(u32(image.min_lod) / 256u, base, last) - base;
++}
++} // namespace Shader
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -390,6 +390,7 @@
+         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
++        .needs_image_view_min_lod = !instance_.IsImageViewMinLodSupported(),
+     };
+     WarmUp();
+ 
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -21,6 +21,10 @@
+ static constexpr u32 ShaderBinaryVersion = 20u;
+ static constexpr u32 ShaderMetaVersion = 6u;
+ static constexpr u32 PreviousShaderMetaVersion = 5u;
++// Sampled shaders analysed for software offsets write the extended form, even
++// when no offset needs lowering. This prevents repeating legacy invalidation.
++static constexpr u32 OffsetShaderMetaVersion = 7u;
++static constexpr u32 ViewMinLodShaderMetaVersion = 8u;
+ static constexpr u32 PipelineKeyVersion = 3u;
+ static constexpr size_t PreviousRuntimeInfoSize = 248u;
+ static_assert(sizeof(Shader::RuntimeInfo) == 256u);
+@@ -196,6 +200,12 @@
+          info.pgm_hash == 0xe4dcd599 || info.pgm_hash == 0xfd2a2c3b)) {
+         key += "_visibility_mip_coords1";
+     }
++    if (std::ranges::any_of(info.samplers, [](const auto& sampler) { return sampler.uses_offset_lod; })) {
++        key += "_offset_point_lod1";
++    }
++    if (std::ranges::any_of(info.images, [](const auto& image) { return image.uses_min_lod_read; })) {
++        key += "_view_min_integer1";
++    }
+     return key;
+ }
+ 
+@@ -251,11 +261,16 @@
+     Serialization::Archive ar;
+     Serialization::Writer meta{ar};
+ 
+-    meta.Write(Serialization::ShaderMetaVersion);
++    meta.Write(spec.view_min_lod_analysis ? Serialization::ViewMinLodShaderMetaVersion
++               : spec.offset_lod_analysis ? Serialization::OffsetShaderMetaVersion
++                                          : Serialization::ShaderMetaVersion);
+     meta.Write(Serialization::ShaderBinaryVersion);
+ 
+     meta.Write(perm_hash);
+     meta.Write(perm_idx);
++    if (spec.view_min_lod_analysis) {
++        meta.Write(u32(spec.offset_lod_analysis));
++    }
+ 
+     spec.Serialize(ar);
+     info.Serialize(ar);
+@@ -278,13 +293,15 @@
+ 
+ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
+-                    Shader::StageSpecialization& spec, size_t& perm_idx) {
++                    Shader::StageSpecialization& spec, size_t& perm_idx, const Shader::Profile& profile) {
+     Serialization::Reader meta{ar};
+ 
+     u32 meta_version{};
+     meta.Read(meta_version);
+     if (meta_version != Serialization::ShaderMetaVersion &&
+-        meta_version != Serialization::PreviousShaderMetaVersion) {
++        meta_version != Serialization::PreviousShaderMetaVersion &&
++        meta_version != Serialization::OffsetShaderMetaVersion &&
++        meta_version != Serialization::ViewMinLodShaderMetaVersion) {
+         return false;
+     }
+ 
+@@ -304,8 +321,35 @@
+         meta_version == Serialization::PreviousShaderMetaVersion
+             ? Serialization::PreviousRuntimeInfoSize
+             : sizeof(Shader::RuntimeInfo);
+-    spec.Deserialize(ar, runtime_info_size);
++    const bool view_min_lod_state = meta_version == Serialization::ViewMinLodShaderMetaVersion;
++    u32 extra_flags{};
++    if (view_min_lod_state) {
++        meta.Read(extra_flags);
++        if (extra_flags > 1) return false;
++    }
++    const bool offset_lod_state = meta_version == Serialization::OffsetShaderMetaVersion ||
++                                  (view_min_lod_state && extra_flags != 0);
++    spec.Deserialize(ar, runtime_info_size, offset_lod_state, view_min_lod_state);
+     info.Deserialize(ar);
++    if (!view_min_lod_state) {
++        // Bit one was not data in old metadata. Reanalyse missing-feature
++        // image shaders once; native hosts preserve their existing caches.
++        for (auto& image : info.images) image.uses_min_lod_read = false;
++        if (profile.needs_image_view_min_lod && !info.images.empty()) return false;
++    } else if (!profile.needs_image_view_min_lod ||
++               spec.view_min_lods.size() != info.images.size()) {
++        return false;
++    }
++    if (!offset_lod_state) {
++        // These flags occupy old padding bits. Never treat cached padding as data.
++        for (auto& image : info.images) image.uses_offset_lod = false;
++        for (auto& sampler : info.samplers) sampler.uses_offset_lod = false;
++        // Missing-feature hosts must reanalyse old sampled shaders before they
++        // can use the new specialization state. Native hosts keep their caches.
++        if (!profile.supports_runtime_image_sample_offsets && !info.samplers.empty()) return false;
++    } else if (profile.supports_runtime_image_sample_offsets) {
++        return false;
++    }
+ 
+     // Capture variants inject diagnostic writes into the translated shader. A normal cached
+     // binary has the same guest program hash but none of those writes, so it must not satisfy a
+@@ -442,7 +486,7 @@
+             Shader::StageSpecialization spec{};
+             spec.info = &info;
+             size_t perm_idx{};
+-            if (!LoadShaderMeta(meta_ar, info, fetch_shader_data, spec, perm_idx)) {
++            if (!LoadShaderMeta(meta_ar, info, fetch_shader_data, spec, perm_idx, profile)) {
+                 return false;
+             }
+             const bool target_vs370 =
+@@ -501,7 +545,7 @@
+     Shader::StageSpecialization spec{};
+     spec.info = &program->info;
+     size_t perm_idx{};
+-    if (!LoadShaderMeta(ar, program->info, fetch_shader, spec, perm_idx)) {
++    if (!LoadShaderMeta(ar, program->info, fetch_shader, spec, perm_idx, profile)) {
+         return false;
+     }
+ 
+@@ -592,6 +636,9 @@
+ 
+     Shader::Profile cached_profile{};
+     std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
++    // The new byte occupied legacy padding. Its compatibility is checked
++    // explicitly by LoadShaderMeta, including old/new host transitions.
++    cached_profile.needs_image_view_min_lod = profile.needs_image_view_min_lod;
+     if (cached_profile != profile) {
+         LOG_WARNING(Render,
+                     "Pipeline cache isn't compatible with current system. Ignoring the cache");
+@@ -729,9 +776,31 @@
+     spec.Write(images);
+     spec.Write(fmasks);
+     spec.Write(samplers);
++    if (offset_lod_analysis) {
++        spec.Write(offset_min_lod_images.to_ullong());
++        spec.Write(offset_sampler_keys);
++    }
++    if (view_min_lod_analysis) {
++        spec.Write(view_min_lods);
++    }
+ }
+ 
+ bool StageSpecialization::Deserialize(Serialization::Archive& ar, size_t runtime_info_size) {
++    return Deserialize(ar, runtime_info_size, false);
++}
++
++bool StageSpecialization::Deserialize(Serialization::Archive& ar, size_t runtime_info_size,
++                                      bool offset_lod_state) {
++    return Deserialize(ar, runtime_info_size, offset_lod_state, false);
++}
++
++bool StageSpecialization::Deserialize(Serialization::Archive& ar, size_t runtime_info_size,
++                                      bool offset_lod_state, bool view_min_lod_state) {
++    view_min_lod_analysis = view_min_lod_state;
++    view_min_lods.clear();
++    offset_min_lod_images.reset();
++    offset_sampler_keys.clear();
++    offset_lod_analysis = offset_lod_state;
+     Serialization::Reader spec{ar};
+ 
+     spec.Read(start);
+@@ -762,6 +831,15 @@
+     spec.Read(images);
+     spec.Read(fmasks);
+     spec.Read(samplers);
++    if (offset_lod_state) {
++        u64 image_min_lods{};
++        spec.Read(image_min_lods);
++        offset_min_lod_images = image_min_lods;
++        spec.Read(offset_sampler_keys);
++    }
++    if (view_min_lod_state) {
++        spec.Read(view_min_lods);
++    }
+ 
+     return true;
+ }
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -49,6 +49,7 @@
+ #include "video_core/renderer_vulkan/vk_shader_hle.h"
+ #include "video_core/texture_cache/image_view.h"
+ #include "video_core/texture_cache/sampler.h"
++#include "video_core/texture_cache/min_lod_fallback.h"
+ #include "video_core/texture_cache/texture_cache.h"
+ 
+ #ifdef MemoryBarrier
+@@ -28441,6 +28442,18 @@
+         binding.unified += array_size;
+     }
+ 
++    const bool native_view_min_lod = instance.IsImageViewMinLodSupported();
++    VideoCore::CommonViewMinLod view_min_lod{native_view_min_lod};
++    if (!native_view_min_lod) {
++        for (const auto& [image_id, desc] : image_bindings) {
++            if (desc.type == VideoCore::TextureCache::BindingType::Storage) {
++                continue;
++            }
++            const auto& view = desc.view_info;
++            view_min_lod.Add(view.range.base.level, view.range.extent.levels, view.min_lod);
++        }
++    }
++
+     u32 sampler_index{};
+     for (const auto& sampler : stage.samplers) {
+         auto ssharp = sampler.GetSharp(stage);
+@@ -28487,6 +28500,7 @@
+                 }
+             }
+         }
++        view_min_lod.Apply(ssharp);
+         const bool capture_resolved_sculpt_sampler =
+             stage.l_stage == Shader::LogicalStage::Fragment &&
+             stage.pgm_hash == DreamsSculptFragmentShader && sampler_index == 0;
+--- /dev/null
++++ b/src/video_core/texture_cache/min_lod_fallback.h
+@@ -0,0 +1,63 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++
++#include <algorithm>
++#include <optional>
++#include "video_core/amdgpu/resource.h"
++
++namespace VideoCore {
++
++// A sampler may be shared by several images. Only use a sampler-side fallback
++// when every sampled view has the same effective minimum in view-relative units.
++// Call Add after cache aliases have resolved to their final backing image.
++struct CommonViewMinLod {
++    explicit CommonViewMinLod(bool native_supported) : blocked{native_supported} {}
++
++    void Add(u32 base, u32 levels, u32 minimum) {
++        if (blocked) {
++            return;
++        }
++        if (base >= 16 || levels == 0 || levels > 16 - base) {
++            blocked = true;
++            return;
++        }
++        const u32 first = base * 256;
++        const u32 last = (base + levels - 1) * 256;
++        const u32 relative = std::clamp(minimum, first, last) - first;
++        if (common && *common != relative) {
++            blocked = true;
++        } else {
++            common = relative;
++        }
++    }
++
++    bool Apply(AmdGpu::Sampler& sampler) const {
++        // Changing lambda must not change the spatial filter or anisotropy.
++        if (blocked || !common || *common == 0 ||
++            sampler.xy_min_filter != sampler.xy_mag_filter ||
++            AmdGpu::IsAnisoFilter(sampler.xy_min_filter) ||
++            sampler.min_lod > sampler.max_lod ||
++            sampler.mip_filter.Value() > AmdGpu::MipFilter::Linear) {
++            return false;
++        }
++        u32 minimum = sampler.min_lod.Value();
++        u32 maximum = sampler.max_lod.Value();
++        if (sampler.mip_filter == AmdGpu::MipFilter::None) {
++            // Preserve the existing no-mip sampler's [0, .25] clamp before
++            // applying the view minimum. The view clamp comes after it.
++            minimum = std::min(minimum, 64u);
++            maximum = std::min(maximum, 64u);
++            sampler.mip_filter.Assign(AmdGpu::MipFilter::Point);
++        }
++        sampler.min_lod.Assign(std::max(minimum, *common));
++        sampler.max_lod.Assign(std::max(maximum, *common));
++        return true;
++    }
++
++private:
++    std::optional<u32> common;
++    bool blocked{};
++};
++
++} // namespace VideoCore
