@@ -4,3 +4,5 @@ patches/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/**/*.exe -text
 builds/**/*.png -text
 builds/cusa04301-clean-main-20261025/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-shadow-fix-20261025/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-shadow-fix-20261025/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

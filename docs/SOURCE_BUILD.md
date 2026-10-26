@@ -2,7 +2,7 @@
 
 ## Current October 25 build
 
-Use the [October 25 source manifest](../builds/cusa04301-clean-main-20261025/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply the listed patches in order through `dreams-clean-main-20261025.patch`. The source overlays and patch application were verified; full fresh-build reproducibility has not been established. Do not combine this recipe with the separate older October 4/6 diagnostic stack below. See [the update record](../CLEAN_MAIN_BUILD_20261025.md#source-and-packaging-evidence) for provenance and validation limits.
+Use the [October 25 shadow-update source manifest](../builds/cusa04301-shadow-fix-20261025/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply the listed patches in order through `dreams-shadow-distance-20261025.patch`. This includes the preceding `dreams-clean-main-20261025.patch`; do not skip it. The source overlays and patch application were verified; full fresh-build reproducibility has not been established. Do not combine this recipe with the separate older October 4/6 diagnostic stack below. See [the update record](../CLEAN_MAIN_BUILD_20261025.md#source-and-packaging-evidence) for provenance and validation limits.
 
 ## Earlier source instructions
 

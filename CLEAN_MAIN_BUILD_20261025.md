@@ -1,38 +1,35 @@
-# Clean main build — October 25, 2026
+# Clean main shadow update — October 25, 2026
 
-**[Download the graphical launcher package](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-clean-main-20261025/Dreams-graphical-launcher-20261025.zip)**
+**[Download the graphical launcher package](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-shadow-fix-20261025/Dreams-graphical-launcher-shadow-fix-20261025.zip)**
 
-Extract the complete ZIP, open **shadPS4QtLauncher.exe**, add your own Dreams game folder and click **Play**. The October 25 core and matching settings are selected automatically, as in the October 21 update. No command prompt is needed. Keep the extracted folder together; your own game/system setup is required.
-
-Core executable SHA-256:
-`35cb8a3c407cb3b15b4e1fe05c10e127338ab4dd21aa251fc7ad0365cce7c921`.
+Extract the complete ZIP, open **shadPS4QtLauncher.exe**, add your own Dreams game folder and click **Play**. The corrected core and matching settings are selected automatically. No commands are needed.
 
 ## What changed
 
-Dreams reused an allocation for geometry occupancy after it had held a lighting image. The emulator could copy that stale image back over the cleared and updated geometry bits. The resulting false occupancy blocked ambient light and made the tested Tren board almost black. A guarded correction invalidates the old image aliases after the verified complete raw clear, so later reads retain the new geometry data. It does not increase brightness or reduce a global shadow-strength setting.
+- Correct floating-point shadow bounds so negative values are handled correctly.
+- Preserve the required order of the shadow sorting and cascade-partitioning operations, fixing the flicker seen in the cube test.
+- Sample the selected mip's dimensions when refining and building the shadow pyramid. Higher mip levels previously lost valid shadow values, causing the tested cube's shadow to disappear at mid-distance.
 
-This update also includes the retained October 23 texture-size, mip-layout, bounded raw-clear and shader corrections. Compared with that clean pre-debug build, only the rasterizer object changes for the new ambient-shadow correction. The custom right-click debug menu, live signal/resource capture tools and debug-control endpoint are excluded. Background control and runtime recorders are disabled; ordinary emulator diagnostics and earlier dormant diagnostic code remain in the core.
+The earlier ambient-shadow, texture-size, shader and sculpt corrections are retained. The new core is the selected clean main build, SHA-256 `399a8aff073bc669d559048f8071eb9e16e301efca23a40dc5928626b3a8b035`.
 
-## Validation and limitations
+## Validation and known issues
 
-- Six isolated real GPU cases and 22 guard checks passed with no Vulkan or synchronization validation errors. Coverage included stale-image corruption, empty geometry, all 256 occupancy patterns, existing visibility, later image reuse and a second clear.
-- Live captures showed occupancy and ambient visibility recovering. The owner confirmed that the Tren board's colours were visible without new problems in that view.
-- The clean executable contains the identical guarded shadow correction used in that private live test. It compiled and linked successfully; its startup, both main launch routes and the public Qt default route were verified. The clean executable itself has not received a separate full gameplay regression test.
-- The new report of **very small shadows that can disappear at some viewing angles remains unresolved**. Its cause and relationship to earlier changes are not established. This publication deliberately preserves the current main executable before investigating it.
-- Tren lag, intermittent black patches/white-floor flashes and other rendering problems are not claimed fixed. No consistent FPS improvement or slowdown was established by the shadow samples. Other GPUs, scenes and game versions remain unverified.
+The focused GPU checks passed: 195 shadow-bound cases, 330 ordering cases, 112 mip-sampling cases and 19 complete native-shader pyramid cases, with no validation errors. Twenty earlier compiled-shader comparisons remained unchanged. The old pyramid fault was reproduced from captured data; the corrected shader matched the deterministic reference.
 
-The test system used AMD Radeon 8060S and Dreams CUSA04301 with the established 2.64 content installation and Precise GPU readbacks. The package is experimental.
+In the live cube test, flickering stopped and the shadow remained visible in the previously failing mid-distance range. The clean build uses the same tested compiler/cache objects and identical shadow-dispatch changes. Startup and the direct and graphical launch routes passed verification; the clean binary has not received a separate full gameplay regression run.
 
-## Profiles and tutorial bypass
+Testing used AMD Radeon 8060S and Dreams CUSA04301 with version 2.64 content. Other GPUs and versions remain unverified. Tren slowdowns and intermittent black patches/white-floor flashes are still unresolved. No overall performance gain is claimed.
 
-The launcher retains the previous graphical package's normal `%APPDATA%\shadPS4` profile policy. It backs up a different per-game configuration before applying the included settings. It does not move portable saves or replace creations. There are no game files, user saves, creations, accounts, firmware, credentials, captured resources or private session manifests in the package.
+## Saves and tutorial bypass
 
-The optional **tutorial-skip/Skip Dreams Tutorial.exe** provides a graphical version of the previously tested progression helper. Close Dreams, open it, choose your own `CUSA04301/SYSTEM/savedata.json`, and confirm. It changes only the supported progression flags and creates an exact backup beside the save. It preserves the three optional voice-over flags and other data, and refuses unsupported formats. Its 15 synthetic checks passed; another player's tutorial outcome has not been live-verified. It is a bypass, not a repair of the tutorial engine.
+The launcher uses the normal `%APPDATA%\shadPS4` profile. It backs up a different per-game configuration before applying the included settings; it does not move portable saves or replace creations. The download contains no games, firmware, user saves or creations.
+
+If a tutorial blocks progress, close Dreams and open **tutorial-skip/Skip Dreams Tutorial.exe**. Select your own `CUSA04301/SYSTEM/savedata.json`. The unchanged helper backs up the file before changing supported progression flags.
 
 ## Source and packaging evidence
 
-- [Checksums](builds/cusa04301-clean-main-20261025/SHA256SUMS.txt), [package checks](builds/cusa04301-clean-main-20261025/verification.json), and [runtime file manifest](builds/cusa04301-clean-main-20261025/runtime-manifest.json).
-- [Source manifest](builds/cusa04301-clean-main-20261025/source-manifest.json) and [source delta from October 21](patches/dreams-clean-main-20261025.patch). Start from public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d` and apply the manifest's patches in order. The previous 970 source-file hashes and 44 selected source/header overlays were checked, and the new patch applies cleanly. Machine-local `#line` filenames are made project-relative. A full fresh source rebuild is not claimed.
-- The unchanged Qt launcher/runtime is taken from the verified October 21 package. Its [corresponding launcher source](builds/cusa04301-image-cache-20261021/qt-launcher-source-99e9829.tar.gz) and existing third-party notices/licenses remain applicable. The updated [settings adapter](builds/cusa04301-clean-main-20261025/DreamsCore.cs) and [optional tutorial helper](builds/cusa04301-clean-main-20261025/SkipDreamsTutorial.cs) are included as source.
+- [Checksums](builds/cusa04301-shadow-fix-20261025/SHA256SUMS.txt), [package verification](builds/cusa04301-shadow-fix-20261025/verification.json), and [runtime file manifest](builds/cusa04301-shadow-fix-20261025/runtime-manifest.json).
+- [Source manifest](builds/cusa04301-shadow-fix-20261025/source-manifest.json) and [shadow correction patch](patches/dreams-shadow-distance-20261025.patch). Start from public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d` and apply every listed patch in order, including the preceding clean-main patch. The new delta changes 13 source/header files. Patch application and source hashes were checked; a fresh full-source rebuild is not claimed.
+- [Settings adapter source](builds/cusa04301-shadow-fix-20261025/DreamsCore.cs), [tutorial helper source](builds/cusa04301-shadow-fix-20261025/SkipDreamsTutorial.cs), and the unchanged [Qt launcher source](builds/cusa04301-image-cache-20261021/qt-launcher-source-99e9829.tar.gz). Existing third-party notices and licenses remain included.
 
-Every ZIP member was allowlisted, hashed and checked.
+All 45 ZIP members were allowlisted and verified against their hashes. The previous [October 25 package](builds/cusa04301-clean-main-20261025/) remains available.

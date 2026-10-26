@@ -1,0 +1,478 @@
+--- a/src/shader_recompiler/backend/spirv/dreams_stateful_order.h
++++ b/src/shader_recompiler/backend/spirv/dreams_stateful_order.h
+@@ -4,25 +4,35 @@
+ #include "shader_recompiler/dreams_compat.h"
+ 
+ namespace Shader::Backend::SPIRV {
++inline u32 DreamsAdditionalIndirectMaxGroups(u64 hash) {
++    switch (hash) {
++    case 0x4bc902cf: return DreamsCompat::StatefulOrderedMaxGroups;
++    case 0xbce8c0fe: // SunShadowSortDrawKeys
++    case 0x6f408bbc: // SunShadowPartitionByCascade
++    case 0xa25580f7: // SunShadowPartitionByCascadeSecondPass
++        return DreamsCompat::MaxTraversalWorkgroups;
++    default: return 0;
++    }
++}
+ inline Id DreamsStatefulShapeValid(EmitContext& ctx) {
+     const Id dims=ctx.OpLoad(ctx.U32[3],ctx.num_workgroups_id);
+     const Id x=ctx.OpCompositeExtract(ctx.U32[1],dims,0);
+     const Id y=ctx.OpCompositeExtract(ctx.U32[1],dims,1);
+     const Id z=ctx.OpCompositeExtract(ctx.U32[1],dims,2);
+     return ctx.OpLogicalAnd(ctx.U1[1],
+-        ctx.OpULessThanEqual(ctx.U1[1],x,ctx.ConstU32(DreamsCompat::StatefulOrderedMaxGroups)),
++        ctx.OpULessThanEqual(ctx.U1[1],x,ctx.ConstU32(DreamsAdditionalIndirectMaxGroups(ctx.info.pgm_hash))),
+         ctx.OpLogicalAnd(ctx.U1[1],ctx.OpIEqual(ctx.U1[1],y,ctx.u32_one_value),
+                          ctx.OpIEqual(ctx.U1[1],z,ctx.u32_one_value)));
+ }
+ inline Id DreamsStatefulPhase(EmitContext& ctx) {
+-    if(ctx.info.pgm_hash!=0x4bc902cf) return ctx.dreams_ordered_phase;
++    if(!DreamsAdditionalIndirectMaxGroups(ctx.info.pgm_hash)) return ctx.dreams_ordered_phase;
+     // Unsupported indirect dimensions execute the original shader once, during Replay.
+     // Its Collect dispatch exits at entry and the cleared scan count remains zero.
+     return ctx.OpSelect(ctx.U32[1],DreamsStatefulShapeValid(ctx),ctx.dreams_ordered_phase,
+                         ctx.ConstU32(DreamsCompat::OrderedPhaseNative));
+ }
+ inline void EmitDreamsStatefulCollectGate(EmitContext& ctx) {
+-    if(ctx.info.pgm_hash!=0x4bc902cf ||
++    if(!DreamsAdditionalIndirectMaxGroups(ctx.info.pgm_hash) ||
+        !DreamsCompat::UseAdditionalExactOrderedCountReplay(ctx.info.pgm_hash)) return;
+     const Id valid=DreamsStatefulShapeValid(ctx);
+     const Id collect=ctx.OpIEqual(ctx.U1[1],ctx.dreams_ordered_phase,
+@@ -37,7 +47,7 @@
+         ctx.OpIEqual(ctx.U1[1],ctx.workgroup_index_id,ctx.u32_zero_value));
+     const Id publish=ctx.OpLogicalAnd(ctx.U1[1],collect,ctx.OpLogicalAnd(ctx.U1[1],valid,first));
+     const auto gds=std::ranges::find(ctx.buffers,BufferType::GdsBuffer,&EmitContext::BufferDefinition::buffer_type);
+-    ASSERT_MSG(gds!=ctx.buffers.end(),"Dreams 4bc indirect count has no GDS buffer");
++    ASSERT_MSG(gds!=ctx.buffers.end(),"Dreams additional indirect count has no GDS buffer");
+     const auto [id,type]=gds->Alias(EmitContext::PointerType::U32);
+     Id address=ctx.ConstU32(DreamsCompat::TraversalOrderedGroupCountDword);
+     if(const Id offset=gds->Offset(EmitContext::PointerSize::B32);Sirit::ValidId(offset))
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+@@ -43,6 +43,72 @@
+     const Id image{ctx.OpLoad(texture.image_type, texture.id)};
+     const Id texel{ctx.OpImageRead(ctx.F32[4], image, coords)};
+     return ctx.OpCompositeExtract(ctx.F32[1], texel, 0);
++}
++
++// DS floating-point min/max use ordered comparisons, retain the old bits on
++// equality/unordered operands, and preserve subnormals independently of VALU mode.
++// Integer comparisons implement that ordering without the host's float flush mode.
++Id AtomicFloatMinMax(EmitContext& ctx, Id pointer, Id value, bool is_min, bool shared) {
++    const Id incoming = ctx.OpBitcast(ctx.U32[1], value);
++    const Id sign = ctx.ConstU32(0x80000000u);
++    const Id magnitude_mask = ctx.ConstU32(0x7fffffffu);
++    const Id infinity = ctx.ConstU32(0x7f800000u);
++    const auto key = [&](Id bits) {
++        const Id negative = ctx.OpINotEqual(ctx.U1[1],
++            ctx.OpBitwiseAnd(ctx.U32[1], bits, sign), ctx.u32_zero_value);
++        return ctx.OpSelect(ctx.U32[1], negative, ctx.OpNot(ctx.U32[1], bits),
++                            ctx.OpBitwiseXor(ctx.U32[1], bits, sign));
++    };
++    const Id incoming_key = key(incoming);
++    const Id incoming_magnitude = ctx.OpBitwiseAnd(ctx.U32[1], incoming, magnitude_mask);
++    const Id incoming_number = ctx.OpULessThanEqual(ctx.U1[1], incoming_magnitude, infinity);
++    const Id scope = ctx.ConstU32(static_cast<u32>(shared ? spv::Scope::Workgroup : spv::Scope::Device));
++    const Id semantics = ctx.u32_zero_value;
++    const Id header = ctx.OpLabel();
++    const Id body = ctx.OpLabel();
++    const Id next = ctx.OpLabel();
++    const Id merge = ctx.OpLabel();
++    ctx.OpBranch(header);
++    ctx.AddLabel(header);
++    ctx.OpLoopMerge(merge, next, spv::LoopControlMask::MaskNone);
++    ctx.OpBranch(body);
++    ctx.AddLabel(body);
++    const Id old = ctx.OpAtomicLoad(ctx.U32[1], pointer, scope, semantics);
++    const Id old_magnitude = ctx.OpBitwiseAnd(ctx.U32[1], old, magnitude_mask);
++    const Id both_numbers = ctx.OpLogicalAnd(ctx.U1[1], incoming_number,
++        ctx.OpULessThanEqual(ctx.U1[1], old_magnitude, infinity));
++    const Id both_zero = ctx.OpIEqual(ctx.U1[1],
++        ctx.OpBitwiseOr(ctx.U32[1], incoming_magnitude, old_magnitude), ctx.u32_zero_value);
++    const Id old_key = key(old);
++    const Id ordered = is_min ? ctx.OpULessThan(ctx.U1[1], incoming_key, old_key)
++                              : ctx.OpUGreaterThan(ctx.U1[1], incoming_key, old_key);
++    const Id replace = ctx.OpLogicalAnd(ctx.U1[1], both_numbers,
++        ctx.OpLogicalAnd(ctx.U1[1], ctx.OpLogicalNot(ctx.U1[1], both_zero), ordered));
++    const Id wanted = ctx.OpSelect(ctx.U32[1], replace, incoming, old);
++    const Id observed = ctx.OpAtomicCompareExchange(ctx.U32[1], pointer, scope,
++        semantics, semantics, wanted, old);
++    const Id committed = ctx.OpIEqual(ctx.U1[1], observed, old);
++    ctx.OpBranchConditional(committed, merge, next);
++    ctx.AddLabel(next);
++    ctx.OpBranch(header);
++    ctx.AddLabel(merge);
++    return ctx.OpBitcast(ctx.F32[1], old);
++}
++
++Id SharedAtomicFloatMinMax(EmitContext& ctx, Id offset, Id value, bool is_min) {
++    const Id index = ctx.OpShiftRightLogical(ctx.U32[1], offset, ctx.ConstU32(2u));
++    const Id ptr = ctx.EmitSharedMemoryAccess(ctx.shared_u32, ctx.shared_memory_u32, index);
++    return AtomicFloatMinMax(ctx, ptr, value, is_min, true);
++}
++
++Id BufferDataShareFloatMinMax(EmitContext& ctx, u32 handle, Id address, Id value, bool is_min) {
++    const auto& buffer = ctx.buffers[handle];
++    if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
++        address = ctx.OpIAdd(ctx.U32[1], address, offset);
++    }
++    const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
++    const Id ptr = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address);
++    return AtomicFloatMinMax(ctx, ptr, value, is_min, false);
+ }
+ 
+ Id SharedAtomicU32(EmitContext& ctx, Id offset, Id value,
+@@ -239,6 +305,14 @@
+     return SharedAtomicU64(ctx, offset, value, &Sirit::Module::OpAtomicSMax);
+ }
+ 
++Id EmitSharedAtomicFMin32(EmitContext& ctx, Id offset, Id value) {
++    return SharedAtomicFloatMinMax(ctx, offset, value, true);
++}
++
++Id EmitSharedAtomicFMax32(EmitContext& ctx, Id offset, Id value) {
++    return SharedAtomicFloatMinMax(ctx, offset, value, false);
++}
++
+ Id EmitSharedAtomicUMin32(EmitContext& ctx, Id offset, Id value) {
+     return SharedAtomicU32(ctx, offset, value, &Sirit::Module::OpAtomicUMin);
+ }
+@@ -340,6 +414,11 @@
+ }
+ 
+ Id EmitBufferAtomicFMin32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
++
++    if (ctx.buffers[handle].buffer_type == BufferType::GdsBuffer ||
++        ctx.buffers[handle].buffer_type == BufferType::SharedMemory) {
++        return BufferDataShareFloatMinMax(ctx, handle, address, value, true);
++    }
+     if (ctx.profile.supports_buffer_fp32_atomic_min_max) {
+         return BufferAtomicU32<true>(ctx, inst, handle, address, value,
+                                      &Sirit::Module::OpAtomicFMin);
+@@ -378,6 +457,11 @@
+ }
+ 
+ Id EmitBufferAtomicFMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
++
++    if (ctx.buffers[handle].buffer_type == BufferType::GdsBuffer ||
++        ctx.buffers[handle].buffer_type == BufferType::SharedMemory) {
++        return BufferDataShareFloatMinMax(ctx, handle, address, value, false);
++    }
+     if (ctx.profile.supports_buffer_fp32_atomic_min_max) {
+         return BufferAtomicU32<true>(ctx, inst, handle, address, value,
+                                      &Sirit::Module::OpAtomicFMax);
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_instructions.h
+@@ -146,6 +146,8 @@
+ Id EmitSharedAtomicUMax64(EmitContext& ctx, Id offset, Id value);
+ Id EmitSharedAtomicSMax32(EmitContext& ctx, Id offset, Id value);
+ Id EmitSharedAtomicSMax64(EmitContext& ctx, Id offset, Id value);
++Id EmitSharedAtomicFMin32(EmitContext& ctx, Id offset, Id value);
++Id EmitSharedAtomicFMax32(EmitContext& ctx, Id offset, Id value);
+ Id EmitSharedAtomicUMin32(EmitContext& ctx, Id offset, Id value);
+ Id EmitSharedAtomicUMin64(EmitContext& ctx, Id offset, Id value);
+ Id EmitSharedAtomicSMin32(EmitContext& ctx, Id offset, Id value);
+--- a/src/shader_recompiler/frontend/translate/data_share.cpp
++++ b/src/shader_recompiler/frontend/translate/data_share.cpp
+@@ -237,7 +237,7 @@
+ void Translator::DS_OP_F32(const GcnInst& inst, AtomicOp op, bool rtn) {
+     const bool is_gds = inst.control.ds.gds;
+     const IR::U32 addr{GetSrc(inst.src[0])};
+-    const IR::U32 data{ir.BitCast<IR::U32>(GetSrc<IR::F32>(inst.src[1]))};
++    const IR::F32 data{GetSrc<IR::F32>(inst.src[1])};
+     const IR::U32 offset =
+         ir.Imm32((u32(inst.control.ds.offset1) << 8u) + u32(inst.control.ds.offset0));
+     IR::U32 addr_offset = ir.IAdd(addr, offset);
+@@ -245,21 +245,18 @@
+         const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+         addr_offset = ir.IAdd(base, addr_offset);
+     }
+-
+-    // This quick path assumes the values are in the non-negative float range, where integer
+-    // ordering matches IEEE-754 bit ordering. Dreams reaches this path while booting.
+-    const IR::U32 original_val = [&] {
++    const IR::F32 original_val = [&] {
+         switch (op) {
+         case AtomicOp::Fmin:
+-            return IR::U32{ir.SharedAtomicIMin(addr_offset, data, false, is_gds)};
++            return ir.SharedAtomicFMin(addr_offset, data, is_gds);
+         case AtomicOp::Fmax:
+-            return IR::U32{ir.SharedAtomicIMax(addr_offset, data, false, is_gds)};
++            return ir.SharedAtomicFMax(addr_offset, data, is_gds);
+         default:
+             UNREACHABLE();
+         }
+     }();
+     if (rtn) {
+-        SetDst(inst.dst[0], original_val);
++        SetDst(inst.dst[0], ir.BitCast<IR::U32>(original_val));
+     }
+ }
+ 
+--- a/src/shader_recompiler/ir/ir_emitter.cpp
++++ b/src/shader_recompiler/ir/ir_emitter.cpp
+@@ -364,6 +364,14 @@
+     default:
+         ThrowInvalidType(data.Type());
+     }
++}
++
++F32 IREmitter::SharedAtomicFMin(const U32& address, const F32& data, bool is_gds) {
++    return Inst<F32>(Opcode::SharedAtomicFMin32, Flags{is_gds}, address, data);
++}
++
++F32 IREmitter::SharedAtomicFMax(const U32& address, const F32& data, bool is_gds) {
++    return Inst<F32>(Opcode::SharedAtomicFMax32, Flags{is_gds}, address, data);
+ }
+ 
+ U32U64 IREmitter::SharedAtomicAnd(const U32& address, const U32U64& data, bool is_gds) {
+--- a/src/shader_recompiler/ir/ir_emitter.h
++++ b/src/shader_recompiler/ir/ir_emitter.h
+@@ -108,6 +108,9 @@
+                                           bool is_gds);
+     [[nodiscard]] U32U64 SharedAtomicIMax(const U32& address, const U32U64& data, bool is_signed,
+                                           bool is_gds);
++    [[nodiscard]] F32 SharedAtomicFMin(const U32& address, const F32& data, bool is_gds);
++    [[nodiscard]] F32 SharedAtomicFMax(const U32& address, const F32& data, bool is_gds);
++
+     [[nodiscard]] U32U64 SharedAtomicAnd(const U32& address, const U32U64& data, bool is_gds);
+     [[nodiscard]] U32U64 SharedAtomicOr(const U32& address, const U32U64& data, bool is_gds);
+     [[nodiscard]] U32U64 SharedAtomicXor(const U32& address, const U32U64& data, bool is_gds);
+--- a/src/shader_recompiler/ir/microinstruction.cpp
++++ b/src/shader_recompiler/ir/microinstruction.cpp
+@@ -93,6 +93,8 @@
+     case Opcode::SharedAtomicIAdd32:
+     case Opcode::SharedAtomicISub32:
+     case Opcode::SharedAtomicSMin32:
++    case Opcode::SharedAtomicFMin32:
++    case Opcode::SharedAtomicFMax32:
+     case Opcode::SharedAtomicUMin32:
+     case Opcode::SharedAtomicSMax32:
+     case Opcode::SharedAtomicUMax32:
+--- a/src/shader_recompiler/ir/opcodes.inc
++++ b/src/shader_recompiler/ir/opcodes.inc
+@@ -462,3 +462,7 @@
+ OPCODE(DataOrderedCount,                                    U32,            U32,            U32,            U32,            U32                             )
+ OPCODE(DreamsSculptCheckpoint,                              Void,           U32x4,          U32x3,          U1                                              )
+ OPCODE(GroupAny,                                            U1,             U1,                                                                             )
++
++// IEEE floating-point comparisons over 32-bit LDS/GDS storage.
++OPCODE(SharedAtomicFMin32, F32, U32, F32, )
++OPCODE(SharedAtomicFMax32, F32, U32, F32, )
+--- a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+@@ -108,6 +108,8 @@
+     case IR::Opcode::WriteSharedU64:
+     case IR::Opcode::SharedAtomicIAdd32:
+     case IR::Opcode::SharedAtomicIAdd64:
++    case IR::Opcode::SharedAtomicFMin32:
++    case IR::Opcode::SharedAtomicFMax32:
+     case IR::Opcode::SharedAtomicUMin32:
+     case IR::Opcode::SharedAtomicUMin64:
+     case IR::Opcode::SharedAtomicSMin32:
+@@ -819,6 +821,12 @@
+         case IR::Opcode::SharedAtomicISub32:
+             inst.ReplaceUsesWith(ir.BufferAtomicISub(handle, address_dwords, inst.Arg(1), {}));
+             break;
++        case IR::Opcode::SharedAtomicFMin32:
++            inst.ReplaceUsesWith(ir.BufferAtomicFMin(handle, address_dwords, inst.Arg(1), {}));
++            break;
++        case IR::Opcode::SharedAtomicFMax32:
++            inst.ReplaceUsesWith(ir.BufferAtomicFMax(handle, address_dwords, inst.Arg(1), {}));
++            break;
+         case IR::Opcode::SharedAtomicSMin32:
+         case IR::Opcode::SharedAtomicUMin32: {
+             const bool is_signed = inst.GetOpcode() == IR::Opcode::SharedAtomicSMin32;
+@@ -1238,10 +1246,17 @@
+     const bool dreams_glass_mip = info.l_stage == LogicalStage::Compute &&
+         info.pgm_hash == 0x345893a7 && !inst_info.is_array &&
+         view_type == AmdGpu::ImageType::Color2D;
+-    const IR::U32 dimension_lod = (dreams_array_2d || dreams_glass_mip) &&
++    // The shadow mip producer and refinement passes supply pixel coordinates already scaled
++    // to their explicit occlusion mip. Normalize against that view mip, keeping
++    // the array slice separate from the LOD register.
++    const bool dreams_shadow_mip = info.l_stage == LogicalStage::Compute &&
++        (info.pgm_hash == 0xe165304b || info.pgm_hash == 0x9f3303a7 ||
++         info.pgm_hash == 0xcfbf6b00) &&
++        inst_info.is_array && view_type == AmdGpu::ImageType::Color2DArray;
++    const IR::U32 dimension_lod = (dreams_array_2d || dreams_glass_mip || dreams_shadow_mip) &&
+                                     unnormalized && inst_info.has_lod
+         ? IR::U32{ir.ConvertFToU(32, ir.FPClamp(
+-              get_addr_reg(addr_reg + (dreams_array_2d ? 3 : 2)), ir.Imm32(0.0f),
++              get_addr_reg(addr_reg + ((dreams_array_2d || dreams_shadow_mip) ? 3 : 2)), ir.Imm32(0.0f),
+               ir.Imm32(float(image.NumViewLevels(image_res.is_array) - 1))))}
+         : ir.Imm32(0u);
+     const bool fold_runtime_offset = !inst_info.is_gather && !is_msaa &&
+--- a/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
++++ b/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
+@@ -45,6 +45,8 @@
+     case IR::Opcode::SharedAtomicIAdd32:
+     case IR::Opcode::SharedAtomicISub32:
+     case IR::Opcode::SharedAtomicSMin32:
++    case IR::Opcode::SharedAtomicFMin32:
++    case IR::Opcode::SharedAtomicFMax32:
+     case IR::Opcode::SharedAtomicUMin32:
+     case IR::Opcode::SharedAtomicSMax32:
+     case IR::Opcode::SharedAtomicUMax32:
+@@ -128,9 +130,14 @@
+         info.uses_image_atomic_float_min_max = true;
+         break;
+     case IR::Opcode::BufferAtomicFMax32:
+-    case IR::Opcode::BufferAtomicFMin32:
+-        info.uses_buffer_atomic_float_min_max = true;
+-        break;
++    case IR::Opcode::BufferAtomicFMin32: {
++        const auto type = info.buffers[inst.Arg(0).U32()].buffer_type;
++        // DS float min/max use integer compare-exchange, including spilled LDS.
++        if (type != BufferType::GdsBuffer && type != BufferType::SharedMemory) {
++            info.uses_buffer_atomic_float_min_max = true;
++        }
++        break;
++    }
+     case IR::Opcode::BufferAtomicIAdd64:
+     case IR::Opcode::BufferAtomicSMax64:
+     case IR::Opcode::BufferAtomicSMin64:
+--- a/src/shader_recompiler/ir/passes/shared_memory_to_storage_pass.cpp
++++ b/src/shader_recompiler/ir/passes/shared_memory_to_storage_pass.cpp
+@@ -19,6 +19,8 @@
+     case IR::Opcode::SharedAtomicIAdd32:
+     case IR::Opcode::SharedAtomicISub32:
+     case IR::Opcode::SharedAtomicSMin32:
++    case IR::Opcode::SharedAtomicFMin32:
++    case IR::Opcode::SharedAtomicFMax32:
+     case IR::Opcode::SharedAtomicUMin32:
+     case IR::Opcode::SharedAtomicSMax32:
+     case IR::Opcode::SharedAtomicUMax32:
+@@ -61,6 +63,8 @@
+             case IR::Opcode::SharedAtomicIAdd32:
+             case IR::Opcode::SharedAtomicISub32:
+             case IR::Opcode::SharedAtomicSMin32:
++            case IR::Opcode::SharedAtomicFMin32:
++            case IR::Opcode::SharedAtomicFMax32:
+             case IR::Opcode::SharedAtomicUMin32:
+             case IR::Opcode::SharedAtomicSMax32:
+             case IR::Opcode::SharedAtomicUMax32:
+@@ -143,6 +147,12 @@
+                 inst.ReplaceUsesWithAndRemove(
+                     ir.BufferAtomicISub(handle, address, inst.Arg(1), {}));
+                 continue;
++            case IR::Opcode::SharedAtomicFMin32:
++                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicFMin(handle, address, inst.Arg(1), {}));
++                continue;
++            case IR::Opcode::SharedAtomicFMax32:
++                inst.ReplaceUsesWithAndRemove(ir.BufferAtomicFMax(handle, address, inst.Arg(1), {}));
++                continue;
+             case IR::Opcode::SharedAtomicSMin32:
+             case IR::Opcode::SharedAtomicUMin32:
+             case IR::Opcode::SharedAtomicSMin64:
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -171,6 +171,15 @@
+     // PrimGlassPS changes only its depth-rejection saved-mask scalar branch.
+     if (info.l_stage == Shader::LogicalStage::Fragment && info.pgm_hash == 0x619002ef) {
+         key += "_glass_final_scc1";
++    }
++    // Only the two corrected sun-shadow sampling programs need recompilation.
++    if (info.l_stage == Shader::LogicalStage::Compute &&
++        (info.pgm_hash == 0xe165304b || info.pgm_hash == 0x9f3303a7)) {
++        key += "_shadow_mip_coords1";
++    }
++    // Recompile the shadow height pyramid producer after fixing its source-mip coordinates.
++    if (info.l_stage == Shader::LogicalStage::Compute && info.pgm_hash == 0xcfbf6b00) {
++        key += "_shadow_pyramid_coords1";
+     }
+     return key;
+ }
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -24985,6 +24985,19 @@
+                     state[1], state[2], state[3], state[4], state[5], state[6], state[7], state[8],
+                     state[9], state[10]);
+     }
++    const bool shadow_ordered_kernel = cs.pgm_hash == 0xbce8c0fe ||
++        cs.pgm_hash == 0x6f408bbc || cs.pgm_hash == 0xa25580f7;
++    const auto shadow_ordered = Shader::DreamsCompat::AdditionalOrderedKernelFor(cs.pgm_hash);
++    const u32 shadow_radix_pass = shadow_ordered.radix_pass && cs.flattened_ud_buf.size() > 24
++        ? cs.flattened_ud_buf[24] : 0;
++    const bool use_shadow_ordered_indirect = shadow_ordered_kernel &&
++        Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
++        instance.IsSubgroupSize64Supported() &&
++        AdditionalOrderedReplayInputsSafe(cs,shadow_radix_pass,image_bindings,texture_cache) &&
++        Shader::DreamsCompat::HasOrderedWaveLaunch(cs_program.dispatch_initiator) &&
++        cs_program.start_x == 0 && cs_program.start_y == 0 && cs_program.start_z == 0 &&
++        cs_program.num_thread_x.full == 64 && cs_program.num_thread_y.full == 1 &&
++        cs_program.num_thread_z.full == 1;
+     const bool use_stateful_indirect = cs.pgm_hash==0x4bc902cf &&
+         Common::ElfInfo::Instance().GameSerial()=="CUSA04301" &&
+         AdditionalOrderedReplayInputsSafe(cs,0,image_bindings,texture_cache) &&
+@@ -25446,7 +25459,7 @@
+ 
+     scheduler.EndRendering();
+     push_data.host_data[Shader::PushData::DreamsOrderedPhase] =
+-        use_stateful_indirect || use_dreams_traversal_ordered_prefix || use_dreams_queue_producer_alt_ordered_prefix ||
++        use_shadow_ordered_indirect || use_stateful_indirect || use_dreams_traversal_ordered_prefix || use_dreams_queue_producer_alt_ordered_prefix ||
+                 use_dreams_visibility_candidate_ordered_prefix ||
+                 use_dreams_visibility_list_ordered_prefix
+             ? Shader::DreamsCompat::OrderedPhaseCollect
+@@ -25512,7 +25525,19 @@
+                   Shader::DreamsCompat::StatefulOrderedMaxGroups*sizeof(u32)};
+         cmdbuf.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount=1,.pBufferMemoryBarriers=&barrier});
+     };
+-    if (use_stateful_indirect) {
++    if (use_shadow_ordered_indirect) {
++        // Indirect dimensions stay on the GPU. A zero dispatch must not reuse the previous count.
++        dreams_ordered_prefix_pass.ClearGroupCount(cmdbuf,gds->Handle(),gds->SizeBytes(),
++            Shader::DreamsCompat::TraversalOrderedGroupCountDword);
++        const vk::BufferMemoryBarrier2 scratch{
++            .srcStageMask=vk::PipelineStageFlagBits2::eComputeShader,
++            .srcAccessMask=vk::AccessFlagBits2::eShaderStorageRead|vk::AccessFlagBits2::eShaderStorageWrite,
++            .dstStageMask=vk::PipelineStageFlagBits2::eComputeShader,
++            .dstAccessMask=vk::AccessFlagBits2::eShaderStorageWrite,
++            .buffer=gds->Handle(),.offset=vk::DeviceSize(Shader::DreamsCompat::TraversalOrderedScratchBaseDword(0))*sizeof(u32),
++            .size=vk::DeviceSize(Shader::DreamsCompat::OrderedCounterStrideDwords)*shadow_ordered.docs*sizeof(u32)};
++        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount=1,.pBufferMemoryBarriers=&scratch});
++    } else if (use_stateful_indirect) {
+         dreams_ordered_prefix_pass.ClearGroupCount(cmdbuf,gds->Handle(),gds->SizeBytes(),
+             Shader::DreamsCompat::TraversalOrderedGroupCountDword);
+         const vk::BufferMemoryBarrier2 scratch{
+@@ -25631,7 +25656,38 @@
+         dreams_performance_profiler
+             ? dreams_performance_profiler->BeginCompute(cmdbuf, cs.pgm_hash, true, 0, 0, 0)
+             : DreamsPerformanceProfiler::ComputeToken{};
+-    if (use_stateful_indirect) {
++    if (use_shadow_ordered_indirect) {
++        static u32 logged_mask{};
++        const u32 bit = cs.pgm_hash == 0xbce8c0fe ? 1 : cs.pgm_hash == 0x6f408bbc ? 2 : 4;
++        if (!(logged_mask & bit)) {
++            logged_mask |= bit;
++            LOG_WARNING(Render_Vulkan,"Dreams shadow exact DOC active hash={:#x}: indirect collect/prefix/replay",cs.pgm_hash);
++        }
++        cmdbuf.dispatchIndirect(buffer->Handle(),base);
++        std::array<HostPasses::DreamsOrderedPrefixPass::Stream,4> streams{};
++        const u32 counter_base = shadow_ordered.counter_base + shadow_radix_pass;
++        for (u32 i=0; i<shadow_ordered.docs; ++i) streams[i] = {
++            Shader::DreamsCompat::MaxTraversalWorkgroups,counter_base+i,
++            Shader::DreamsCompat::TraversalOrderedScratchBaseDword(i)};
++        dreams_ordered_prefix_pass.RunBatchFromGdsCount(cmdbuf,gds->Handle(),gds->SizeBytes(),
++            std::span{streams}.first(shadow_ordered.docs),
++            Shader::DreamsCompat::TraversalOrderedGroupCountDword,Shader::DreamsCompat::OrderedEntryDwords);
++        // Unsupported dimensions execute the native shader once in replay. Include its writes.
++        const vk::BufferMemoryBarrier2 counters{
++            .srcStageMask=vk::PipelineStageFlagBits2::eComputeShader,
++            .srcAccessMask=vk::AccessFlagBits2::eShaderStorageWrite,
++            .dstStageMask=vk::PipelineStageFlagBits2::eComputeShader,
++            .dstAccessMask=vk::AccessFlagBits2::eShaderStorageRead|vk::AccessFlagBits2::eShaderStorageWrite,
++            .buffer=gds->Handle(),.offset=vk::DeviceSize(counter_base)*sizeof(u32),
++            .size=vk::DeviceSize(shadow_ordered.docs)*sizeof(u32)};
++        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount=1,.pBufferMemoryBarriers=&counters});
++        push_data.host_data[Shader::PushData::DreamsOrderedPhase]=Shader::DreamsCompat::OrderedPhaseReplay;
++        const Pipeline::BufferBarriers no_barriers;
++        pipeline->BindResources(set_writes,no_barriers,push_data);cmdbuf=scheduler.CommandBuffer();
++        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute,pipeline->HandleDreamsOrderedPhase(
++            push_data.host_data[Shader::PushData::DreamsOrderedPhase]));
++        cmdbuf.dispatchIndirect(buffer->Handle(),base);
++    } else if (use_stateful_indirect) {
+         static bool logged{};
+         if(!logged){logged=true;LOG_WARNING(Render_Vulkan,
+             "Dreams 4bc stateful exact DOC active: indirect collect/two-prefix/checkpoint-replay");}

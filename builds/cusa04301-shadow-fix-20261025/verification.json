@@ -1,0 +1,30 @@
+{
+  "core_sha256": "399a8aff073bc669d559048f8071eb9e16e301efca23a40dc5928626b3a8b035",
+  "core_matches_selected_main": true,
+  "qt_default_route_verified": true,
+  "configuration_hash_verified": true,
+  "environment_verified": true,
+  "inherited_diagnostics_removed": true,
+  "publication_started_game": false,
+  "real_profiles_written": false,
+  "shadow_gpu_cases": {
+    "float_shadow_bounds": 195,
+    "ordered_shadow_dispatches": 330,
+    "shadow_refinement_mips": 112,
+    "shadow_pyramid": 19
+  },
+  "shadow_gpu_validation_errors": 0,
+  "compiler_and_cache_objects_identical_to_live_test": true,
+  "clean_shadow_dispatch_changes_identical_to_live_test": true,
+  "private_live_visual_confirmation": "Cube shadow remained stable and visible in the previously failing mid-distance range.",
+  "clean_binary_live_gameplay_tested": false,
+  "performance_gain_established": false,
+  "custom_debug_tools_included": false,
+  "builder_included": false,
+  "user_saves_included": false,
+  "optional_tutorial_gui_unchanged": true,
+  "fresh_full_source_rebuild_verified": false,
+  "zip_sha256": "e924b2c13eba28c51f3fc3104561ea77d73ec7d70f8db43117e8107890d0a61b",
+  "zip_bytes": 60924695,
+  "zip_members": 45
+}

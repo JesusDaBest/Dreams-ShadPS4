@@ -2,7 +2,7 @@
 
 A Windows build of shadPS4 with fixes for **Dreams (CUSA04301)**.
 
-**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-clean-main-20261025/Dreams-graphical-launcher-20261025.zip)**
+**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-shadow-fix-20261025/Dreams-graphical-launcher-shadow-fix-20261025.zip)**
 
 Updated October 25, 2026.
 
@@ -16,11 +16,11 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 
 ## What's included
 
-- Rendering, shader and texture fixes, including the correction for overly dark ambient shadows.
+- Shadow fixes for missing coverage, flickering and disappearance at mid-distance, plus the earlier rendering, shader and texture fixes.
 - The graphical launcher and an optional tutorial-skip tool.
 
 ## Known issues
 
-This is experimental. Lag, intermittent black patches/white flashes, and small shadows that disappear at some angles remain unresolved. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64; other GPUs and versions are unverified.
+This is experimental. Lag and intermittent black patches/white flashes remain. The shadow repair was confirmed in the tested cube scene. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64; other GPUs and versions are unverified.
 
 [Latest release details](CLEAN_MAIN_BUILD_20261025.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
