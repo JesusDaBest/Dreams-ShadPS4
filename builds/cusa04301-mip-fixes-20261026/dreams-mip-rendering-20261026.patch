@@ -1,0 +1,620 @@
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -502,7 +502,9 @@
+     const auto sharp = ctx.info.images[handle & 0xFFFF].GetSharp(ctx.info);
+     const Id zero = ctx.u32_zero_value;
+     const auto mips{[&] { return has_mips ? ctx.OpImageQueryLevels(ctx.U32[1], image) : zero; }};
+-    const bool uses_lod{texture.view_type != AmdGpu::ImageType::Color2DMsaa && !texture.is_storage};
++    const bool uses_lod{texture.view_type != AmdGpu::ImageType::Color2DMsaa &&
++                        texture.view_type != AmdGpu::ImageType::Color2DMsaaArray &&
++                        !texture.is_storage};
+     const auto query{[&](Id type) {
+         return uses_lod ? ctx.OpImageQuerySizeLod(type, image, lod)
+                         : ctx.OpImageQuerySize(type, image);
+@@ -515,6 +517,7 @@
+     case AmdGpu::ImageType::Color2DMsaa:
+         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[2]), zero, mips());
+     case AmdGpu::ImageType::Color2DArray:
++    case AmdGpu::ImageType::Color2DMsaaArray:
+     case AmdGpu::ImageType::Color3D:
+         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
+     default:
+@@ -554,7 +557,8 @@
+     Id texel;
+     if (!texture.is_storage) {
+         const Id image = ctx.OpLoad(texture.image_type, texture.id);
+-        if (texture.view_type != AmdGpu::ImageType::Color2DMsaa) {
++        if (texture.view_type != AmdGpu::ImageType::Color2DMsaa &&
++            texture.view_type != AmdGpu::ImageType::Color2DMsaaArray) {
+             if (Sirit::ValidId(ms)) {
+                 LOG_ERROR(Render_Recompiler, "image is not MS but ms operand is provided");
+             }
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1074,6 +1074,9 @@
+         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, false, sampled, format);
+     case AmdGpu::ImageType::Color2DMsaa:
+         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, true, sampled, format);
++    case AmdGpu::ImageType::Color2DMsaaArray:
++        ctx.AddCapability(spv::Capability::ImageMSArray);
++        return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, true, sampled, format);
+     case AmdGpu::ImageType::Color3D:
+         return ctx.TypeImage(sampled_type, spv::Dim::Dim3D, false, false, false, sampled, format);
+     default:
+--- a/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_tracking_pass.cpp
+@@ -1,4 +1,3 @@
+-#line 1 "src/shader_recompiler/ir/passes/resource_tracking_pass.cpp"
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -1089,12 +1088,11 @@
+ }
+ 
+ IR::F32 OffsetToCoord(IR::IREmitter& ir, const IR::Value& offset, const IR::Value& dimensions,
+-                      u32 offset_comp, u32 dim_comp, bool unnormalized) {
++                      u32 offset_comp, u32 dim_comp) {
+     const auto offset_float =
+         ir.ConvertSToF(32, 32, IR::U32{OffsetComponent(ir, offset, offset_comp)});
+-    if (unnormalized) {
+-        return IR::F32{offset_float};
+-    }
++    // Sampling coordinates have already been normalized, including guest UNRM inputs.
++    // Convert texel offsets to the same units before adding them.
+     const auto dim_float =
+         ir.ConvertUToF(32, 32, IR::U32{ir.CompositeExtract(dimensions, dim_comp)});
+     return ir.FPDiv(offset_float, dim_float);
+@@ -1102,10 +1100,10 @@
+ 
+ IR::Value ApplyRuntimeOffsetToCoords(IR::IREmitter& ir, AmdGpu::ImageType view_type,
+                                      const IR::Value& coords, const IR::Value& offset,
+-                                     const IR::Value& dimensions, bool unnormalized) {
++                                     const IR::Value& dimensions) {
+     const auto add_offset = [&](const IR::Value& coord, u32 offset_comp, u32 dim_comp) {
+         return ir.FPAdd(IR::F32{coord},
+-                        OffsetToCoord(ir, offset, dimensions, offset_comp, dim_comp, unnormalized));
++                        OffsetToCoord(ir, offset, dimensions, offset_comp, dim_comp));
+     };
+ 
+     switch (view_type) {
+@@ -1237,21 +1235,28 @@
+     // Dreams' traversal, fleck selection and depth-pyramid producer supply (x, y, slice, LOD)
+     // even when their occlusion map is a plain 2D texture. The ignored slice still
+     // occupies a VGPR; preserve the explicit LOD and its coordinate dimensions.
++    // Captured sprite/geometry culling programs use the same (x,y,slice,LOD)
++    // convention and scale their pixel coordinates by the chosen LOD.
++    const bool dreams_culling_mip = info.l_stage == LogicalStage::Compute &&
++        inst_info.is_unnormalized && inst_info.has_lod &&
++        (info.pgm_hash == 0x0ffa5e6b || info.pgm_hash == 0x692f0f7f ||
++         info.pgm_hash == 0xe4dcd599 || info.pgm_hash == 0xfd2a2c3b);
+     const bool dreams_array_2d =
+         (info.pgm_hash == DreamsCompat::TraversalShader || info.pgm_hash == 0x4bc902cf ||
+-         info.pgm_hash == 0x34267ace || info.pgm_hash == 0x3091e6c1) &&
++         info.pgm_hash == 0x34267ace || info.pgm_hash == 0x3091e6c1 ||
++         dreams_culling_mip) &&
+         inst_info.is_array && view_type == AmdGpu::ImageType::Color2D;
+     // PrimGlassMipBlurDownCS supplies pixel coordinates in its selected source mip.
+     // Dividing by mip zero crops every reduction after the first to a smaller corner.
+     const bool dreams_glass_mip = info.l_stage == LogicalStage::Compute &&
+         info.pgm_hash == 0x345893a7 && !inst_info.is_array &&
+         view_type == AmdGpu::ImageType::Color2D;
+-    // The shadow mip producer and refinement passes supply pixel coordinates already scaled
++    // The sun/spotlight mip producers and sun refinement supply pixel coordinates already scaled
+     // to their explicit occlusion mip. Normalize against that view mip, keeping
+     // the array slice separate from the LOD register.
+     const bool dreams_shadow_mip = info.l_stage == LogicalStage::Compute &&
+         (info.pgm_hash == 0xe165304b || info.pgm_hash == 0x9f3303a7 ||
+-         info.pgm_hash == 0xcfbf6b00) &&
++         info.pgm_hash == 0xcfbf6b00 || info.pgm_hash == 0x5e8446a4) &&
+         inst_info.is_array && view_type == AmdGpu::ImageType::Color2DArray;
+     const IR::U32 dimension_lod = (dreams_array_2d || dreams_glass_mip || dreams_shadow_mip) &&
+                                     unnormalized && inst_info.has_lod
+@@ -1295,6 +1300,10 @@
+             addr_reg = addr_reg + 1;
+             return get_coord(addr_reg - 1, 0);
+         case AmdGpu::ImageType::Color1DArray: // x, slice
++            addr_reg = addr_reg + 2;
++            // An array layer is an index, even when the spatial coordinate is UNRM.
++            return ir.CompositeConstruct(get_coord(addr_reg - 2, 0),
++                                         get_addr_reg(addr_reg - 1));
+         case AmdGpu::ImageType::Color2D:      // x, y
+         case AmdGpu::ImageType::Color2DMsaa:  // x, y
+         {
+@@ -1325,7 +1334,7 @@
+     const IR::F32 lod_clamp = inst_info.has_lod_clamp ? get_addr_reg(addr_reg++) : IR::F32{};
+     const IR::Value sample_coords =
+         fold_runtime_offset
+-            ? ApplyRuntimeOffsetToCoords(ir, view_type, coords, offset, dimensions, unnormalized)
++            ? ApplyRuntimeOffsetToCoords(ir, view_type, coords, offset, dimensions)
+             : coords;
+     const IR::Value sample_offset = fold_runtime_offset ? IR::Value{} : offset;
+ 
+@@ -1768,6 +1777,43 @@
+     clear_pending();
+ }
+ 
++// A merged IMAGE_LOAD_MIP and ordinary writer cannot use a storage-image
++// LOD operand on hosts without image-load/store-LOD. Keep the writer binding,
++// and give only those failing reads an ordinary fetched-image view of the same
++// backing. PatchImageArgs then retains the explicit LOD and view swizzle.
++void SeparateStorageLodReads(IR::Program& program, const Profile& profile) {
++    if (profile.supports_image_load_store_lod) {
++        return;
++    }
++    std::array<u32, NUM_IMAGES> read_bindings;
++    read_bindings.fill(~0u);
++    auto& images = program.info.images;
++    for (IR::Block* const block : program.post_order_blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            if (inst.GetOpcode() != IR::Opcode::ImageRead ||
++                !inst.Flags<IR::TextureInstInfo>().has_lod) {
++                continue;
++            }
++            const u32 binding = inst.Arg(0).U32();
++            const auto image = images[binding];
++            if (!image.is_written || image.mip_fallback_mode != MipStorageFallbackMode::None) {
++                continue;
++            }
++            auto& read_binding = read_bindings[binding];
++            if (read_binding == ~0u) {
++                ASSERT_MSG(images.size() < images.capacity(), "No binding for storage mip read");
++                auto read_image = image;
++                read_image.is_written = false;
++                read_image.is_atomic = false;
++                read_image.is_integer_atomic = false;
++                read_binding = static_cast<u32>(images.size());
++                images.push_back(read_image);
++            }
++            inst.SetArg(0, IR::Value{read_binding});
++        }
++    }
++}
++
+ void ResourceTrackingPass(IR::Program& program, const Profile& profile) {
+     PatchInlineScalarTables(program);
+     // Iterate resource instructions and patch them after finding the sharp.
+@@ -1784,6 +1830,8 @@
+             }
+         }
+     }
++
++    SeparateStorageLodReads(program, profile);
+ 
+     // Pass 2: Patch instruction args
+     for (IR::Block* const block : program.post_order_blocks) {
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -1,4 +1,3 @@
+-#line 1 "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -180,6 +179,22 @@
+     // Recompile the shadow height pyramid producer after fixing its source-mip coordinates.
+     if (info.l_stage == Shader::LogicalStage::Compute && info.pgm_hash == 0xcfbf6b00) {
+         key += "_shadow_pyramid_coords1";
++    }
++    // SpotShadowMipOccluders also supplies coordinates in its explicit source mip.
++    if (info.l_stage == Shader::LogicalStage::Compute && info.pgm_hash == 0x5e8446a4) {
++        key += "_spot_shadow_pyramid_coords1";
++    }
++    // The coordinate/layer repair applies across sampled image types. These
++    // resource flags are persisted in shader metadata and available on both
++    // cache write and load, unlike the current guest sampler descriptors.
++    if (std::ranges::any_of(info.images, [](const auto& image) { return image.is_sampled; })) {
++        key += "_sample_coord_units2";
++    }
++    // Retire only the affected cached visibility shaders.
++    if (info.l_stage == Shader::LogicalStage::Compute &&
++        (info.pgm_hash == 0x0ffa5e6b || info.pgm_hash == 0x692f0f7f ||
++         info.pgm_hash == 0xe4dcd599 || info.pgm_hash == 0xfd2a2c3b)) {
++        key += "_visibility_mip_coords1";
+     }
+     return key;
+ }
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -685,13 +685,17 @@
+     const auto& src_info = src_image.info;
+ 
+     const auto dst_dim = info.props.is_block ? 2 : 0;
+-    const auto mip_block_w = std::max(info.size.width >> (mip + dst_dim), 1u);
+-    const auto mip_block_h = std::max(info.size.height >> (mip + dst_dim), 1u);
++    const u32 mip_width = std::max(info.size.width >> mip, 1u);
++    const u32 mip_height = std::max(info.size.height >> mip, 1u);
++    const auto mip_block_w = (mip_width + (1u << dst_dim) - 1) >> dst_dim;
++    const auto mip_block_h = (mip_height + (1u << dst_dim) - 1) >> dst_dim;
+     const auto mip_block_p = std::max(info.mips_layout[mip].pitch >> dst_dim, 1u);
+ 
+     const auto src_dim = src_info.props.is_block ? 2 : 0;
+-    ASSERT(mip_block_w == (src_info.size.width >> src_dim));
+-    ASSERT(mip_block_h == (src_info.size.height >> src_dim));
++    ASSERT(mip_block_w == ((src_info.size.width + (1u << src_dim) - 1) >> src_dim));
++    ASSERT(mip_block_h == ((src_info.size.height + (1u << src_dim) - 1) >> src_dim));
++    ASSERT(dst_dim != src_dim ||
++           (mip_width == src_info.size.width && mip_height == src_info.size.height));
+     ASSERT(mip_block_p == (src_info.pitch >> src_dim));
+ 
+     const auto [src_layers, dst_layers] = SanitizeCopyLayers(src_info, info, src_info.size.depth);
+@@ -736,23 +740,28 @@
+     Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, mrt1_range);
+ 
+     const auto [src_layers, dst_layers] = SanitizeCopyLayers(src_image.info, info, 1);
++    // Render targets may be views of a cached mip or array slice. Copy the same
++    // subresources that were transitioned above, rather than the whole backing.
++    const u32 copy_layers = std::min({src_layers, dst_layers, mrt0_range.extent.layers,
++                                      mrt1_range.extent.layers});
+     if (src_image.backing->num_samples == 1) {
+         const vk::ImageCopy region = {
+             .srcSubresource{
+                 .aspectMask = vk::ImageAspectFlagBits::eColor,
+-                .mipLevel = 0,
++                .mipLevel = mrt0_range.base.level,
+                 .baseArrayLayer = mrt0_range.base.layer,
+-                .layerCount = src_layers,
++                .layerCount = copy_layers,
+             },
+             .srcOffset = {0, 0, 0},
+             .dstSubresource{
+                 .aspectMask = vk::ImageAspectFlagBits::eColor,
+-                .mipLevel = 0,
++                .mipLevel = mrt1_range.base.level,
+                 .baseArrayLayer = mrt1_range.base.layer,
+-                .layerCount = dst_layers,
++                .layerCount = copy_layers,
+             },
+             .dstOffset = {0, 0, 0},
+-            .extent = {info.size.width, info.size.height, 1},
++            .extent = {std::max(info.size.width >> mrt1_range.base.level, 1u),
++                       std::max(info.size.height >> mrt1_range.base.level, 1u), 1},
+         };
+         scheduler->CommandBuffer().copyImage(src_image.GetImage(),
+                                              vk::ImageLayout::eTransferSrcOptimal, GetImage(),
+@@ -761,19 +770,20 @@
+         const vk::ImageResolve region = {
+             .srcSubresource{
+                 .aspectMask = vk::ImageAspectFlagBits::eColor,
+-                .mipLevel = 0,
++                .mipLevel = mrt0_range.base.level,
+                 .baseArrayLayer = mrt0_range.base.layer,
+-                .layerCount = src_layers,
++                .layerCount = copy_layers,
+             },
+             .srcOffset = {0, 0, 0},
+             .dstSubresource{
+                 .aspectMask = vk::ImageAspectFlagBits::eColor,
+-                .mipLevel = 0,
++                .mipLevel = mrt1_range.base.level,
+                 .baseArrayLayer = mrt1_range.base.layer,
+-                .layerCount = dst_layers,
++                .layerCount = copy_layers,
+             },
+             .dstOffset = {0, 0, 0},
+-            .extent = {info.size.width, info.size.height, 1},
++            .extent = {std::max(info.size.width >> mrt1_range.base.level, 1u),
++                       std::max(info.size.height >> mrt1_range.base.level, 1u), 1},
+         };
+         scheduler->CommandBuffer().resolveImage(src_image.GetImage(),
+                                                 vk::ImageLayout::eTransferSrcOptimal, GetImage(),
+--- a/src/video_core/texture_cache/image_info.cpp
++++ b/src/video_core/texture_cache/image_info.cpp
+@@ -7,6 +7,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <map>
++#include <limits>
+ #include <string_view>
+ 
+ #include "common/assert.h"
+@@ -258,9 +259,10 @@
+         }
+ 
+         auto& mip_info = mips_layout[mip];
++        size_t mip_size = 0;
+         switch (array_mode) {
+         case AmdGpu::ArrayMode::ArrayLinearAligned: {
+-            std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
++            std::tie(mip_info.pitch, mip_info.height, mip_size) =
+                 ImageSizeLinearAligned(mip_w, mip_h, num_bits, num_samples);
+             break;
+         }
+@@ -269,7 +271,7 @@
+             mip_d += (-mip_d) & (thickness - 1);
+             [[fallthrough]];
+         case AmdGpu::ArrayMode::Array1DTiledThin1: {
+-            std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
++            std::tie(mip_info.pitch, mip_info.height, mip_size) =
+                 ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, num_samples);
+             break;
+         }
+@@ -286,7 +288,7 @@
+             [[fallthrough]];
+         case AmdGpu::ArrayMode::Array2DTiledThin1: {
+             ASSERT(!props.is_block);
+-            std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
++            std::tie(mip_info.pitch, mip_info.height, mip_size) = ImageSizeMacroTiled(
+                 mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, mip, alt_tile);
+             break;
+         }
+@@ -300,7 +302,13 @@
+             mip_info.pitch *= 4;
+             mip_info.height *= 4;
+         }
+-        mip_info.size *= mip_d * resources.layers;
++        // Widen before multiplying; a 512 MiB tiled image already overflows
++        // a 32-bit intermediate measured in bits. Keep the existing layout ABI.
++        const u64 total_mip_size = static_cast<u64>(mip_size) * mip_d * resources.layers;
++        ASSERT_MSG(total_mip_size <= std::numeric_limits<u32>::max() - u64(guest_size),
++                   "Image mip chain exceeds the 32-bit layout range: mip={} offset={} bytes={}",
++                   mip, guest_size, total_mip_size);
++        mip_info.size = static_cast<u32>(total_mip_size);
+         mip_info.offset = guest_size;
+         guest_size += mip_info.size;
+     }
+@@ -343,10 +351,18 @@
+     }
+ 
+     // 2D block dimensions of both images should be the same.
+-    const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
+-    const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
+-    const auto this_w = std::max(size.width >> this_dim, 1u);
+-    const auto this_h = std::max(size.height >> this_dim, 1u);
++    const u32 mip_width = std::max(info.size.width >> mip, 1u);
++    const u32 mip_height = std::max(info.size.height >> mip, 1u);
++    const auto mip_w = (mip_width + (1u << info_dim) - 1) >> info_dim;
++    const auto mip_h = (mip_height + (1u << info_dim) - 1) >> info_dim;
++    const auto this_w = (size.width + (1u << this_dim) - 1) >> this_dim;
++    const auto this_h = (size.height + (1u << this_dim) - 1) >> this_dim;
++    // Equal compressed block counts do not imply equal copy extents at an edge.
++    // Preserve block-compatible reinterpretation, but require matching texel
++    // extents when both images have the same block extent.
++    if (this_dim == info_dim && (size.width != mip_width || size.height != mip_height)) {
++        return -1;
++    }
+     if ((this_w != mip_w) || (this_h != mip_h)) {
+         return -1;
+     }
+@@ -380,13 +396,21 @@
+ 
+     // 2D block dimensions of both images should be the same.
+     const auto info_dim = info.props.is_block ? 2 : 0;
+-    const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
+-    const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
++    const u32 mip_width = std::max(info.size.width >> mip, 1u);
++    const u32 mip_height = std::max(info.size.height >> mip, 1u);
++    const auto mip_w = (mip_width + (1u << info_dim) - 1) >> info_dim;
++    const auto mip_h = (mip_height + (1u << info_dim) - 1) >> info_dim;
+     const auto mip_p = std::max(info.mips_layout[mip].pitch >> info_dim, 1u);
+ 
+     const auto this_dim = props.is_block ? 2 : 0;
+-    const auto this_w = std::max(size.width >> this_dim, 1u);
+-    const auto this_h = std::max(size.height >> this_dim, 1u);
++    const auto this_w = (size.width + (1u << this_dim) - 1) >> this_dim;
++    const auto this_h = (size.height + (1u << this_dim) - 1) >> this_dim;
++    // Equal compressed block counts do not imply equal copy extents at an edge.
++    // Preserve block-compatible reinterpretation, but require matching texel
++    // extents when both images have the same block extent.
++    if (this_dim == info_dim && (size.width != mip_width || size.height != mip_height)) {
++        return -1;
++    }
+     const auto this_p = std::max(pitch >> this_dim, 1u);
+     if ((this_w != mip_w) || (this_h != mip_h) || (this_p != mip_p)) {
+         return -1;
+--- a/src/video_core/texture_cache/tile.h
++++ b/src/video_core/texture_cache/tile.h
+@@ -303,11 +303,11 @@
+     const auto pitch_align = std::max(8u, 64u / ((bpp + 7) / 8));
+     auto pitch_aligned = (pitch + pitch_align - 1) & ~(pitch_align - 1);
+     const auto height_aligned = height;
+-    size_t log_sz = pitch_aligned * height_aligned * num_samples;
++    size_t log_sz = static_cast<u64>(pitch_aligned) * height_aligned * num_samples;
+     const auto slice_align = std::max(64u, 256u / ((bpp + 7) / 8));
+     while (log_sz % slice_align) {
+         pitch_aligned += pitch_align;
+-        log_sz = pitch_aligned * height_aligned * num_samples;
++        log_sz = static_cast<u64>(pitch_aligned) * height_aligned * num_samples;
+     }
+     return {pitch_aligned, height_aligned, (log_sz * bpp + 7) / 8};
+ }
+@@ -317,10 +317,10 @@
+     const auto& [pitch_align, height_align] = micro_tile_extent;
+     auto pitch_aligned = (pitch + pitch_align - 1) & ~(pitch_align - 1);
+     const auto height_aligned = (height + height_align - 1) & ~(height_align - 1);
+-    size_t log_sz = (pitch_aligned * height_aligned * bpp * num_samples + 7) / 8;
++    size_t log_sz = (static_cast<u64>(pitch_aligned) * height_aligned * bpp * num_samples + 7) / 8;
+     while ((log_sz * thickness) % 256) {
+         pitch_aligned += pitch_align;
+-        log_sz = (pitch_aligned * height_aligned * bpp * num_samples + 7) / 8;
++        log_sz = (static_cast<u64>(pitch_aligned) * height_aligned * bpp * num_samples + 7) / 8;
+     }
+     return {pitch_aligned, height_aligned, log_sz};
+ }
+@@ -344,7 +344,7 @@
+ 
+     const auto pitch_aligned = (pitch + pitch_align - 1) & ~(pitch_align - 1);
+     const auto height_aligned = (height + height_align - 1) & ~(height_align - 1);
+-    const auto log_sz = pitch_aligned * height_aligned * num_samples;
++    const auto log_sz = static_cast<u64>(pitch_aligned) * height_aligned * num_samples;
+     return {pitch_aligned, height_aligned, (log_sz * bpp + 7) / 8};
+ }
+ 
+--- a/src/video_core/texture_cache/image_view.cpp
++++ b/src/video_core/texture_cache/image_view.cpp
+@@ -22,6 +22,7 @@
+     case AmdGpu::ImageType::Color2DMsaa:
+         return vk::ImageViewType::e2D;
+     case AmdGpu::ImageType::Color2DArray:
++    case AmdGpu::ImageType::Color2DMsaaArray:
+         return vk::ImageViewType::e2DArray;
+     case AmdGpu::ImageType::Color3D:
+         return vk::ImageViewType::e3D;
+--- a/src/video_core/texture_cache/sampler.cpp
++++ b/src/video_core/texture_cache/sampler.cpp
+@@ -1,4 +1,3 @@
+-#line 1 "src/video_core/texture_cache/sampler.cpp"
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -60,6 +59,10 @@
+         };
+     }();
+ 
++    // With mip filtering disabled, select the view's base mip but retain the
++    // sign of the clamped LOD so minification and magnification filters differ.
++    // Vulkan nearest-mip selection keeps [0, 0.25] on level zero.
++    const bool no_mip_filter = sampler.mip_filter == AmdGpu::MipFilter::None;
+     const vk::SamplerCreateInfo sampler_ci = {
+         .pNext = reduction ? static_cast<const void*>(&*reduction)
+                            : custom_color ? static_cast<const void*>(&*custom_color) : nullptr,
+@@ -69,13 +72,14 @@
+         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
+         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
+         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
+-        .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
++        .mipLodBias = std::clamp(sampler.LodBias(), -instance.MaxSamplerLodBias(),
++                                 instance.MaxSamplerLodBias()),
+         .anisotropyEnable = anisotropy_enable,
+         .maxAnisotropy = max_anisotropy,
+         .compareEnable = is_compare,
+         .compareOp = LiverpoolToVK::DepthCompare(sampler.depth_compare_func),
+-        .minLod = sampler.MinLod(),
+-        .maxLod = sampler.MaxLod(),
++        .minLod = no_mip_filter ? std::min(sampler.MinLod(), 0.25f) : sampler.MinLod(),
++        .maxLod = no_mip_filter ? std::min(sampler.MaxLod(), 0.25f) : sampler.MaxLod(),
+         .borderColor = border_color,
+         .unnormalizedCoordinates = false, // Handled in shader due to Vulkan limitations.
+     };
+--- a/src/shader_recompiler/resource.h
++++ b/src/shader_recompiler/resource.h
+@@ -95,7 +95,14 @@
+             std::memcpy(&image, &raw, sizeof(raw));
+             image.pitch = image.width;
+         }
+-        if (!image.Valid()) {
++        // An empty/reversed mip range must not underflow the fallback binding
++        // count or reach Vulkan as a view beyond the backing image. MSAA uses
++        // last_level for its sample count, so it is not a mip-range bound.
++        const auto type = image.GetType();
++        const bool invalid_mip_range = type != AmdGpu::ImageType::Color2DMsaa &&
++                                       type != AmdGpu::ImageType::Color2DMsaaArray &&
++                                       image.base_level > image.last_level;
++        if (!image.Valid() || invalid_mip_range) {
+             LOG_DEBUG(Render_Vulkan, "Encountered invalid image sharp");
+             image = AmdGpu::Image::Null(is_depth);
+         } else if (is_depth) {
+--- a/src/shader_recompiler/specialization.h
++++ b/src/shader_recompiler/specialization.h
+@@ -234,7 +234,12 @@
+             }
+         }
+         for (u32 i = 0; i < images.size(); i++) {
+-            if (other.bitset[binding++] && images[i] != other.images[i]) {
++            // A null image consumes one binding even though its specialization
++            // stays zero-initialized. It cannot reuse a multi-mip descriptor
++            // array: that would shift every following resource binding.
++            if (std::max(images[i].num_bindings, 1u) !=
++                    std::max(other.images[i].num_bindings, 1u) ||
++                (other.bitset[binding++] && images[i] != other.images[i])) {
+                 return false;
+             }
+         }
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -6,6 +6,7 @@
+ #include <condition_variable>
+ #include <filesystem>
+ #include <mutex>
++#include <optional>
+ #include <span>
+ #include <thread>
+ #include <unordered_set>
+@@ -63,6 +64,8 @@
+         ImageInfo info;
+         ImageViewInfo view_info;
+         BindingType type{BindingType::Texture};
++        // Keep guest-relative coordinates across cache replacement/rebinding.
++        std::optional<SubresourceBase> guest_view_base;
+ 
+         ImageDesc() = default;
+         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -846,6 +846,12 @@
+ }
+ 
+ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
++    // Rebinding may pass this description back after its view was translated to
++    // a cached parent. Always start from the original guest-relative view.
++    if (!desc.guest_view_base) {
++        desc.guest_view_base = desc.view_info.range.base;
++    }
++    desc.view_info.range.base = *desc.guest_view_base;
+     const auto& info = desc.info;
+     ASSERT(info.guest_address != 0);
+ 
+@@ -886,27 +892,33 @@
+     int view_slice{-1};
+     if (!image_id) {
+         for (const auto& cache_id : image_ids) {
+-            view_mip = -1;
+-            view_slice = -1;
+-
+             const auto& merged_info = image_id ? slot_images[image_id].info : info;
+-            auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
+-                ResolveOverlap(merged_info, desc.type, cache_id, image_id);
++            const auto overlap_image_id =
++                std::get<0>(ResolveOverlap(merged_info, desc.type, cache_id, image_id));
+             if (overlap_image_id) {
+                 image_id = overlap_image_id;
+-                view_mip = overlap_view_mip;
+-                view_slice = overlap_view_slice;
+             }
+         }
+     }
+ 
+     if (image_id) {
+         Image& image_resolved = slot_images[image_id];
++        // Overlap resolution can retain or replace a previously selected parent.
++        // Locate the original request in the final backing, not the last overlap
++        // visited (which may be unrelated or relative to an intermediate parent).
++        if (image_resolved.info.guest_address == info.guest_address) {
++            view_mip = 0;
++            view_slice = 0;
++        } else {
++            view_mip = info.MipOf(image_resolved.info);
++            view_slice = info.SliceOf(image_resolved.info, view_mip);
++        }
+         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
+             // Cannot reuse this image as we need the exact requested format.
+             image_id = {};
+-        } else if (!ContainsResourceRange(image_resolved.info.resources, info.resources,
+-                                           std::max(view_mip, 0), std::max(view_slice, 0))) {
++        } else if (view_mip < 0 || view_slice < 0 ||
++                   !ContainsResourceRange(image_resolved.info.resources, info.resources,
++                                          view_mip, view_slice)) {
+             // The image was clearly picked up wrong.
+             FreeImage(image_id);
+             image_id = {};
+@@ -917,6 +929,9 @@
+     if (!image_id) {
+         image_id = slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
+         RegisterImage(image_id);
++        // A fresh image uses the request's own coordinates, not a rejected alias.
++        view_mip = 0;
++        view_slice = 0;
+     }
+ 
+     Image& image = slot_images[image_id];
+@@ -925,10 +940,10 @@
+ 
+     // If the image requested is a subresource of the image from cache record its location.
+     if (view_mip > 0) {
+-        desc.view_info.range.base.level = view_mip;
++        desc.view_info.range.base.level += view_mip;
+     }
+     if (view_slice > 0) {
+-        desc.view_info.range.base.layer = view_slice;
++        desc.view_info.range.base.layer += view_slice;
+     }
+ 
+     return image_id;

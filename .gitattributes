@@ -6,3 +6,5 @@ builds/**/*.png -text
 builds/cusa04301-clean-main-20261025/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-shadow-fix-20261025/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-shadow-fix-20261025/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-mip-fixes-20261026/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-mip-fixes-20261026/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
