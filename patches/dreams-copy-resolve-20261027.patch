@@ -1,0 +1,59 @@
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -612,14 +612,18 @@
+     const auto& src_info = src_image.info;
+     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
+     const u32 num_layers = std::min(src_info.resources.layers, info.resources.layers);
+-    ASSERT(src_info.resources.layers == info.resources.layers || num_mips == 1);
++    // Each source mip already reserves all of its layers in the copy buffer.
++    // The common layer count is valid even when a multi-mip array expands.
++    const u32 copy_width = !src_info.props.is_block && !info.props.is_block
++                               ? std::min(src_info.size.width, info.size.width)
++                               : src_info.size.width;
+ 
+     SetBackingSamples(info.num_samples, false);
+     src_image.SetBackingSamples(src_info.num_samples);
+ 
+     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+     for (u32 mip = 0; mip < num_mips; ++mip) {
+-        const auto mip_w = std::max(src_info.size.width >> mip, 1u);
++        const auto mip_w = std::max(copy_width >> mip, 1u);
+         const auto mip_h = std::max(src_info.size.height >> mip, 1u);
+         const auto mip_d = std::max(src_info.size.depth >> mip, 1u);
+         const auto& mip_info = src_info.mips_layout[mip];
+@@ -754,6 +758,15 @@
+     // subresources that were transitioned above, rather than the whole backing.
+     const u32 copy_layers = std::min({src_layers, dst_layers, mrt0_range.extent.layers,
+                                       mrt1_range.extent.layers});
++    // A retained cache backing can exceed the other selected mip's extent.
++    // Restrict both resolve routes to pixels present in both images.
++    const vk::Extent3D copy_extent{
++        std::min(std::max(src_image.info.size.width >> mrt0_range.base.level, 1u),
++                 std::max(info.size.width >> mrt1_range.base.level, 1u)),
++        std::min(std::max(src_image.info.size.height >> mrt0_range.base.level, 1u),
++                 std::max(info.size.height >> mrt1_range.base.level, 1u)),
++        1,
++    };
+     if (src_image.backing->num_samples == 1) {
+         const vk::ImageCopy region = {
+             .srcSubresource{
+@@ -770,8 +783,7 @@
+                 .layerCount = copy_layers,
+             },
+             .dstOffset = {0, 0, 0},
+-            .extent = {std::max(info.size.width >> mrt1_range.base.level, 1u),
+-                       std::max(info.size.height >> mrt1_range.base.level, 1u), 1},
++            .extent = copy_extent,
+         };
+         scheduler->CommandBuffer().copyImage(src_image.GetImage(),
+                                              vk::ImageLayout::eTransferSrcOptimal, GetImage(),
+@@ -792,8 +804,7 @@
+                 .layerCount = copy_layers,
+             },
+             .dstOffset = {0, 0, 0},
+-            .extent = {std::max(info.size.width >> mrt1_range.base.level, 1u),
+-                       std::max(info.size.height >> mrt1_range.base.level, 1u), 1},
++            .extent = copy_extent,
+         };
+         scheduler->CommandBuffer().resolveImage(src_image.GetImage(),
+                                                 vk::ImageLayout::eTransferSrcOptimal, GetImage(),
