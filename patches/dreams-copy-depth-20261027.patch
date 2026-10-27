@@ -1,0 +1,15 @@
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -559,7 +559,11 @@
+                 // 3D images must use layerCount=1
+                 region.srcSubresource.layerCount = 1;
+                 region.dstSubresource.layerCount = 1;
+-                region.extent = vk::Extent3D(mip_w, mip_h, mip_d);
++                // Cache growth may share padded guest bytes with a shallower source.
++                // Preserve the refreshed destination tail; copy only existing slices.
++                const u32 copy_depth =
++                    std::min(mip_d, std::max(src_info.size.depth >> mip, 1u));
++                region.extent = vk::Extent3D(mip_w, mip_h, copy_depth);
+             } else {
+                 // Array images
+                 const u32 copy_layers = std::min(src_layers, dst_layers);

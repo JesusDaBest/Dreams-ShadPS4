@@ -1,0 +1,41 @@
+{
+  "public_base_commit": "b84847d1b6ca14d349bf9e11e91d14ae182e008d",
+  "patches": [
+    "patches/dreams-source-delta-20261016-performance.patch",
+    "patches/dreams-occlusion-array-lod-20261016.patch",
+    "patches/dreams-ordered-count-20261017.patch",
+    "patches/dreams-shader-instructions-20261019.patch",
+    "patches/dreams-image-cache-20261021.patch",
+    "patches/dreams-clean-main-20261025.patch",
+    "patches/dreams-shadow-distance-20261025.patch",
+    "patches/dreams-mip-rendering-20261026.patch",
+    "patches/dreams-mip-fallbacks-20261026.patch",
+    "patches/dreams-array-range-20261026.patch",
+    "patches/dreams-mip-depth-20261027.patch",
+    "patches/dreams-copy-depth-20261027.patch"
+  ],
+  "changed_files": [
+    "src/video_core/texture_cache/image.cpp"
+  ],
+  "frozen_overlay_files": {
+    "src/shader_recompiler/backend/spirv/emit_spirv_image.cpp": "f22f41f1b26839790e2092c6b91033988b8fe86456c7d776a6ebe16f8a15ad6d",
+    "src/shader_recompiler/backend/spirv/spirv_emit_context.cpp": "1da1f96c7f3d4e1869d67e6e4adf8796e5c0a923322bf94f6821934cd2304e75",
+    "src/shader_recompiler/ir/passes/resource_tracking_pass.cpp": "500da6b9d16c32dbc8552e3d6362750aa7252eeff7cf277a208c2567d55190e6",
+    "src/shader_recompiler/resource.h": "d8a4c41ea67255608b02789f719210db4a6b14f5884b51d5a6a932a8df13de4b",
+    "src/shader_recompiler/specialization.h": "ea8039f74756f93804dd65d6990ba7980fb2dee21f867aae4f0b6cf1f15d52ca",
+    "src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp": "cbb8816669d875dbddb7c94ac9bb820ce17645f351ed20a56d9cdfb5f13edbfb",
+    "src/video_core/texture_cache/image.cpp": "aa77735138061d3e3dd2fbeef7bbf341047021d178749fb00d5e63203bd90682",
+    "src/video_core/texture_cache/image_info.cpp": "4c37e5ef66c68bba0bdafb62d12376c3691777328162ca15adb441af0aeaccd8",
+    "src/video_core/texture_cache/image_view.cpp": "729ea4b104e3d59fd735a89c6d478563d5ad7111a5082f2828e573457f94e3a6",
+    "src/video_core/texture_cache/sampler.cpp": "5f125d33c7fb9b479fb1f5a7ca23ee34b4be6bb9e90fd9ced45821ff326af1f3",
+    "src/video_core/texture_cache/texture_cache.cpp": "4cc02f386c503e03456aa3f730fb1fc387b34aa5671da390114a512ebc56625a",
+    "src/video_core/texture_cache/texture_cache.h": "aa50a978d037241600709486050699a2ff2e7c783911001047f2eae103691a05",
+    "src/video_core/texture_cache/tile.h": "a149ecffbed20f93fceb6bf2e8f5f4bc80e1d3a93ae7d0b9126d9b44b0f4ba4c",
+    "src/shader_recompiler/profile.h": "437288a9fb8d05078ff82947015ba71924ea295016b5cc6d76f563627a921306",
+    "src/shader_recompiler/view_min_lod.h": "f1351988ab8fc0d576684f29b64fc9eead5c1112285711c602364001fa37017c",
+    "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp": "231f4f1f7f3799e906d9da9cfba77f433edbd91b7bc6fa162a105480f9db098b",
+    "src/video_core/renderer_vulkan/vk_rasterizer.cpp": "ef92a3e0fa248b552b35d83760e011c72ff8b80cd487d0eae666893ebfd2c727",
+    "src/video_core/texture_cache/min_lod_fallback.h": "6b07b36607e992088159bdd28f94f1ae259a905b22760ccde5b24302f9e8ff7a"
+  },
+  "source_scope": "Previous public source stack plus a bounded 3D image-copy depth correction. One source and linked object change. Patch application and source hashes verified."
+}

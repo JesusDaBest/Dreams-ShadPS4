@@ -2,7 +2,7 @@
 
 ## Current October 27 build
 
-Use the [texture bounds and depth source manifest](../builds/cusa04301-mip-depth-20261027/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-mip-depth-20261027.patch`. Retain all preceding patches. The source hashes and patch application are verified; full fresh-build reproducibility has not been established. Do not combine this recipe with the separate older October 4/6 diagnostic stack below. See [the update record](updates/MIP_DEPTH_20261027.md#download-and-source).
+Use the [3D texture-copy source manifest](../builds/cusa04301-copy-depth-20261027/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-copy-depth-20261027.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/COPY_DEPTH_20261027.md#download-and-source).
 
 ## Earlier source instructions
 
