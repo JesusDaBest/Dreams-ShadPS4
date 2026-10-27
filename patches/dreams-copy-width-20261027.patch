@@ -1,0 +1,15 @@
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -510,7 +510,11 @@
+                   vk::to_string(src_info.pixel_format), vk::to_string(info.pixel_format));
+     }
+ 
+-    const u32 base_width = src_info.size.width;
++    // Equal memory pitch does not imply equal visible width. Preserve destination
++    // texels outside the shared area; compressed copies use different extent units.
++    const u32 base_width = !src_info.props.is_block && !info.props.is_block
++                               ? std::min(src_info.size.width, info.size.width)
++                               : src_info.size.width;
+     const u32 base_height = src_info.size.height;
+     const u32 base_depth =
+         info.type == AmdGpu::ImageType::Color3D ? info.size.depth : src_info.size.depth;
