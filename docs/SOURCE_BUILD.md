@@ -2,7 +2,7 @@
 
 ## Current October 27 build
 
-Use the [copy and resolve source manifest](../builds/cusa04301-copy-resolve-20261027/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-copy-resolve-20261027.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/COPY_RESOLVE_20261027.md#download-and-source).
+Use the [multisampled texture-write source manifest](../builds/cusa04301-storage-multisample-20261027/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-storage-multisample-20261027.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/STORAGE_MULTISAMPLE_20261027.md#download-and-source).
 
 ## Earlier source instructions
 

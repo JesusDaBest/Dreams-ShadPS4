@@ -1,0 +1,70 @@
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1063,6 +1063,13 @@
+         desc.is_atomic ? GetFormat(image, desc.is_integer_atomic) : spv::ImageFormat::Unknown;
+     const auto type = image.GetViewType(desc.is_array);
+     const u32 sampled = desc.is_written ? 2 : 1;
++    // SPIR-V requires this declaration for multisampled storage images,
++    // including reads/atomics sharing a written descriptor. Sampled-only
++    // multisample images do not require it.
++    if (desc.is_written && (type == AmdGpu::ImageType::Color2DMsaa ||
++                            type == AmdGpu::ImageType::Color2DMsaaArray)) {
++        ctx.AddCapability(spv::Capability::StorageImageMultisample);
++    }
+     switch (type) {
+     case AmdGpu::ImageType::Color1D:
+         return ctx.TypeImage(sampled_type, spv::Dim::Dim1D, false, false, false, sampled, format);
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -1,5 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <spirv/unified1/spirv.hpp11>
+ 
+ #include "common/serdes.h"
+ #include "core/emulator_settings.h"
+@@ -207,6 +209,34 @@
+         key += "_view_min_integer1";
+     }
+     return key;
++}
++
++// Older shaders could reach the cache without the capability required by
++// their multisampled storage image. Keep every other cached shader; only
++// these invalid binaries must compile again. Specialization is persisted,
++// so this check never dereferences a guest descriptor during cache warmup.
++bool CachedStorageCapabilitiesMatch(const Shader::StageSpecialization& spec,
++                                    std::span<const u32> words) {
++    const bool requires_multisample = std::ranges::any_of(spec.images, [](const auto& image) {
++        return image.is_storage && (image.type == AmdGpu::ImageType::Color2DMsaa ||
++                                    image.type == AmdGpu::ImageType::Color2DMsaaArray);
++    });
++    if (!requires_multisample) {
++        return true;
++    }
++    // Capabilities are the first instruction section after the SPIR-V header.
++    for (size_t offset = 5; offset < words.size();) {
++        const u32 count = words[offset] >> 16;
++        if (count != 2 || count > words.size() - offset ||
++            (words[offset] & 0xffff) != static_cast<u32>(spv::Op::OpCapability)) {
++            break;
++        }
++        if (words[offset + 1] == static_cast<u32>(spv::Capability::StorageImageMultisample)) {
++            return true;
++        }
++        offset += count;
++    }
++    return false;
+ }
+ 
+ } // Anonymous namespace
+@@ -557,7 +587,7 @@
+     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
+                                        ShaderBinaryCacheKey(program->info, program_key, perm_idx),
+                                        spv);
+-    if (spv.empty()) {
++    if (spv.empty() || !CachedStorageCapabilitiesMatch(spec, spv)) {
+         return false;
+     }
+ 
