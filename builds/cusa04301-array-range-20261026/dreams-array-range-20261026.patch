@@ -1,0 +1,19 @@
+--- a/src/shader_recompiler/resource.h
++++ b/src/shader_recompiler/resource.h
+@@ -104,7 +104,15 @@
+         const bool invalid_mip_range = type != AmdGpu::ImageType::Color2DMsaa &&
+                                        type != AmdGpu::ImageType::Color2DMsaaArray &&
+                                        image.base_level > image.last_level;
+-        if (!image.Valid() || invalid_mip_range) {
++        // Array views retain base_array even when the instruction addresses
++        // only one layer. A base past the backing array must use the null
++        // descriptor path, rather than fabricate a one-layer out-of-range view.
++        // GetType maps cubes to 2D arrays; NumLayers includes their faces/padding.
++        const bool array_type = type == AmdGpu::ImageType::Color1DArray ||
++                                type == AmdGpu::ImageType::Color2DArray ||
++                                type == AmdGpu::ImageType::Color2DMsaaArray;
++        const bool invalid_array_base = array_type && image.base_array >= image.NumLayers();
++        if (!image.Valid() || invalid_mip_range || invalid_array_base) {
+             LOG_DEBUG(Render_Vulkan, "Encountered invalid image sharp");
+             image = AmdGpu::Image::Null(is_depth);
+         } else if (is_depth) {

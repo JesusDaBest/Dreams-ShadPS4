@@ -2,7 +2,7 @@
 
 ## Current October 26 build
 
-Use the [October 26 sampling-update source manifest](../builds/cusa04301-mip-fallbacks-20261026/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-mip-fallbacks-20261026.patch`. Keep all preceding patches, including `dreams-mip-rendering-20261026.patch`. The source overlays and patch application were verified; full fresh-build reproducibility has not been established. Do not combine this recipe with the separate older October 4/6 diagnostic stack below. See [the update record](updates/MIP_FALLBACKS_20261026.md#download-and-source) for provenance and validation limits.
+Use the [texture-array update source manifest](../builds/cusa04301-array-range-20261026/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-array-range-20261026.patch`. Retain all preceding patches. The source hashes and patch application are verified; full fresh-build reproducibility has not been established. Do not combine this recipe with the separate older October 4/6 diagnostic stack below. See [the update record](updates/ARRAY_RANGE_20261026.md#download-and-source).
 
 ## Earlier source instructions
 
