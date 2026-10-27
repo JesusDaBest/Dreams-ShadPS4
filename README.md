@@ -2,9 +2,9 @@
 
 A Windows build of shadPS4 with fixes for **Dreams (CUSA04301)**.
 
-**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-array-range-20261026/Dreams-graphical-launcher-array-range-20261026.zip)**
+**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-mip-depth-20261027/Dreams-graphical-launcher-mip-depth-20261027.zip)**
 
-Updated October 26, 2026.
+Updated October 27, 2026.
 
 ## How to play
 
@@ -23,4 +23,4 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 
 This is experimental. Lag and intermittent black patches/white flashes remain; no overall speedup is claimed. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64. Other GPUs and versions remain unverified.
 
-[Latest release details](docs/updates/ARRAY_RANGE_20261026.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
+[Latest release details](docs/updates/MIP_DEPTH_20261027.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
