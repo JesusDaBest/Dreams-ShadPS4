@@ -2,7 +2,7 @@
 
 A Windows build of shadPS4 with fixes for **Dreams (CUSA04301)**.
 
-**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-dynamic-mip-20261028/Dreams-graphical-launcher-dynamic-mip-20261028.zip)**
+**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-display-colour-20261028/Dreams-graphical-launcher-display-colour-20261028.zip)**
 
 Updated October 28, 2026.
 
@@ -17,10 +17,10 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 ## What's included
 
 - Shadow repairs, including the Light gadget, plus corrections to texture detail selection, sampling, transfers and cache reuse, including fallback support for missing GPU features.
-- The graphical launcher and an optional tutorial-skip tool.
+- Corrected display colours, the graphical launcher and an optional tutorial-skip tool.
 
 ## Known issues
 
 This is experimental. Lag and intermittent black patches/white flashes remain; no overall speedup is claimed. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64. Other GPUs and versions remain unverified.
 
-[Latest release details](docs/updates/DYNAMIC_MIP_20261028.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
+[Latest release details](docs/updates/DISPLAY_COLOUR_20261028.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)

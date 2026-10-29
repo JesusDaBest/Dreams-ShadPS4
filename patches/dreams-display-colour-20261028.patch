@@ -1,0 +1,112 @@
+--- a/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -775,7 +775,11 @@
+ 
+     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
+                                  fsr_settings, frame->is_hdr);
+-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
++    // Vulkan has no 10-bit sRGB image view. This view (and SDR FSR output)
++    // still contains encoded colour; the final pass must not encode it twice.
++    const bool input_srgb =
++        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
++    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings, input_srgb);
+ 
+     DebugState.game_resolution = {image_size.width, image_size.height};
+     DebugState.output_resolution = {frame->width, frame->height};
+--- a/src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
++++ b/src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
+@@ -15,6 +15,15 @@
+ 
+ namespace Vulkan::HostPasses {
+ 
++namespace {
++struct PostProcessingConstants {
++    PostProcessingPass::Settings settings;
++    u32 input_srgb;
++};
++static_assert(sizeof(PostProcessingConstants) == 12);
++static_assert(offsetof(PostProcessingConstants, input_srgb) == 8);
++} // namespace
++
+ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
+     static const std::array pp_shaders{
+         HostShaders::FS_TRI_VERT,
+@@ -42,7 +51,7 @@
+     const vk::PushConstantRange push_constants{
+         .stageFlags = vk::ShaderStageFlagBits::eFragment,
+         .offset = 0,
+-        .size = sizeof(Settings),
++        .size = sizeof(PostProcessingConstants),
+     };
+ 
+     const auto& vs_module = Compile(pp_shaders[0], vk::ShaderStageFlagBits::eVertex, device);
+@@ -187,7 +196,8 @@
+ }
+ 
+ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
+-                                vk::Extent2D input_size, Frame& frame, Settings settings) {
++                                vk::Extent2D input_size, Frame& frame, Settings settings,
++                                bool input_srgb) {
+     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
+         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
+             .pLabelName = "Host/Post processing",
+@@ -256,8 +266,9 @@
+                          });
+ 
+     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
+-    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
+-                         &settings);
++    const PostProcessingConstants constants{settings, input_srgb ? 1u : 0u};
++    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
++                         sizeof(constants), &constants);
+ 
+     cmdbuf.beginRendering(rendering_info);
+     cmdbuf.draw(3, 1, 0, 0);
+--- a/src/video_core/renderer_vulkan/host_passes/pp_pass.h
++++ b/src/video_core/renderer_vulkan/host_passes/pp_pass.h
+@@ -22,7 +22,7 @@
+     void Create(vk::Device device, vk::Format surface_format);
+ 
+     void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
+-                Frame& output, Settings settings);
++                Frame& output, Settings settings, bool input_srgb = false);
+ 
+ private:
+     vk::UniquePipeline pipeline{};
+--- a/src/video_core/host_shaders/post_process.frag
++++ b/src/video_core/host_shaders/post_process.frag
+@@ -11,6 +11,7 @@
+ layout (push_constant) uniform settings {
+     float gamma;
+     bool hdr;
++    bool input_srgb;
+ } pp;
+ 
+ const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
+@@ -22,11 +23,22 @@
+     );
+ }
+ 
++vec3 srgb_to_linear(vec3 rgb) {
++    return mix(
++        pow(max((rgb + b) / a, vec3(0.0)), vec3(2.4)),
++        rgb / d,
++        lessThanEqual(rgb, vec3(0.04045))
++    );
++}
++
+ void main() {
+-    vec4 color_linear = texture(texSampler, uv);
+-    if (pp.hdr) {
+-        color = color_linear;
++    vec4 sampled = texture(texSampler, uv);
++    // A 10-bit sRGB surface has a UNORM view: sampling does not decode it.
++    // At neutral gamma it is already ready for the UNORM display output.
++    if (pp.hdr || (pp.input_srgb && pp.gamma == 1.0)) {
++        color = sampled;
+     } else {
+-        color = vec4(gamma(color_linear.rgb), color_linear.a);
++        vec3 linear_rgb = pp.input_srgb ? srgb_to_linear(sampled.rgb) : sampled.rgb;
++        color = vec4(gamma(linear_rgb), sampled.a);
+     }
+ }
