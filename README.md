@@ -2,7 +2,7 @@
 
 A Windows build of shadPS4 with fixes for **Dreams (CUSA04301)**.
 
-**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-compressed-copy-20261029/Dreams-graphical-launcher-compressed-copy-20261029.zip)**
+**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-tren-collision-20261029/Dreams-graphical-launcher-tren-collision-20261029.zip)**
 
 Updated October 29, 2026.
 
@@ -17,10 +17,11 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 ## What's included
 
 - Shadow repairs, including the Light gadget, plus corrections to texture detail selection, sampling, transfers and cache reuse, including fallback support for missing GPU features.
+- A fix for Tren disappearing after certain collisions.
 - Corrected display colours, the graphical launcher and an optional tutorial-skip tool.
 
 ## Known issues
 
 This is experimental. Lag and intermittent black patches/white flashes remain; no overall speedup is claimed. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64. Other GPUs and versions remain unverified.
 
-[Latest release details](docs/updates/COMPRESSED_COPY_20261029.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
+[Latest release details](docs/updates/TREN_COLLISION_20261029.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)

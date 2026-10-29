@@ -1,0 +1,49 @@
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -541,9 +541,19 @@
+     const bool is_same_type = !is_2d_to_3d && !is_3d_to_2d;
+ 
+     for (u32 mip = 0; mip < num_mips; ++mip) {
+-        const u32 mip_w = std::max(base_width >> mip, 1u);
+-        const u32 mip_h = std::max(base_height >> mip, 1u);
++        u32 mip_w = std::max(base_width >> mip, 1u);
++        u32 mip_h = std::max(base_height >> mip, 1u);
+         const u32 mip_d = std::max(base_depth >> mip, 1u);
++        if (src_info.props.is_block != info.props.is_block) {
++            // Vulkan expresses the region in source texels. Limit it to the
++            // destination's block capacity before its format adjusts the extent.
++            const u32 src_block = src_info.props.is_block ? 4u : 1u;
++            const u32 dst_block = info.props.is_block ? 4u : 1u;
++            const u32 dst_w = std::max(info.size.width >> mip, 1u);
++            const u32 dst_h = std::max(info.size.height >> mip, 1u);
++            mip_w = std::min(mip_w, ((dst_w + dst_block - 1) / dst_block) * src_block);
++            mip_h = std::min(mip_h, ((dst_h + dst_block - 1) / dst_block) * src_block);
++        }
+ 
+         auto [src_layers, dst_layers] = SanitizeCopyLayers(src_info, info, mip_d);
+ 
+--- a/src/shader_recompiler/frontend/translate/vector_alu.cpp
++++ b/src/shader_recompiler/frontend/translate/vector_alu.cpp
+@@ -1160,16 +1160,19 @@
+ 
+ void Translator::V_RCP_LEGACY_F32(const GcnInst& inst) {
+     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
+-    const auto result = ir.FPRecip(src0);
++    const IR::F32 result{ir.FPRecip(src0)};
+     const auto inf = ir.FPIsInf(result);
+ 
+-    const auto raw_result = ir.ConvertFToU(32, result);
++    // Inspect the IEEE sign bit; converting infinity to uint is undefined.
++    const auto raw_result = ir.BitCast<IR::U32>(result);
+     const auto sign_bit = ir.ShiftRightLogical(raw_result, ir.Imm32(31u));
+     const auto sign_bit_set = ir.INotEqual(sign_bit, ir.Imm32(0u));
+     const IR::F32 inf_result{ir.Select(sign_bit_set, ir.Imm32(-0.0f), ir.Imm32(0.0f))};
+     const IR::F32 val{ir.Select(inf, inf_result, result)};
+ 
+-    SetDst(inst.dst[0], val);
++    // The legacy instruction maps both input zero signs to positive zero.
++    const auto zero_input = ir.FPEqual(src0, ir.Imm32(0.0f));
++    SetDst(inst.dst[0], IR::F32{ir.Select(zero_input, ir.Imm32(0.0f), val)});
+ }
+ 
+ void Translator::V_RCP_F64(const GcnInst& inst) {
