@@ -28,3 +28,5 @@ builds/cusa04301-dynamic-mip-20261028/** -text whitespace=blank-at-eol,blank-at-
 builds/cusa04301-dynamic-mip-20261028/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-display-colour-20261028/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-display-colour-20261028/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-compressed-copy-20261029/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-compressed-copy-20261029/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

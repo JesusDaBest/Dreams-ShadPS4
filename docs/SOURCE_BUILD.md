@@ -1,8 +1,8 @@
 # Build the Dreams source fixes
 
-## Current October 28 build
+## Current October 29 build
 
-Use the [display colour source manifest](../builds/cusa04301-display-colour-20261028/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-display-colour-20261028.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/DISPLAY_COLOUR_20261028.md#download-and-source).
+Use the [compressed texture copy source manifest](../builds/cusa04301-compressed-copy-20261029/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-compressed-copy-20261029.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/COMPRESSED_COPY_20261029.md#download-and-source).
 
 ## Earlier source instructions
 

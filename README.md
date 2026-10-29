@@ -2,9 +2,9 @@
 
 A Windows build of shadPS4 with fixes for **Dreams (CUSA04301)**.
 
-**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-display-colour-20261028/Dreams-graphical-launcher-display-colour-20261028.zip)**
+**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-compressed-copy-20261029/Dreams-graphical-launcher-compressed-copy-20261029.zip)**
 
-Updated October 28, 2026.
+Updated October 29, 2026.
 
 ## How to play
 
@@ -23,4 +23,4 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 
 This is experimental. Lag and intermittent black patches/white flashes remain; no overall speedup is claimed. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64. Other GPUs and versions remain unverified.
 
-[Latest release details](docs/updates/DISPLAY_COLOUR_20261028.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
+[Latest release details](docs/updates/COMPRESSED_COPY_20261029.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)

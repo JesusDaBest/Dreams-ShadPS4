@@ -1,0 +1,88 @@
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -621,7 +621,11 @@
+     SetBackingSamples(info.num_samples, false);
+     src_image.SetBackingSamples(src_info.num_samples);
+ 
++    // A compressed edge block can cover different texel counts in the two images.
++    // Separate image extents preserve its bytes without an invalid image-to-image copy.
++    const bool compressed = src_info.props.is_block && info.props.is_block;
+     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
++    boost::container::small_vector<vk::BufferImageCopy, 8> destination_copies;
+     for (u32 mip = 0; mip < num_mips; ++mip) {
+         const auto mip_w = std::max(copy_width >> mip, 1u);
+         const auto mip_h = std::max(src_info.size.height >> mip, 1u);
+@@ -643,6 +647,29 @@
+             .imageOffset = {0, 0, 0},
+             .imageExtent = {extent_w, extent_h, mip_d},
+         });
++        auto destination_copy = buffer_copies.back();
++        destination_copy.imageSubresource.aspectMask =
++            aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
++        if (compressed) {
++            const u32 dst_w = std::max(info.size.width >> mip, 1u);
++            const u32 dst_h = std::max(info.size.height >> mip, 1u);
++            const u32 block_w = std::min((mip_w + 3) / 4, (dst_w + 3) / 4);
++            const u32 block_h = std::min((mip_h + 3) / 4, (dst_h + 3) / 4);
++            const bool src_volume = src_info.type == AmdGpu::ImageType::Color3D;
++            const bool dst_volume = info.type == AmdGpu::ImageType::Color3D;
++            const u32 src_slices = src_volume ? mip_d : src_info.resources.layers;
++            const u32 dst_slices = dst_volume ? std::max(info.size.depth >> mip, 1u)
++                                              : info.resources.layers;
++            const u32 slices = std::min(src_slices, dst_slices);
++            auto& source_copy = buffer_copies.back();
++            source_copy.imageSubresource.layerCount = src_volume ? 1u : slices;
++            source_copy.imageExtent = {std::min(block_w * 4, mip_w),
++                                      std::min(block_h * 4, mip_h), src_volume ? slices : 1u};
++            destination_copy.imageSubresource.layerCount = dst_volume ? 1u : slices;
++            destination_copy.imageExtent = {std::min(block_w * 4, dst_w),
++                                           std::min(block_h * 4, dst_h), dst_volume ? slices : 1u};
++        }
++        destination_copies.push_back(destination_copy);
+     }
+ 
+     const vk::BufferMemoryBarrier2 pre_copy_barrier = {
+@@ -685,12 +712,8 @@
+         .pBufferMemoryBarriers = &post_copy_barrier,
+     });
+ 
+-    for (auto& copy : buffer_copies) {
+-        copy.imageSubresource.aspectMask = aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+-    }
+-
+     cmdbuf.copyBufferToImage(buffer, GetImage(), vk::ImageLayout::eTransferDstOptimal,
+-                             buffer_copies);
++                             destination_copies);
+     Transit(vk::ImageLayout::eGeneral,
+             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
+ }
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -832,7 +832,26 @@
+     auto& new_image = slot_images[new_image_id];
+ 
+     RefreshImage(new_image);
+-    new_image.CopyImage(src_image);
++    if (src_image.info.props.is_block && info.props.is_block &&
++        (src_image.info.size.width != info.size.width ||
++         src_image.info.size.height != info.size.height)) {
++        // Equal guest block pitch need not mean equal visible texel edges. Copy the
++        // shared blocks through a buffer so each image can use its own legal extent.
++        const auto& copy_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
++        if (src_image.info.guest_size <= copy_buffer.SizeBytes()) {
++            new_image.CopyImageWithBuffer(src_image, copy_buffer.Handle(), 0);
++        } else {
++            // Do not overrun the fixed utility buffer for a large compressed array.
++            auto temporary = std::make_unique<Buffer>(
++                instance, scheduler, MemoryUsage::DeviceLocal, 0,
++                vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
++                src_image.info.guest_size);
++            new_image.CopyImageWithBuffer(src_image, temporary->Handle(), 0);
++            scheduler.DeferOperation([buffer = std::move(temporary)]() mutable {});
++        }
++    } else {
++        new_image.CopyImage(src_image);
++    }
+ 
+     if (src_image.binding.is_bound || src_image.binding.is_target) {
+         src_image.binding.needs_rebind = 1u;
