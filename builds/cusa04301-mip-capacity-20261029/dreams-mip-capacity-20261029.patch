@@ -1,0 +1,14 @@
+--- a/src/video_core/texture_cache/transfer_layout.h
++++ b/src/video_core/texture_cache/transfer_layout.h
+@@ -25,6 +25,11 @@
+ }
+ 
+ inline void ExpandImageResources(ImageInfo& info, SubresourceExtent resources) {
++    // An alias can have more mips because its texel dimensions are larger.
++    // Inherit only levels representable by this backing, while retaining layers.
++    const u32 max_levels = std::bit_width(
++        std::max({info.size.width, info.size.height, info.size.depth}));
++    resources.levels = std::min(resources.levels, max_levels);
+     if (info.resources == resources) {
+         return;
+     }

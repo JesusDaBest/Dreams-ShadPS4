@@ -32,3 +32,5 @@ builds/cusa04301-compressed-copy-20261029/** -text whitespace=blank-at-eol,blank
 builds/cusa04301-compressed-copy-20261029/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-tren-collision-20261029/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-tren-collision-20261029/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-mip-capacity-20261029/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-mip-capacity-20261029/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
