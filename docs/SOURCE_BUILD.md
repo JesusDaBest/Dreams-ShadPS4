@@ -2,7 +2,7 @@
 
 ## Current October 29 build
 
-Use the [mip allocation source manifest](../builds/cusa04301-mip-capacity-20261029/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-mip-capacity-20261029.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/MIP_CAPACITY_20261029.md#download-and-source).
+Use the [depth texture source manifest](../builds/cusa04301-depth-growth-20261029/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-depth-growth-20261029.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/DEPTH_GROWTH_20261029.md#download-and-source).
 
 ## Earlier source instructions
 

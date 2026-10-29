@@ -1,0 +1,18 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -501,6 +501,15 @@
+         // Inherit image usage
+         auto& new_image = slot_images[new_image_id];
+         new_image.usage = cache_image.usage;
++        // The copy below covers only the old backing. Initialize newly exposed
++        // texels from guest memory before preserving the cached GPU contents.
++        if (cache_image.info.num_samples == 1 && new_info.num_samples == 1 &&
++            (!ContainsResources(cache_image.info.resources, new_info.resources) ||
++             new_info.size.width > cache_image.info.size.width ||
++             new_info.size.height > cache_image.info.size.height ||
++             new_info.size.depth > cache_image.info.size.depth)) {
++            RefreshImage(new_image);
++        }
+         new_image.flags &= ~ImageFlagBits::Dirty;
+         // When creating a depth buffer through overlap resolution don't clear it on first use.
+         new_image.info.meta_info.htile_clear_mask = 0;
