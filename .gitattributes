@@ -24,3 +24,5 @@ builds/cusa04301-copy-resolve-20261027/** -text whitespace=blank-at-eol,blank-at
 builds/cusa04301-copy-resolve-20261027/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-storage-multisample-20261027/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-storage-multisample-20261027/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-dynamic-mip-20261028/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-dynamic-mip-20261028/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

@@ -1,8 +1,8 @@
 # Build the Dreams source fixes
 
-## Current October 27 build
+## Current October 28 build
 
-Use the [multisampled texture-write source manifest](../builds/cusa04301-storage-multisample-20261027/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-storage-multisample-20261027.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/STORAGE_MULTISAMPLE_20261027.md#download-and-source).
+Use the [dynamic mip-write source manifest](../builds/cusa04301-dynamic-mip-20261028/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-dynamic-mip-20261028.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/DYNAMIC_MIP_20261028.md#download-and-source).
 
 ## Earlier source instructions
 

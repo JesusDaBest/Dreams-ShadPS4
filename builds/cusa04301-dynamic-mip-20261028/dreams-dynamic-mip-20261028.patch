@@ -1,0 +1,51 @@
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -630,7 +630,31 @@
+         ASSERT(texture.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex);
+         const Id single_image_ptr_type =
+             ctx.TypePointer(spv::StorageClass::UniformConstant, texture.image_type);
+-        image_ptr = ctx.OpAccessChain(single_image_ptr_type, image_ptr, std::array{lod});
++        // LOD may differ between lanes. A dynamically indexed descriptor without
++        // non-uniform indexing support broadcasts one lane's mip on some drivers.
++        // Constant descriptor accesses keep this fallback portable; each lane
++        // executes exactly one store, and out-of-view LODs execute none.
++        const u32 mip_count = ctx.info.images[handle & 0xFFFF].NumBindings(ctx.info);
++        boost::container::static_vector<Sirit::Literal, 16> levels;
++        boost::container::static_vector<Id, 16> labels;
++        for (u32 level = 0; level < mip_count; ++level) {
++            levels.push_back(level);
++            labels.push_back(ctx.OpLabel());
++        }
++        const Id merge = ctx.OpLabel();
++        const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
++        ctx.OpSelectionMerge(merge, spv::SelectionControlMask::MaskNone);
++        ctx.OpSwitch(lod, merge, levels, labels);
++        for (u32 level = 0; level < mip_count; ++level) {
++            ctx.AddLabel(labels[level]);
++            const Id ptr = ctx.OpAccessChain(single_image_ptr_type, image_ptr,
++                                             std::array{ctx.ConstU32(level)});
++            const Id image = ctx.OpLoad(texture.image_type, ptr);
++            ctx.OpImageWrite(image, coords, texel, operands.mask, operands.operands);
++            ctx.OpBranch(merge);
++        }
++        ctx.AddLabel(merge);
++        return;
+     }
+     const Id image = ctx.OpLoad(texture.image_type, image_ptr);
+     const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -207,6 +207,13 @@
+     }
+     if (std::ranges::any_of(info.images, [](const auto& image) { return image.uses_min_lod_read; })) {
+         key += "_view_min_integer1";
++    }
++    // The fallback now selects mip descriptors using constant-index branches.
++    // The mode is persisted in Info, so cache warmup needs no guest-memory read.
++    if (std::ranges::any_of(info.images, [](const auto& image) {
++            return image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
++        })) {
++        key += "_storage_mip_select1";
+     }
+     return key;
+ }
