@@ -1,0 +1,21 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -520,7 +520,17 @@
+                 new_image.CopyImage(cache_image);
+             } else {
+                 const auto& copy_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+-                new_image.CopyImageWithBuffer(cache_image, copy_buffer.Handle(), 0);
++                if (cache_image.info.guest_size <= copy_buffer.SizeBytes()) {
++                    new_image.CopyImageWithBuffer(cache_image, copy_buffer.Handle(), 0);
++                } else {
++                    // A large mip chain or array can exceed the shared copy buffer.
++                    auto temporary = std::make_unique<Buffer>(
++                        instance, scheduler, MemoryUsage::DeviceLocal, 0,
++                        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
++                        cache_image.info.guest_size);
++                    new_image.CopyImageWithBuffer(cache_image, temporary->Handle(), 0);
++                    scheduler.DeferOperation([buffer = std::move(temporary)]() mutable {});
++                }
+             }
+         } else if (cache_image.info.num_samples == 1 && new_info.props.is_depth &&
+                    new_info.num_samples > 1) {
