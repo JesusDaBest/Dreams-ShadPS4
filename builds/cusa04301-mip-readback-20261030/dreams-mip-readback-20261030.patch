@@ -1,0 +1,31 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -259,14 +259,24 @@
+                            writeback_size] {
+         buffer_cache.GetUtilityBuffer(MemoryUsage::Download).InvalidateMappedRange(offset,
+                                                                                    writeback_size);
+-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
+-                                                   writeback_size);
++        return Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
++                                                        download, writeback_size);
+     };
+     if (sync) {
+         scheduler.Finish();
+-        writeback();
++        if (writeback()) {
++            // The retained image now has a new CPU baseline. Hash the completed
++            // download, not guest memory: a CPU edit after writeback must remain
++            // detectable instead of being mistaken for the downloaded contents.
++            for (u32 mip = 0; mip < info.resources.levels; ++mip) {
++                const auto& layout = info.mips_layout[mip];
++                image.mip_hashes[mip] = XXH3_64bits(download + layout.offset, layout.size);
++            }
++        }
+     } else {
+-        scheduler.DeferPriorityOperation(writeback);
++        // The asynchronous caller retires the image immediately. Do not retain
++        // an Image reference or update its metadata from the callback thread.
++        scheduler.DeferPriorityOperation([writeback] { writeback(); });
+     }
+ }
+ 

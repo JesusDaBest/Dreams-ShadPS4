@@ -2,7 +2,7 @@
 
 ## Current October 30 build
 
-Use the [mip-refresh source manifest](../builds/cusa04301-mip-refresh-20261030/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-mip-refresh-20261030.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/MIP_REFRESH_20261030.md#download-and-source).
+Use the [mip-readback source manifest](../builds/cusa04301-mip-readback-20261030/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-mip-readback-20261030.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/MIP_READBACK_20261030.md#download-and-source).
 
 ## Earlier source instructions
 
