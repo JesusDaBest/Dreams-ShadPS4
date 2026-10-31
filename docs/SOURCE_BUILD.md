@@ -2,7 +2,7 @@
 
 ## Current October 31 build
 
-Use the [GPU image-write source manifest](../builds/cusa04301-gpu-image-writes-20261031/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-gpu-image-writes-20261031.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/GPU_IMAGE_WRITES_20261031.md#download-and-source).
+Use the [texture-format source manifest](../builds/cusa04301-partial-image-formats-20261031/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-partial-image-formats-20261031.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/PARTIAL_IMAGE_FORMATS_20261031.md#download-and-source).
 
 ## Earlier source instructions
 
