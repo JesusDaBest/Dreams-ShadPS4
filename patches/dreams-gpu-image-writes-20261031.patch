@@ -1,0 +1,319 @@
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -649,6 +649,9 @@
+             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
+             return;
+         }
++        // The GPU fill replaces this complete byte range. Refresh only images
++        // wholly inside it; partially covered images still need preservation.
++        texture_cache.InvalidateImagesFullyWrittenByGPU(address, num_bytes);
+     }
+     Buffer* buffer = [&] {
+         if (is_gds) {
+@@ -658,6 +661,10 @@
+         return buffer;
+     }();
+     buffer->Fill(buffer->Offset(address), num_bytes, value);
++    if (!is_gds) {
++        texture_cache.CopyGpuFillToPartialImages(address, num_bytes, buffer->Handle(),
++                                                buffer->Offset(address));
++    }
+ }
+ 
+ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+@@ -671,7 +678,11 @@
+         // Without a readback there's nothing we can do with this
+         // Fallback to creating dst buffer on GPU to at least have this data there
+     }
+-    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
++    // Preserve supported partial image aliases until the GPU copy patches
++    // only their changed pixels. GDS offsets are not guest image addresses.
++    if (!dst_gds) {
++        texture_cache.PrepareImagesForGpuCopy(dst, num_bytes);
++    }
+     auto& src_buffer = [&] -> const Buffer& {
+         if (src_gds) {
+             return gds_buffer;
+@@ -749,6 +760,10 @@
+         .bufferMemoryBarrierCount = 2,
+         .pBufferMemoryBarriers = buf_barriers_after,
+     });
++    if (!dst_gds) {
++        texture_cache.CopyGpuWriteToPartialImages(dst, num_bytes, dst_buffer.Handle(),
++                                                  dst_buffer.Offset(dst), true);
++    }
+ }
+ 
+ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -426,13 +426,231 @@
+     });
+ }
+ 
++// Map a texel-aligned GPU fill onto only the visible pixels it covers. The
++// buffer can contain stale data outside that range; never upload it wholesale.
++static std::vector<vk::BufferImageCopy> PlanPartialLinearFill(
++    const ImageInfo& info, VAddr address, u64 size, u64 buffer_offset) {
++    if (!size || address > ~VAddr{0} - size ||
++        info.guest_address > ~VAddr{0} - info.guest_size ||
++        buffer_offset > ~u64{0} - size || !info.guest_size ||
++        info.props.is_tiled || info.props.is_block || info.props.is_volume ||
++        info.props.is_depth || info.props.has_stencil || info.num_samples != 1 ||
++        info.tile_mode != AmdGpu::TileMode::DisplayLinearAligned ||
++        info.array_mode != AmdGpu::ArrayMode::ArrayLinearAligned ||
++        info.alt_tile || info.bank_swizzle || info.size.depth != 1 ||
++        !info.size.width || !info.size.height || !info.resources.layers ||
++        !info.resources.levels || info.resources.levels > info.mips_layout.size()) {
++        return {};
++    }
++    u32 pixel_bytes{};
++    switch (info.pixel_format) {
++    case vk::Format::eR8G8B8A8Unorm: pixel_bytes = 4; break;
++    case vk::Format::eR16G16B16A16Sfloat:
++    case vk::Format::eR32G32Uint: pixel_bytes = 8; break;
++    case vk::Format::eR32G32B32A32Uint: pixel_bytes = 16; break;
++    default: return {};
++    }
++    if (info.num_bits != pixel_bytes * 8) {
++        return {};
++    }
++    const u64 begin = std::max(address, info.guest_address);
++    const u64 end = std::min(address + size, info.guest_address + info.guest_size);
++    if (begin >= end || (begin == info.guest_address &&
++                        end == info.guest_address + info.guest_size) ||
++        (begin - info.guest_address) % pixel_bytes ||
++        (end - info.guest_address) % pixel_bytes ||
++        (buffer_offset + (begin - address)) % pixel_bytes) {
++        return {};
++    }
++    std::vector<vk::BufferImageCopy> copies;
++    u64 previous_end{};
++    for (u32 level = 0; level < info.resources.levels; ++level) {
++        const auto& mip = info.mips_layout[level];
++        const u32 width = std::max(info.size.width >> level, 1u);
++        const u32 height = std::max(info.size.height >> level, 1u);
++        const u64 row_bytes = u64(mip.pitch) * pixel_bytes;
++        // Division guards keep validation overflow-free even for bad metadata.
++        if (mip.pitch < width || mip.height < height || !mip.size ||
++            mip.offset < previous_end || mip.offset % pixel_bytes || mip.offset > info.guest_size ||
++            mip.size > info.guest_size - mip.offset ||
++            row_bytes > mip.size / mip.height ||
++            row_bytes * mip.height != mip.size / info.resources.layers ||
++            mip.size % info.resources.layers) {
++            return {};
++        }
++        previous_end = u64(mip.offset) + mip.size;
++        const u64 layer_bytes = row_bytes * mip.height;
++        const u64 mip_address = info.guest_address + mip.offset;
++        if (begin >= mip_address + mip.size || end <= mip_address) {
++            continue;
++        }
++        const u32 first_layer = u32((std::max(begin, mip_address) - mip_address) / layer_bytes);
++        const u32 last_layer = u32((std::min(end, mip_address + mip.size) - 1 - mip_address) / layer_bytes);
++        for (u32 layer = first_layer; layer <= last_layer; ++layer) {
++            const u64 layer_address = mip_address + layer_bytes * layer;
++            const u32 first_row = u32((std::max(begin, layer_address) - layer_address) / row_bytes);
++            const u32 last_row = std::min(height - 1, u32(
++                (std::min(end, layer_address + layer_bytes) - 1 - layer_address) / row_bytes));
++            for (u32 y = first_row; y <= last_row; ++y) {
++                const u64 row_address = layer_address + u64(y) * row_bytes;
++                const u64 left = std::max(begin, row_address);
++                const u64 right = std::min(end, row_address + u64(width) * pixel_bytes);
++                if (left >= right) {
++                    continue;
++                }
++                const u32 x = u32((left - row_address) / pixel_bytes);
++                const u32 count = u32((right - left) / pixel_bytes);
++                const u64 offset = buffer_offset + (left - address);
++                if (!copies.empty()) {
++                    auto& last = copies.back();
++                    if (x == 0 && count == width && last.imageOffset.x == 0 &&
++                        last.imageExtent.width == width &&
++                        last.imageSubresource.mipLevel == level &&
++                        last.imageSubresource.baseArrayLayer == layer &&
++                        last.imageOffset.y + last.imageExtent.height == y &&
++                        last.bufferOffset + u64(last.imageExtent.height) * row_bytes == offset) {
++                        ++last.imageExtent.height;
++                        continue;
++                    }
++                }
++                copies.push_back(vk::BufferImageCopy{
++                    .bufferOffset = offset,
++                    .bufferRowLength = mip.pitch,
++                    .bufferImageHeight = mip.height,
++                    .imageSubresource = {vk::ImageAspectFlagBits::eColor, level, layer, 1},
++                    .imageOffset = {s32(x), s32(y), 0},
++                    .imageExtent = {count, 1, 1},
++                });
++            }
++        }
++    }
++    return copies;
++}
++
++void TextureCache::CopyGpuFillToPartialImages(VAddr address, u32 size, vk::Buffer buffer,
++                                           u64 buffer_offset) {
++    CopyGpuWriteToPartialImages(address, size, buffer, buffer_offset, false);
++}
++
++void TextureCache::CopyGpuWriteToPartialImages(VAddr address, u32 size, vk::Buffer buffer,
++                                            u64 buffer_offset, bool invalidate_exact_base) {
++    if (!size || address > ~VAddr{0} - size || buffer_offset > ~u64{0} - size) {
++        return;
++    }
++    std::scoped_lock lock{mutex};
++    bool copied = false;
++    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
++        if (!image.SafeToDownload() || image.backing->num_samples != 1 ||
++            image.backing->image.image_ci.format != image.info.pixel_format) {
++            if (invalidate_exact_base && image.info.guest_address == address) {
++                image.flags |= ImageFlagBits::GpuDirty;
++            }
++            return;
++        }
++        const auto copies = PlanPartialLinearFill(image.info, address, size, buffer_offset);
++        if (copies.empty()) {
++            if (invalidate_exact_base && image.info.guest_address == address) {
++                image.flags |= ImageFlagBits::GpuDirty;
++            }
++            return;
++        }
++        if (!copied) {
++            scheduler.EndRendering();
++            const vk::BufferMemoryBarrier2 barrier{
++                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
++                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
++                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
++                .buffer = buffer, .offset = buffer_offset, .size = size,
++            };
++            scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++                .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier});
++            copied = true;
++        }
++        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {});
++        scheduler.CommandBuffer().copyBufferToImage(buffer, image.GetImage(),
++                                                    vk::ImageLayout::eTransferDstOptimal, copies);
++        image.Transit(vk::ImageLayout::eGeneral,
++                      vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
++    });
++    if (copied) {
++        const vk::BufferMemoryBarrier2 barrier{
++            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
++            .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
++            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
++            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
++            .buffer = buffer, .offset = buffer_offset, .size = size,
++        };
++        scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++            .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier});
++    }
++}
++
++void TextureCache::PrepareImagesForGpuCopy(VAddr address, u32 size) {
++    if (!size || address > ~VAddr{0} - size) {
++        return;
++    }
++    std::scoped_lock lock{mutex};
++    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
++        const VAddr start = image.info.guest_address;
++        const bool full = start >= address && start - address <= size &&
++                          image.info.guest_size <= size - (start - address);
++        if (start != address && !full) {
++            return;
++        }
++        // Keep a valid partial destination until the copy can patch its changed
++        // texels. Cached buffers are page-aligned, so the guest address has the
++        // same texel alignment as the eventual buffer offset.
++        if (!full && image.SafeToDownload() && image.backing->num_samples == 1 &&
++            image.backing->image.image_ci.format == image.info.pixel_format &&
++            !PlanPartialLinearFill(image.info, address, size, address).empty()) {
++            return;
++        }
++        // Full writes and unsupported partial layouts retain the old path.
++        if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
++            auto& stats = GetDreamsVolumeRefreshStats(image.info);
++            const u64 count = ++stats.gpu_invalidations;
++            LogDreamsVolumeCacheEvent(image, stats, "gpu-invalidate", count, address, size);
++        }
++        image.flags |= ImageFlagBits::GpuDirty;
++    });
++}
++
++void TextureCache::InvalidateImagesFullyWrittenByGPU(VAddr address, size_t size) {
++    std::scoped_lock lock{mutex};
++    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
++        const VAddr start = image.info.guest_address;
++        if (start < address || start - address > size ||
++            image.info.guest_size > size - (start - address)) {
++            return;
++        }
++        if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
++            auto& stats = GetDreamsVolumeRefreshStats(image.info);
++            const u64 count = ++stats.gpu_invalidations;
++            LogDreamsVolumeCacheEvent(image, stats, "gpu-invalidate", count, address, size);
++        }
++        image.flags |= ImageFlagBits::GpuDirty;
++    });
++}
++
+ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool include_overlaps) {
++    InvalidateMemoryFromGPU(address, max_size, include_overlaps, false);
++}
++
++void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool include_overlaps,
++                                           bool complete_write) {
+     std::scoped_lock lock{mutex};
+     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
+-        // Most formatted aliases share a base address. Some games write suballocated images
+-        // through a larger unformatted buffer, which requires conservative overlap invalidation.
++        // A proven complete buffer overwrite also replaces images fully contained
++        // inside that range. Partial overlaps still need preservation of their
++        // untouched image contents, so do not broaden ordinary GPU invalidations.
+         if (!include_overlaps && image.info.guest_address != address) {
+-            return;
++            const VAddr image_start = image.info.guest_address;
++            if (!complete_write || image_start < address ||
++                image_start - address > max_size ||
++                image.info.guest_size > max_size - (image_start - address)) {
++                return;
++            }
+         }
+         // Ensure image is reuploaded when accessed again.
+         if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -97,8 +97,21 @@
+     /// Whether any cached image aliases these bytes, including an interior subrange.
+     bool HasImageInRange(VAddr addr, size_t size);
+ 
++    /// Refreshes only images wholly overwritten by a GPU byte-range write.
++    void InvalidateImagesFullyWrittenByGPU(VAddr address, size_t size);
++
++    void CopyGpuFillToPartialImages(VAddr address, u32 size, vk::Buffer buffer, u64 buffer_offset);
++
++    void PrepareImagesForGpuCopy(VAddr address, u32 size);
++    void CopyGpuWriteToPartialImages(VAddr address, u32 size, vk::Buffer buffer,
++                                     u64 buffer_offset, bool invalidate_exact_base);
++
++
+     /// Marks an image as dirty if it exists at the provided address.
+     void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool include_overlaps = false);
++    // complete_write requires a verified overwrite of every byte in the range.
++    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool include_overlaps,
++                                 bool complete_write);
+ 
+     /// Evicts any images that overlap the unmapped range.
+     void UnmapMemory(VAddr cpu_addr, size_t size);
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -21042,7 +21042,7 @@
+              cs_program.num_thread_z.full},
+             {dispatch_x, cs_program.dim_y, cs_program.dim_z}, dispatch_base_x);
+         if (bytes && memory->IsValidMapping(sharp.base_address, bytes)) {
+-            texture_cache.InvalidateMemoryFromGPU(sharp.base_address, bytes);
++            texture_cache.InvalidateMemoryFromGPU(sharp.base_address, bytes, false, true);
+             static std::atomic_flag logged{};
+             if (!logged.test_and_set(std::memory_order_relaxed)) {
+                 LOG_INFO(Render_Vulkan,

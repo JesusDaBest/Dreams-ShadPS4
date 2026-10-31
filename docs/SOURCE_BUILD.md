@@ -1,8 +1,8 @@
 # Build the Dreams source fixes
 
-## Current October 30 build
+## Current October 31 build
 
-Use the [mip-readback source manifest](../builds/cusa04301-mip-readback-20261030/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-mip-readback-20261030.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/MIP_READBACK_20261030.md#download-and-source).
+Use the [GPU image-write source manifest](../builds/cusa04301-gpu-image-writes-20261031/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-gpu-image-writes-20261031.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/GPU_IMAGE_WRITES_20261031.md#download-and-source).
 
 ## Earlier source instructions
 
