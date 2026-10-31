@@ -2,7 +2,7 @@
 
 ## Current October 31 build
 
-Use the [packed-texture source manifest](../builds/cusa04301-packed-image-formats-20261031/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-packed-image-formats-20261031.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/PACKED_IMAGE_FORMATS_20261031.md#download-and-source).
+Use the [microphone recording source manifest](../builds/cusa04301-microphone-encoder-20261031/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-microphone-encoder-20261031.patch` in order. The last patch includes the encoder source, license, headers and CMake integration; no extra codec download is required. Changed source hashes and patch application are verified. Full fresh-build reproducibility has not been established. See [the update record](updates/MICROPHONE_RECORDING_20261031.md#download-and-source).
 
 ## Earlier source instructions
 
