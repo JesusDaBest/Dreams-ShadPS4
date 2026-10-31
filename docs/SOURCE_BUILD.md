@@ -2,7 +2,7 @@
 
 ## Current October 30 build
 
-Use the [texture-border source manifest](../builds/cusa04301-sampler-border-20261030/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-sampler-border-20261030.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/SAMPLER_BORDER_20261030.md#download-and-source).
+Use the [texture-refresh source manifest](../builds/cusa04301-texture-refresh-20261030/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch in order through `dreams-texture-refresh-20261030.patch`. Retain all preceding patches. Source hashes and patch application are verified; full fresh-build reproducibility has not been established. See [the update record](updates/TEXTURE_REFRESH_20261030.md#download-and-source).
 
 ## Earlier source instructions
 
