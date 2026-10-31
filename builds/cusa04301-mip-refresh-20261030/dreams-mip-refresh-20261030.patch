@@ -1,0 +1,193 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -534,7 +534,7 @@
+             }
+             // Preserve ownership only for current GPU contents actually copied.
+             if (cache_image.SafeToDownload()) {
+-                new_image.flags |= ImageFlagBits::GpuModified;
++                new_image.MarkGpuModified();
+             }
+         } else if (cache_image.info.num_samples == 1 && new_info.props.is_depth &&
+                    new_info.num_samples > 1) {
+@@ -548,7 +548,7 @@
+                 cache_image.info.pixel_format, new_info.pixel_format, cache_image.GetImage(),
+                 new_image.GetImage());
+             if (cache_image.SafeToDownload()) {
+-                new_image.flags |= ImageFlagBits::GpuModified;
++                new_image.MarkGpuModified();
+             }
+         } else {
+             LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
+@@ -839,9 +839,10 @@
+                 // We need to have a larger, already allocated image to copy this one into
+                 if (merged_image_id) {
+                     auto& merged_image = slot_images[merged_image_id];
++                    RefreshImage(merged_image);
+                     merged_image.CopyMip(cache_image, mip, slice);
+                     if (cache_image.SafeToDownload()) {
+-                        merged_image.flags |= ImageFlagBits::GpuModified;
++                        merged_image.MarkGpuModified();
+                     }
+                     FreeImage(cache_image_id);
+                 }
+@@ -884,7 +885,7 @@
+ 
+     // A copy into a fresh backing must not make GPU-written data look CPU-only.
+     if (src_image.SafeToDownload()) {
+-        new_image.flags |= ImageFlagBits::GpuModified;
++        new_image.MarkGpuModified();
+     }
+ 
+     if (src_image.binding.is_bound || src_image.binding.is_target) {
+@@ -1034,27 +1035,27 @@
+ 
+ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
++    UpdateImage(image_id);
+     if (desc.type == BindingType::Storage) {
+-        image.flags |= ImageFlagBits::GpuModified;
++        image.MarkGpuModified();
+         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+             image.info.guest_address != 0) {
+             std::unique_lock lk{download_images_mutex};
+             download_images.emplace(image_id);
+         }
+     }
+-    UpdateImage(image_id);
+     return image.FindView(desc.view_info);
+ }
+ 
+ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+-    image.flags |= ImageFlagBits::GpuModified;
+     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+         std::unique_lock lk{download_images_mutex};
+         download_images.emplace(image_id);
+     }
+     image.usage.render_target = 1u;
+     UpdateImage(image_id);
++    image.MarkGpuModified();
+ 
+     // Register meta data for this color buffer
+     if (desc.info.meta_info.cmask_addr) {
+@@ -1074,9 +1075,9 @@
+ 
+ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+-    image.flags |= ImageFlagBits::GpuModified;
+     image.usage.depth_target = 1u;
+     UpdateImage(image_id);
++    image.MarkGpuModified();
+ 
+     // Register meta data for this depth buffer
+     if (desc.info.meta_info.htile_addr) {
+@@ -1158,6 +1159,8 @@
+     const u32 num_mips = image.info.resources.levels;
+     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
+     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
++    const bool cpu_touched =
++        True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty));
+     if (volume_stats != nullptr) {
+         const u64 count = ++volume_stats->dirty_refreshes;
+         LogDreamsVolumeCacheEvent(image, *volume_stats, "dirty-refresh", count);
+@@ -1171,11 +1174,13 @@
+             image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
+         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
+ 
+-        // Protect GPU modified resources from accidental CPU reuploads.
+-        if (is_gpu_modified && !is_gpu_dirty) {
++        // Compare CPU updates against the last CPU contents, not the GPU data.
++        // A buffer refresh must advance a changed CPU baseline too, but its
++        // GPU upload must not be skipped just because the CPU hash matches.
++        if (is_gpu_modified && (!is_gpu_dirty || cpu_touched)) {
+             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
+             const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
+-            if (image.mip_hashes[m] == hash) {
++            if (!is_gpu_dirty && image.mip_hashes[m] == hash) {
+                 continue;
+             }
+             image.mip_hashes[m] = hash;
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -8,6 +8,7 @@
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/texture_cache/blit_helper.h"
+ #include "video_core/texture_cache/image.h"
++#include <xxhash.h>
+ 
+ #include <vk_mem_alloc.h>
+ 
+@@ -352,6 +353,20 @@
+         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+         .pImageMemoryBarriers = barriers.data(),
+     });
++}
++
++void Image::MarkGpuModified() {
++    if ((False(flags & ImageFlagBits::GpuModified) ||
++         True(flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) &&
++        info.guest_address != 0 &&
++        info.num_samples == 1) {
++        const auto* address = std::bit_cast<const u8*>(info.guest_address);
++        for (u32 mip = 0; mip < info.resources.levels; ++mip) {
++            const auto& layout = info.mips_layout[mip];
++            mip_hashes[mip] = XXH3_64bits(address + layout.offset, layout.size);
++        }
++    }
++    flags |= ImageFlagBits::GpuModified;
+ }
+ 
+ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer,
+@@ -844,7 +859,7 @@
+                                                 vk::ImageLayout::eTransferDstOptimal, region);
+     }
+ 
+-    flags |= VideoCore::ImageFlagBits::GpuModified;
++    MarkGpuModified();
+     flags &= ~VideoCore::ImageFlagBits::Dirty;
+ }
+ 
+--- a/src/video_core/texture_cache/image.h
++++ b/src/video_core/texture_cache/image.h
+@@ -105,6 +105,10 @@
+     bool IsTracked() {
+         return track_addr != 0 && track_addr_end != 0;
+     }
++
++    // Call after pending uploads or a full overwrite. Before a partial write,
++    // refresh pending CPU data so untouched subresources are preserved.
++    void MarkGpuModified();
+ 
+     bool SafeToDownload() const {
+         return True(flags & ImageFlagBits::GpuModified) && False(flags & (ImageFlagBits::Dirty));
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -27116,7 +27116,7 @@
+             buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::DeviceLocal);
+         dst_image.CopyImageWithBuffer(src_image, copy_buffer.Handle(), 0);
+     }
+-    dst_image.flags |= VideoCore::ImageFlagBits::GpuModified;
++    dst_image.MarkGpuModified();
+     dst_image.flags &= ~VideoCore::ImageFlagBits::Dirty;
+     return true;
+ }
+@@ -27177,7 +27177,7 @@
+         .extent = image1.info.resources,
+     };
+     image1.Clear(clear, range);
+-    image1.flags |= VideoCore::ImageFlagBits::GpuModified;
++    image1.MarkGpuModified();
+     image1.flags &= ~VideoCore::ImageFlagBits::Dirty;
+     return true;
+ }
+@@ -29910,7 +29910,9 @@
+     VideoCore::TextureCache::ImageDesc mrt0_desc{liverpool->regs.color_buffers[0], mrt0_hint};
+     VideoCore::TextureCache::ImageDesc mrt1_desc{liverpool->regs.color_buffers[1], mrt1_hint};
+     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
+-    auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
++    const auto mrt1_id = texture_cache.FindImage(mrt1_desc, true);
++    texture_cache.UpdateImage(mrt1_id);
++    auto& mrt1_image = texture_cache.GetImage(mrt1_id);
+ 
+     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
+                                  liverpool->regs.color_buffers[0].Address(),
