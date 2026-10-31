@@ -52,3 +52,5 @@ builds/cusa04301-gpu-image-writes-20261031/** -text whitespace=blank-at-eol,blan
 builds/cusa04301-gpu-image-writes-20261031/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-partial-image-formats-20261031/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-partial-image-formats-20261031/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-packed-image-formats-20261031/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-packed-image-formats-20261031/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
