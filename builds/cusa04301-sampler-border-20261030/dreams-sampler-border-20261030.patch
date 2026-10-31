@@ -1,0 +1,27 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -1246,9 +1246,21 @@
+ 
+ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
+                                      AmdGpu::BorderColorBuffer border_color_base, bool is_compare) {
+-    const std::array<u64, 3> cache_key{sampler.raw0, sampler.raw1,
+-                                       static_cast<u64>(is_compare)};
+-    const u64 hash = XXH3_64bits(cache_key.data(), sizeof(cache_key));
++    std::array<u64, 5> cache_key{sampler.raw0, sampler.raw1,
++                                 static_cast<u64>(is_compare), 0, 0};
++    size_t key_bytes = 3 * sizeof(u64);
++    if (sampler.border_color_type == AmdGpu::BorderColor::Custom &&
++        instance.IsCustomBorderColorSupported()) {
++        // The descriptor stores an index, but the immutable host sampler stores
++        // the selected colour. The table or its contents may change independently.
++        const auto* colours = border_color_base.Address<const std::array<float, 4>*>();
++        const auto colour_bits =
++            std::bit_cast<std::array<u64, 2>>(colours[sampler.border_color_ptr.Value()]);
++        cache_key[3] = colour_bits[0];
++        cache_key[4] = colour_bits[1];
++        key_bytes = sizeof(cache_key);
++    }
++    const u64 hash = XXH3_64bits(cache_key.data(), key_bytes);
+ 
+     std::scoped_lock lock{samplers_mutex};
+     const auto [it, new_sampler] =
