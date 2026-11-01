@@ -1,0 +1,98 @@
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -462,12 +462,24 @@
+     if constexpr (!async) Vulkan::DreamsWaitProbe::ObserveDownload(total_size_bytes);
+     Vulkan::DreamsReadbackGpuSpan::Scope gpu_span{instance, scheduler, device_addr, size,
+         total_size_bytes, copies.size(), !async && Common::ElfInfo::Instance().GameSerial() == "CUSA04301"};
+-    const auto [download, offset] = download_buffer.Map(total_size_bytes);
++    // A large unmap can request more dirty bytes than the fixed download ring.
++    // Deferred callbacks also need storage that survives subsequent ring reuse.
++    std::shared_ptr<Buffer> owned_download;
++    if (async || total_size_bytes > download_buffer.SizeBytes()) {
++        owned_download = std::make_shared<Buffer>(
++            instance, scheduler, MemoryUsage::Download, 0, AllFlags, total_size_bytes);
++    }
++    auto& target_buffer = owned_download ? *owned_download : static_cast<Buffer&>(download_buffer);
++    const auto [download, offset] = owned_download
++        ? std::pair{owned_download->mapped_data.data(), u64{0}}
++        : download_buffer.Map(total_size_bytes);
+     for (auto& copy : copies) {
+         // Modify copies to have the staging offset in mind
+         copy.dstOffset += offset;
+     }
+-    download_buffer.Commit();
++    if (!owned_download) {
++        download_buffer.Commit();
++    }
+     scheduler.EndRendering();
+     const auto cmdbuf = scheduler.CommandBuffer();
+     if constexpr (!async) gpu_span.Begin(cmdbuf);
+@@ -479,12 +491,17 @@
+             .pBufferMemoryBarriers = &*barrier,
+         });
+     }
+-    cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
++    cmdbuf.copyBuffer(buffer.buffer, target_buffer.Handle(), copies);
+     if constexpr (!async) gpu_span.End(cmdbuf);
+-    const auto write_data = [&]() {
++    auto write_data = [this, owned_download, copies = std::move(copies),
++                             buffer_addr = buffer.CpuAddr(), device_addr, size,
++                             download, offset, total_size_bytes]() {
++        auto& completed_buffer = owned_download ? *owned_download
++            : static_cast<Buffer&>(download_buffer);
++        completed_buffer.InvalidateMappedRange(offset, total_size_bytes);
+         auto* memory = Core::Memory::Instance();
+         for (const auto& copy : copies) {
+-            const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
++            const VAddr copy_device_addr = buffer_addr + copy.srcOffset;
+             const u64 dst_offset = copy.dstOffset - offset;
+             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
+                                     copy.size);
+@@ -492,7 +509,7 @@
+         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+     };
+     if constexpr (async) {
+-        scheduler.DeferOperation(write_data);
++        scheduler.DeferOperation(std::move(write_data));
+     } else {
+         gpu_span.BeforeFinish();
+         scheduler.Finish();
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -1807,8 +1807,12 @@
+         }
+         --num_deletions;
+         const size_t lru_id = samplers.at(hash).lru_id;
++        auto retired_sampler = std::move(samplers.at(hash));
+         samplers.erase(hash);
+         sampler_lru_cache.Free(lru_id);
++        // Age selects a cache entry, but does not prove its GPU work finished.
++        // Retain the native sampler through the current submission as images do.
++        scheduler.DeferOperation([sampler = std::move(retired_sampler)] {});
+         return false;
+     };
+ 
+--- a/src/video_core/buffer_cache/buffer.cpp
++++ b/src/video_core/buffer_cache/buffer.cpp
+@@ -231,8 +231,8 @@
+ 
+     offset += mapped_size;
+     if (current_watch_cursor != 0 &&
+-        current_watches[current_watch_cursor].tick == scheduler->CurrentTick()) {
+-        current_watches[current_watch_cursor].upper_bound = offset;
++        current_watches[current_watch_cursor - 1].tick == scheduler->CurrentTick()) {
++        current_watches[current_watch_cursor - 1].upper_bound = offset;
+         return;
+     }
+ 
+--- a/src/common/lru_cache.h
++++ b/src/common/lru_cache.h
+@@ -56,7 +56,7 @@
+     template <typename Func>
+     void ForEachItemBelow(TickType tick, Func&& func) {
+         static constexpr bool RETURNS_BOOL =
+-            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
++            std::is_same_v<std::invoke_result_t<Func, ObjectType>, bool>;
+         Item* iterator = first_item;
+         while (iterator) {
+             if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {

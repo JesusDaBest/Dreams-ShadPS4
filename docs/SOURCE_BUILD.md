@@ -2,7 +2,7 @@
 
 ## Current November 1 build
 
-Use the [current source manifest](../builds/cusa04301-backing-write-segments-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-backing-write-segments-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. The changed memory-copy source reconstructs exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/BACKING_WRITE_SEGMENTS_20261101.md).
+Use the [current source manifest](../builds/cusa04301-gpu-resource-lifetime-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-gpu-resource-lifetime-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. All four changed source files reconstruct exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/GPU_RESOURCE_LIFETIME_20261101.md).
 
 ## Earlier source instructions
 
