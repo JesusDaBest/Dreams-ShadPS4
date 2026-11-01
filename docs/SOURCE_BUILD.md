@@ -2,7 +2,7 @@
 
 ## Current November 1 build
 
-Use the [current source manifest](../builds/cusa04301-readback-controls-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-readback-controls-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. The three changed source files reconstruct exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/READBACK_CONTROLS_20261101.md).
+Use the [current source manifest](../builds/cusa04301-readback-lifetime-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-readback-lifetime-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. The changed cache source reconstructs exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/READBACK_LIFETIME_20261101.md).
 
 ## Earlier source instructions
 

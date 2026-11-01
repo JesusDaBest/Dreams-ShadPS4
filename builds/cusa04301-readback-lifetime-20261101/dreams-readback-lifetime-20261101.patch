@@ -1,0 +1,53 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -210,20 +210,25 @@
+     const u64 alignment = std::max<u64>(instance.StorageMinAlignment(),
+                                         instance.NonCoherentAtomSize());
+     const u64 reserve_size = Common::AlignUp<u64>(writeback_size, alignment);
+-    // Large images do not fit the shared readback ring. Preserve their GPU
+-    // contents too, without increasing the permanent staging allocation.
+-    std::shared_ptr<StreamBuffer> oversized_download;
+-    if (reserve_size > download_ring.SizeBytes()) {
+-        oversized_download = std::make_shared<StreamBuffer>(
+-            instance, scheduler, MemoryUsage::Download, reserve_size);
+-    }
+-    auto& download_buffer = oversized_download ? *oversized_download : download_ring;
+-    const auto [download, offset] = download_buffer.Map(reserve_size, alignment);
++    // Ring reuse waits for the GPU, not for deferred CPU writeback. Retain
++    // separate storage for asynchronous downloads until that writeback returns.
++    // Oversized synchronous downloads also need storage outside the fixed ring.
++    std::shared_ptr<Buffer> owned_download;
++    if (!sync || reserve_size > download_ring.SizeBytes()) {
++        owned_download = std::make_shared<Buffer>(
++            instance, scheduler, MemoryUsage::Download, 0, AllFlags, reserve_size);
++    }
++    auto& download_buffer = owned_download ? *owned_download : static_cast<Buffer&>(download_ring);
++    const auto [download, offset] = owned_download
++        ? std::pair{owned_download->mapped_data.data(), u64{0}}
++        : download_ring.Map(reserve_size, alignment);
+     if (!download) {
+         LOG_ERROR(Render_Vulkan, "Image download exceeds staging capacity: {:#x}", writeback_size);
+         return;
+     }
+-    download_buffer.Commit();
++    if (!owned_download) {
++        download_ring.Commit();
++    }
+ 
+     // An image does not own row/depth padding. Seed it from CPU backing rather than
+     // copying uninitialized scratch bytes over neighboring guest data. No extra copy
+@@ -264,11 +269,10 @@
+     scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+         .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host_barrier,
+     });
+-    const auto writeback = [this, oversized_download, device_addr = info.guest_address,
++    const auto writeback = [this, owned_download, device_addr = info.guest_address,
+                            download, offset, writeback_size] {
+-        // The completion callback owns oversized staging until writeback finishes.
+-        auto& completed_buffer = oversized_download ? *oversized_download
+-            : buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
++        auto& completed_buffer = owned_download ? *owned_download
++            : static_cast<Buffer&>(buffer_cache.GetUtilityBuffer(MemoryUsage::Download));
+         completed_buffer.InvalidateMappedRange(offset, writeback_size);
+         return Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                         download, writeback_size);
