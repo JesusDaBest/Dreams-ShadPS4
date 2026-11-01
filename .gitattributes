@@ -60,3 +60,5 @@ builds/cusa04301-readback-controls-20261101/** -text whitespace=blank-at-eol,bla
 builds/cusa04301-readback-controls-20261101/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-readback-lifetime-20261101/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-readback-lifetime-20261101/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-backing-write-segments-20261101/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-backing-write-segments-20261101/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

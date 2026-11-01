@@ -1,0 +1,36 @@
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -255,7 +255,7 @@
+ 
+     std::vector<VirtualMemoryArea> vmas_to_write;
+     auto current_vma = FindVMA(virtual_addr);
+-    while (current_vma->second.Overlaps(virtual_addr, size)) {
++    while (current_vma != vma_map.end() && current_vma->second.Overlaps(virtual_addr, size)) {
+         if (!HasPhysicalBacking(current_vma->second)) {
+             break;
+         }
+@@ -267,6 +267,7 @@
+         return false;
+     }
+ 
++    const auto* source = static_cast<const u8*>(data);
+     for (auto& vma : vmas_to_write) {
+         auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;
+         auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
+@@ -278,12 +279,14 @@
+                 std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
+             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
+             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
+-            memcpy(backing, data, copy_size);
++            // Each physical region consumes the next part of the readback.
++            memcpy(backing, source, copy_size);
++            source += copy_size;
+             size -= copy_size;
+         }
+     }
+ 
+-    return true;
++    return size == 0;
+ }
+ 
+ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
