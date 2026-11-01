@@ -1,0 +1,246 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -194,15 +194,15 @@
+ void TextureCache::ProcessDownloadImages() {
+     std::unique_lock lk{download_images_mutex};
+     for (const ImageId image_id : download_images) {
+-        DownloadImageMemory(image_id, true);
++        DownloadImageMemory(image_id);
+     }
+     download_images.clear();
+ }
+ 
+-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
++Common::UniqueFunction<bool> TextureCache::PrepareImageDownload(ImageId image_id, bool immediate) {
+     Image& image = slot_images[image_id];
+     if (False(image.flags & ImageFlagBits::GpuModified)) {
+-        return;
++        return {};
+     }
+     auto& download_ring = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+     const auto& info = image.info;
+@@ -210,11 +210,11 @@
+     const u64 alignment = std::max<u64>(instance.StorageMinAlignment(),
+                                         instance.NonCoherentAtomSize());
+     const u64 reserve_size = Common::AlignUp<u64>(writeback_size, alignment);
+-    // Ring reuse waits for the GPU, not for deferred CPU writeback. Retain
+-    // separate storage for asynchronous downloads until that writeback returns.
+-    // Oversized synchronous downloads also need storage outside the fixed ring.
++    // A batch can wrap the ring before its CPU writebacks run. Keep each queued
++    // download in owned storage until the batch has been copied to guest memory.
++    // Oversized immediate downloads also need storage outside the fixed ring.
+     std::shared_ptr<Buffer> owned_download;
+-    if (!sync || reserve_size > download_ring.SizeBytes()) {
++    if (!immediate || reserve_size > download_ring.SizeBytes()) {
+         owned_download = std::make_shared<Buffer>(
+             instance, scheduler, MemoryUsage::Download, 0, AllFlags, reserve_size);
+     }
+@@ -224,7 +224,7 @@
+         : download_ring.Map(reserve_size, alignment);
+     if (!download) {
+         LOG_ERROR(Render_Vulkan, "Image download exceeds staging capacity: {:#x}", writeback_size);
+-        return;
++        return {};
+     }
+     if (!owned_download) {
+         download_ring.Commit();
+@@ -242,7 +242,7 @@
+             if (!memory->TryReadBacking(info.guest_address + pos, download + pos, bytes)) {
+                 LOG_ERROR(Render_Vulkan, "Cannot preserve image padding at {:#x}",
+                           info.guest_address + pos);
+-                return;
++                return {};
+             }
+             pos += bytes;
+           }
+@@ -269,29 +269,33 @@
+     scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+         .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host_barrier,
+     });
+-    const auto writeback = [this, owned_download, device_addr = info.guest_address,
+-                           download, offset, writeback_size] {
++    return [this, owned_download, device_addr = info.guest_address,
++            download, offset, writeback_size, image_id, immediate] {
+         auto& completed_buffer = owned_download ? *owned_download
+             : static_cast<Buffer&>(buffer_cache.GetUtilityBuffer(MemoryUsage::Download));
+         completed_buffer.InvalidateMappedRange(offset, writeback_size);
+-        return Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+-                                                        download, writeback_size);
++        if (!Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
++                                                       download, writeback_size)) {
++            return false;
++        }
++        if (immediate) {
++            // Hash the downloaded bytes, not backing that the CPU may edit next.
++            auto& retained_image = slot_images[image_id];
++            const auto& retained_info = retained_image.info;
++            for (u32 mip = 0; mip < retained_info.resources.levels; ++mip) {
++                const auto& layout = retained_info.mips_layout[mip];
++                retained_image.mip_hashes[mip] = XXH3_64bits(download + layout.offset, layout.size);
++            }
++        }
++        return true;
+     };
+-    if (sync) {
++}
++
++void TextureCache::DownloadImageMemory(ImageId image_id) {
++    auto writeback = PrepareImageDownload(image_id, true);
++    if (writeback) {
+         scheduler.Finish();
+-        if (writeback()) {
+-            // The retained image now has a new CPU baseline. Hash the completed
+-            // download, not guest memory: a CPU edit after writeback must remain
+-            // detectable instead of being mistaken for the downloaded contents.
+-            for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+-                const auto& layout = info.mips_layout[mip];
+-                image.mip_hashes[mip] = XXH3_64bits(download + layout.offset, layout.size);
+-            }
+-        }
+-    } else {
+-        // The asynchronous caller retires the image immediately. Do not retain
+-        // an Image reference or update its metadata from the callback thread.
+-        scheduler.DeferPriorityOperation([writeback] { writeback(); });
++        writeback();
+     }
+ }
+ 
+@@ -889,7 +893,7 @@
+ 
+         // The replacement image will initially upload from guest memory. Make the guest backing
+         // authoritative before deleting a GPU-modified alias so that upload retains its contents.
+-        DownloadImageMemory(cache_image_id, true);
++        DownloadImageMemory(cache_image_id);
+     };
+ 
+     // Equal address
+@@ -1727,19 +1731,30 @@
+         return;
+     }
+     std::scoped_lock lock{mutex};
++    // Keep dirty images registered and write-protected through the entire
++    // writeback. Releasing them first permits a newer CPU store or remap to be
++    // overwritten by a delayed callback. Submit all dirty downloads together.
++    std::vector<std::pair<ImageId, Common::UniqueFunction<bool>>> pending_downloads;
++    u64 pending_bytes = 0;
++    const auto projected_usage = [&] { return total_used_memory - pending_bytes; };
+     bool pressured = false;
+     bool aggresive = false;
+     u64 ticks_to_destroy = 0;
+     size_t num_deletions = 0;
+ 
+     const auto configure = [&](bool allow_aggressive) {
+-        pressured = total_used_memory >= pressure_gc_memory;
+-        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
++        pressured = projected_usage() >= pressure_gc_memory;
++        aggresive = allow_aggressive && projected_usage() >= critical_gc_memory;
+         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
+         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
+         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+     };
+     const auto clean_up = [&](ImageId image_id) {
++        // The aggressive pass can revisit an image whose readback is queued.
++        if (std::ranges::any_of(pending_downloads,
++                               [&](const auto& pending) { return pending.first == image_id; })) {
++            return false;
++        }
+         if (num_deletions == 0) {
+             return true;
+         }
+@@ -1755,16 +1770,24 @@
+             return false;
+         }
+         if (download) {
+-            DownloadImageMemory(image_id);
+-        }
+-        FreeImage(image_id);
+-        if (total_used_memory < critical_gc_memory) {
++            // Neighboring CPU writes may have untracked a boundary page.
++            TrackImage(image_id);
++            auto writeback = PrepareImageDownload(image_id, false);
++            if (!writeback) {
++                return false;
++            }
++            pending_bytes += Common::AlignUp(image.info.guest_size, 1024);
++            pending_downloads.emplace_back(image_id, std::move(writeback));
++        } else {
++            FreeImage(image_id);
++        }
++        if (projected_usage() < critical_gc_memory) {
+             if (aggresive) {
+                 num_deletions >>= 2;
+                 aggresive = false;
+                 return false;
+             }
+-            if (pressured && total_used_memory < pressure_gc_memory) {
++            if (pressured && projected_usage() < pressure_gc_memory) {
+                 num_deletions >>= 1;
+                 pressured = false;
+             }
+@@ -1776,10 +1799,27 @@
+     configure(false);
+     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+ 
+-    if (total_used_memory >= critical_gc_memory) {
++    if (projected_usage() >= critical_gc_memory) {
+         // If we are still over the critical limit, run an aggressive GC
+         configure(true);
+         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
++    }
++
++    if (!pending_downloads.empty()) {
++        // CPU invalidation and unmapping take mutex as well. Do not untrack any
++        // dirty image until its completed data has reached the old mapping.
++        // Clean-only collection never submits or waits here.
++        const u64 download_tick = scheduler.CurrentTick();
++        scheduler.Finish();
++        for (auto& [image_id, writeback] : pending_downloads) {
++            if (writeback()) {
++                FreeImage(image_id);
++            }
++            // CPU writeback is finished. Release staging allocations on the
++            // existing cleanup thread, using the tick that already completed.
++            scheduler.DeferPriorityOperation(
++                [retired_writeback = std::move(writeback)] {}, download_tick);
++        }
+     }
+ }
+ 
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -120,7 +120,7 @@
+     void ProcessDownloadImages();
+ 
+     /// Copies an image back to its guest-memory layout.
+-    void DownloadImageMemory(ImageId image_id, bool sync = false);
++    void DownloadImageMemory(ImageId image_id);
+ 
+     /// Writes an image's linear GPU contents for targeted renderer diagnostics.
+     void DumpImageLinear(ImageId image_id, const std::filesystem::path& path);
+@@ -406,6 +406,8 @@
+         UnregisterImage(image_id);
+         DeleteImage(image_id);
+     }
++
++    Common::UniqueFunction<bool> PrepareImageDownload(ImageId image_id, bool immediate);
+ 
+     void GarbageCollectImages();
+     void GarbageCollectSamplers();
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -421,9 +421,14 @@
+     /// Defers an operation until the gpu has reached the current cpu tick.
+     /// Runs as soon as possible in another thread.
+     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
++        DeferPriorityOperation(std::move(func), CurrentTick());
++    }
++
++    /// Retire work against its recorded submission, including an already-completed tick.
++    void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 gpu_tick) {
+         {
+             std::unique_lock lk(priority_pending_ops_mutex);
+-            priority_pending_ops.emplace(std::move(func), CurrentTick());
++            priority_pending_ops.emplace(std::move(func), gpu_tick);
+         }
+         priority_pending_ops_cv.notify_one();
+     }

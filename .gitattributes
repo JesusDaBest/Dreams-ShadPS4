@@ -64,3 +64,5 @@ builds/cusa04301-backing-write-segments-20261101/** -text whitespace=blank-at-eo
 builds/cusa04301-backing-write-segments-20261101/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-gpu-resource-lifetime-20261101/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-gpu-resource-lifetime-20261101/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-image-eviction-writeback-20261101/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-image-eviction-writeback-20261101/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
