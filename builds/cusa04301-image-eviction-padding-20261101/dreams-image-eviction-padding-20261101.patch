@@ -1,0 +1,52 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -1772,9 +1772,20 @@
+         if (download) {
+             // Neighboring CPU writes may have untracked a boundary page.
+             TrackImage(image_id);
+-            auto writeback = PrepareImageDownload(image_id, false);
+-            if (!writeback) {
+-                return false;
++            // Padding is prefetched from guest memory before a download. If an
++            // earlier writeback touches this range, prefetching now would retain
++            // its old bytes and later overwrite that completed image's pixels.
++            const bool shared_padding =
++                std::ranges::any_of(pending_downloads, [&](const auto& pending) {
++                    return slot_images[pending.first].Overlaps(image.info.guest_address,
++                                                               image.info.guest_size);
++                }) && ImageHasTransferPadding(image.info);
++            Common::UniqueFunction<bool> writeback;
++            if (!shared_padding) {
++                writeback = PrepareImageDownload(image_id, false);
++                if (!writeback) {
++                    return false;
++                }
+             }
+             pending_bytes += Common::AlignUp(image.info.guest_size, 1024);
+             pending_downloads.emplace_back(image_id, std::move(writeback));
+@@ -1812,13 +1823,24 @@
+         const u64 download_tick = scheduler.CurrentTick();
+         scheduler.Finish();
+         for (auto& [image_id, writeback] : pending_downloads) {
++            u64 completed_tick = download_tick;
++            if (!writeback) {
++                // Earlier images have now reached backing memory. Keep this
++                // alias registered and protected while taking its fresh padding.
++                writeback = PrepareImageDownload(image_id, false);
++                if (!writeback) {
++                    continue;
++                }
++                completed_tick = scheduler.CurrentTick();
++                scheduler.Finish();
++            }
+             if (writeback()) {
+                 FreeImage(image_id);
+             }
+             // CPU writeback is finished. Release staging allocations on the
+             // existing cleanup thread, using the tick that already completed.
+             scheduler.DeferPriorityOperation(
+-                [retired_writeback = std::move(writeback)] {}, download_tick);
++                [retired_writeback = std::move(writeback)] {}, completed_tick);
+         }
+     }
+ }

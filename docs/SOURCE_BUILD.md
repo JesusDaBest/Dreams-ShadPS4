@@ -2,7 +2,7 @@
 
 ## Current November 1 build
 
-Use the [current source manifest](../builds/cusa04301-image-eviction-writeback-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-image-eviction-writeback-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. All three changed source files reconstruct exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/IMAGE_EVICTION_WRITEBACK_20261101.md).
+Use the [current source manifest](../builds/cusa04301-image-eviction-padding-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-image-eviction-padding-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. The changed source file reconstructs exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/IMAGE_EVICTION_PADDING_20261101.md).
 
 ## Earlier source instructions
 
