@@ -1,0 +1,11 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -1871,6 +1871,8 @@
+         const size_t lru_id = samplers.at(hash).lru_id;
+         auto retired_sampler = std::move(samplers.at(hash));
+         samplers.erase(hash);
++        // The second pass must use the remaining cache size, not the entry count.
++        total_used_samplers = samplers.size();
+         sampler_lru_cache.Free(lru_id);
+         // Age selects a cache entry, but does not prove its GPU work finished.
+         // Retain the native sampler through the current submission as images do.
