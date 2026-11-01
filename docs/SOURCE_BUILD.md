@@ -1,8 +1,8 @@
 # Build the Dreams source fixes
 
-## Current October 31 build
+## Current November 1 build
 
-Use the [microphone recording source manifest](../builds/cusa04301-microphone-encoder-20261031/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-microphone-encoder-20261031.patch` in order. The last patch includes the encoder source, license, headers and CMake integration; no extra codec download is required. Changed source hashes and patch application are verified. Full fresh-build reproducibility has not been established. See [the update record](updates/MICROPHONE_RECORDING_20261031.md#download-and-source).
+Use the [current source manifest](../builds/cusa04301-readback-controls-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-readback-controls-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. The three changed source files reconstruct exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/READBACK_CONTROLS_20261101.md).
 
 ## Earlier source instructions
 

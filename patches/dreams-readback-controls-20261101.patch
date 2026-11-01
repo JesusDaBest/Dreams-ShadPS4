@@ -1,0 +1,123 @@
+--- a/src/core/devtools/layer.cpp
++++ b/src/core/devtools/layer.cpp
+@@ -96,6 +96,9 @@
+             ImGui::EndMenu();
+         }
+         if (BeginMenu("Display")) {
++            if (MenuItem("Show FPS", "F10", show_simple_fps)) {
++                Overlay::ToggleSimpleFps();
++            }
+             auto& pp_settings = presenter->GetPPSettingsRef();
+             if (BeginMenu("Brightness")) {
+                 SliderFloat("Gamma", &pp_settings.gamma, 0.1f, 2.0f);
+@@ -362,6 +365,10 @@
+ static void LoadSettings(const char* line) {
+     int i;
+     float f;
++    if (sscanf(line, "show_simple_fps=%d", &i) == 1) {
++        show_simple_fps = i != 0;
++        return;
++    }
+     if (sscanf(line, "fps_scale=%f", &f) == 1) {
+         fps_scale = f;
+         return;
+@@ -424,6 +431,7 @@
+     };
+     handler.WriteAllFn = [](ImGuiContext*, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf) {
+         buf->appendf("[%s][Data]\n", handler->TypeName);
++        buf->appendf("show_simple_fps=%d\n", show_simple_fps);
+         buf->appendf("fps_scale=%f\n", fps_scale);
+         buf->appendf("show_advanced_debug=%d\n", DebugState.IsShowingDebugMenuBar());
+         buf->appendf("show_frame_graph=%d\n", frame_graph.is_open);
+@@ -482,16 +490,27 @@
+         ImGui::GetForegroundDrawList()->AddText(pos, color, "Emulation Paused");
+     }
+ 
++    // Save visibility changes even when the overlay is hidden. Process this
++    // on the ImGui thread; the input hotkey only queues the toggle.
++    const bool reposition_fps = visibility_toggled;
++    visibility_toggled = false;
++    if (reposition_fps) {
++        MarkIniSettingsDirty();
++    }
++
+     if (show_simple_fps) {
+         if (Begin("Video Info", nullptr,
+                   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
+                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
+             // Set window position to top left if it was toggled on
+-            if (visibility_toggled) {
++            if (reposition_fps) {
+                 SetWindowPos("Video Info", {999999.0f, 0.0f}, ImGuiCond_Always);
+-                visibility_toggled = false;
+             }
+             if (BeginPopupContextWindow()) {
++                if (MenuItem("Hide FPS", "F10")) {
++                    Overlay::ToggleSimpleFps();
++                }
++                Separator();
+ #define M(label, value)                                                                            \
+     if (MenuItem(label, nullptr, fps_scale == value))                                              \
+     fps_scale = value
+--- a/src/emulator.cpp
++++ b/src/emulator.cpp
+@@ -586,6 +586,10 @@
+                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
+         }
+     }
++    // Locally packaged Dreams builds may have no Git describe metadata.
++    if (id == "CUSA04301") {
++        window_title = fmt::format("Dreams | shadPS4 v{}", Common::g_version);
++    }
+     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
+                                                    EmulatorSettings.GetWindowHeight(), controllers,
+                                                    window_title);
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -6,6 +6,7 @@
+ #include <bit>
+ #include <cstdlib>
+ #include <fstream>
++#include <memory>
+ #include <string_view>
+ #include <unordered_map>
+ 
+@@ -203,12 +204,20 @@
+     if (False(image.flags & ImageFlagBits::GpuModified)) {
+         return;
+     }
+-    auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
++    auto& download_ring = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+     const auto& info = image.info;
+     const u32 writeback_size = info.guest_size;
+     const u64 alignment = std::max<u64>(instance.StorageMinAlignment(),
+                                         instance.NonCoherentAtomSize());
+     const u64 reserve_size = Common::AlignUp<u64>(writeback_size, alignment);
++    // Large images do not fit the shared readback ring. Preserve their GPU
++    // contents too, without increasing the permanent staging allocation.
++    std::shared_ptr<StreamBuffer> oversized_download;
++    if (reserve_size > download_ring.SizeBytes()) {
++        oversized_download = std::make_shared<StreamBuffer>(
++            instance, scheduler, MemoryUsage::Download, reserve_size);
++    }
++    auto& download_buffer = oversized_download ? *oversized_download : download_ring;
+     const auto [download, offset] = download_buffer.Map(reserve_size, alignment);
+     if (!download) {
+         LOG_ERROR(Render_Vulkan, "Image download exceeds staging capacity: {:#x}", writeback_size);
+@@ -255,10 +264,12 @@
+     scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+         .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host_barrier,
+     });
+-    const auto writeback = [this, device_addr = info.guest_address, download, offset,
+-                           writeback_size] {
+-        buffer_cache.GetUtilityBuffer(MemoryUsage::Download).InvalidateMappedRange(offset,
+-                                                                                   writeback_size);
++    const auto writeback = [this, oversized_download, device_addr = info.guest_address,
++                           download, offset, writeback_size] {
++        // The completion callback owns oversized staging until writeback finishes.
++        auto& completed_buffer = oversized_download ? *oversized_download
++            : buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
++        completed_buffer.InvalidateMappedRange(offset, writeback_size);
+         return Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                         download, writeback_size);
+     };
