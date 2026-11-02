@@ -1,0 +1,39 @@
+{
+  "exact_tested_private_binary": false,
+  "production_changes_preserved": true,
+  "changed_production_objects": 5,
+  "diagnostic_objects_removed_or_rebuilt": 5,
+  "private_regression_cases": 259,
+  "private_validation_errors": 0,
+  "user_requested_promotion": true,
+  "explicit_visual_outcome_not_supplied": true,
+  "qt_default_route_verified": true,
+  "direct_route_verified": true,
+  "configuration_hash_verified": true,
+  "environment_verified": true,
+  "publication_started_game": false,
+  "real_profiles_written": false,
+  "source_patch_reconstruction_verified": true,
+  "earlier_fixes_retained": true,
+  "custom_debug_tools_included": false,
+  "user_saves_included": false,
+  "builder_included": false,
+  "vr_included": false,
+  "optional_tutorial_gui_unchanged": true,
+  "fresh_full_source_rebuild_verified": false,
+  "limitations": [
+    "Promotion was explicitly requested after making the combined candidate available for testing; no separate visual result was provided.",
+    "The clean executable was not separately played. Debug-only hooks were removed while preserving the approved production changes.",
+    "The regression fixture covers buffer readback, source lifetime and scheduler reentry on one GPU; it is not exhaustive rendering coverage.",
+    "No controlled game FPS comparison was performed and no overall speedup or complete visual-regression resolution is claimed."
+  ],
+  "core_sha256": "2f68936b5b01d845912098efc61e51f4834dd55d8fede732e547a777485dfc62",
+  "clean_regression": {
+    "cases": 259,
+    "failures": 0,
+    "validation_errors": 0
+  },
+  "zip_sha256": "3d7c8da19bb99175cc9c5dfeb6eaf8b337b12a2b3a865fcd499d13323e8ac9b4",
+  "zip_bytes": 60995624,
+  "zip_members": 47
+}

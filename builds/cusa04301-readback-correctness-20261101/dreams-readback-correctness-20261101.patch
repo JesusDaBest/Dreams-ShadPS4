@@ -1,0 +1,664 @@
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -6,6 +6,7 @@
+ #include <cstdlib>
+ #include <limits>
+ #include <string_view>
++#include <utility>
+ #include "common/alignment.h"
+ #include "common/debug.h"
+ #include "common/elf_info.h"
+@@ -20,6 +21,7 @@
+ #include "video_core/renderer_vulkan/dreams_wait_probe.h"
+ #include "video_core/renderer_vulkan/dreams_readback_gpu_span.h"
+ #include "video_core/texture_cache/texture_cache.h"
++#include <vk_mem_alloc.h>
+ 
+ namespace VideoCore {
+ 
+@@ -237,6 +239,79 @@
+     }
+ }
+ 
++void BufferCache::ReadCachedMemory(VAddr device_addr, u64 size,
++                                   std::source_location caller) {
++    if (!size) {
++        return;
++    }
++    liverpool->SendCommand<true>([&] {
++        struct CachedRange {
++            VAddr address;
++            u64 size;
++        };
++        boost::container::small_vector<CachedRange, 8> ranges;
++        // A readback may submit work and run completed fault callbacks. Those
++        // callbacks can join buffers and erase buffer_ranges entries, so finish
++        // traversing the live map before any operation that can submit.
++        buffer_ranges.ForEachInRange(device_addr, size,
++                                     [&](VAddr first, VAddr last, BufferId) {
++                                         ranges.push_back({first, last - first});
++                                     });
++        for (const auto& range : ranges) {
++            // Resolve again after each completion. Save addresses, not Buffer
++            // references or IDs: an earlier read can retire or move them.
++            const BufferId id = page_table[range.address >> CACHING_PAGEBITS].buffer_id;
++            if (IsBufferInvalid(id)) {
++                continue;
++            }
++            Buffer& buffer = slot_buffers[id];
++            if (!buffer.IsInBounds(range.address, range.size) ||
++                !IsRegionGpuModified(range.address, range.size)) {
++                continue;
++            }
++            // Keep the request inside an existing allocation; do not merge
++            // buffers just to cover CPU-only gaps in a texture's guest range.
++            const auto handle = buffer.Handle();
++            const auto access = buffer.access_mask;
++            const auto stage = buffer.stage;
++            // BindBuffers updates access tracking while retaining its barriers
++            // until Pipeline::BindResources. A hash readback can run between
++            // those steps, so the tracked access may describe a future read,
++            // not the GPU write that produced the bytes being downloaded.
++            // Make prior writes available here, before the copy is recorded.
++            scheduler.EndRendering();
++            auto before = *buffer.GetBarrier(vk::AccessFlagBits2::eTransferRead,
++                                            vk::PipelineStageFlagBits2::eTransfer, 0, true);
++            before.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
++            before.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
++            scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++                .bufferMemoryBarrierCount = 1,
++                .pBufferMemoryBarriers = &before,
++            });
++            ReadMemory(range.address, range.size, false, caller);
++            // Completion can retire this allocation, or relocate SlotVector
++            // storage even when its ID survives. Reacquire the current object
++            // and restore access only for the same active GPU buffer.
++            const BufferId current_id =
++                page_table[range.address >> CACHING_PAGEBITS].buffer_id;
++            if (current_id != id || IsBufferInvalid(current_id)) {
++                continue;
++            }
++            Buffer& current = slot_buffers[current_id];
++            if (current.Handle() != handle) {
++                continue;
++            }
++            if (auto barrier = current.GetBarrier(access, stage)) {
++                scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++                    .bufferMemoryBarrierCount = 1,
++                    .pBufferMemoryBarriers = &*barrier,
++                });
++            }
++        }
++    });
++}
++
++
+ // Prefetch eligibility follows elapsed time, not the number of unrelated reads.
+ // Tren can revisit a result within 40 ms after more than 100 other requests.
+ // A quarter-second idle limit still stops speculative copies of abandoned windows.
+@@ -462,17 +537,19 @@
+     if constexpr (!async) Vulkan::DreamsWaitProbe::ObserveDownload(total_size_bytes);
+     Vulkan::DreamsReadbackGpuSpan::Scope gpu_span{instance, scheduler, device_addr, size,
+         total_size_bytes, copies.size(), !async && Common::ElfInfo::Instance().GameSerial() == "CUSA04301"};
+-    // A large unmap can request more dirty bytes than the fixed download ring.
+-    // Deferred callbacks also need storage that survives subsequent ring reuse.
++    // Do not submit while the source Buffer reference and copy offsets are live:
++    // completion callbacks can relocate or replace that allocation. Deferred,
++    // oversized and busy-ring downloads use owned storage instead.
+     std::shared_ptr<Buffer> owned_download;
+-    if (async || total_size_bytes > download_buffer.SizeBytes()) {
++    auto [download, offset] = !async && total_size_bytes <= download_buffer.SizeBytes()
++        ? download_buffer.Map(total_size_bytes, 0, false)
++        : std::pair<u8*, u64>{nullptr, 0};
++    if (!download) {
+         owned_download = std::make_shared<Buffer>(
+             instance, scheduler, MemoryUsage::Download, 0, AllFlags, total_size_bytes);
++        download = owned_download->mapped_data.data();
+     }
+     auto& target_buffer = owned_download ? *owned_download : static_cast<Buffer&>(download_buffer);
+-    const auto [download, offset] = owned_download
+-        ? std::pair{owned_download->mapped_data.data(), u64{0}}
+-        : download_buffer.Map(total_size_bytes);
+     for (auto& copy : copies) {
+         // Modify copies to have the staging offset in mind
+         copy.dstOffset += offset;
+@@ -529,14 +606,11 @@
+     pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+ 
+-    if (!preflight_only && instance.IsVertexInputDynamicState()) {
+-        // Update current vertex inputs.
+-        const auto cmdbuf = scheduler.CommandBuffer();
+-        cmdbuf.setVertexInputEXT(bindings, attributes);
+-    }
+-
+     if (bindings.empty()) {
+-        // If there are no bindings, there is nothing further to do.
++        // An empty layout still needs to replace the previous dynamic layout.
++        if (!preflight_only && instance.IsVertexInputDynamicState()) {
++            scheduler.CommandBuffer().setVertexInputEXT(bindings, attributes);
++        }
+         return;
+     }
+ 
+@@ -619,9 +693,13 @@
+         host_strides.push_back(buffer.GetStride());
+     }
+ 
++    // Obtaining vertex buffers can wrap a stream buffer and submit its work.
++    // Set the layout after those operations, on the command buffer that receives
++    // the bindings; dynamic state from the submitted command buffer is not kept.
+     const auto cmdbuf = scheduler.CommandBuffer();
+     const auto num_buffers = guest_buffers.size();
+     if (instance.IsVertexInputDynamicState()) {
++        cmdbuf.setVertexInputEXT(bindings, attributes);
+         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+     } else {
+         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
+@@ -700,25 +778,22 @@
+     if (!dst_gds) {
+         texture_cache.PrepareImagesForGpuCopy(dst, num_bytes);
+     }
+-    auto& src_buffer = [&] -> const Buffer& {
+-        if (src_gds) {
+-            return gds_buffer;
+-        }
++    if (!src_gds) {
+         const auto buffer_id = FindBuffer(src, num_bytes);
+-        auto& buffer = slot_buffers[buffer_id];
+-        SynchronizeBuffer(buffer, src, num_bytes, false, true);
+-        return buffer;
+-    }();
+-    auto& dst_buffer = [&] -> const Buffer& {
+-        if (dst_gds) {
+-            return gds_buffer;
+-        }
++        SynchronizeBuffer(slot_buffers[buffer_id], src, num_bytes, false, true);
++    }
++    if (!dst_gds) {
+         const auto buffer_id = FindBuffer(dst, num_bytes);
+-        auto& buffer = slot_buffers[buffer_id];
+-        SynchronizeBuffer(buffer, dst, num_bytes, true, true);
++        SynchronizeBuffer(slot_buffers[buffer_id], dst, num_bytes, true, true);
+         gpu_modified_ranges.Add(dst, num_bytes);
+-        return buffer;
+-    }();
++    }
++    // Destination preparation can move the slots or join the source into a new
++    // allocation. Resolve both current buffers only after preparing both ranges.
++    // These lookups must not allocate or retain the old source id.
++    const Buffer& src_buffer =
++        src_gds ? gds_buffer : slot_buffers[page_table[src >> CACHING_PAGEBITS].buffer_id];
++    const Buffer& dst_buffer =
++        dst_gds ? gds_buffer : slot_buffers[page_table[dst >> CACHING_PAGEBITS].buffer_id];
+     const vk::BufferCopy region = {
+         .srcOffset = src_buffer.Offset(src),
+         .dstOffset = dst_buffer.Offset(dst),
+@@ -1150,7 +1225,9 @@
+     if (copies.empty()) {
+         return VK_NULL_HANDLE;
+     }
+-    const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
++    // Submitting here can run completion callbacks that relocate cached buffers
++    // while this function and SynchronizeBuffer still hold Buffer references.
++    const auto [staging, offset] = staging_buffer.Map(total_size_bytes, 0, false);
+     if (staging) {
+         for (auto& copy : copies) {
+             u8* const src_pointer = staging + copy.srcOffset;
+@@ -1162,7 +1239,7 @@
+         staging_buffer.Commit();
+         return staging_buffer.Handle();
+     } else {
+-        // For large one time transfers use a temporary host buffer.
++        // Keep busy-ring and oversized uploads alive until their GPU tick completes.
+         auto temp_buffer =
+             std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
+                                      vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
+@@ -1172,6 +1249,13 @@
+             u8* const src_pointer = staging + copy.srcOffset;
+             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
+             memory->CopySparseMemory(device_addr, src_pointer, copy.size);
++        }
++        if (!temp_buffer->is_coherent) {
++            const auto result = vmaFlushAllocation(instance.GetAllocator(),
++                                                   temp_buffer->buffer.allocation, 0,
++                                                   total_size_bytes);
++            ASSERT_MSG(result == VK_SUCCESS, "Failed flushing upload buffer: {}",
++                       vk::to_string(vk::Result{result}));
+         }
+         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
+         return src_buffer;
+@@ -1257,20 +1341,29 @@
+         .size = num_bytes,
+     };
+     vk::Buffer src_buffer = staging_buffer.Handle();
+-    if (num_bytes < StagingBufferSize) {
+-        const auto [staging, offset] = staging_buffer.Map(num_bytes);
++    // Registration also calls this while its page table and range index are being
++    // updated. Do not submit and run cache callbacks part-way through that update.
++    const auto [staging, offset] = num_bytes < StagingBufferSize
++                                      ? staging_buffer.Map(num_bytes, 0, false)
++                                      : std::pair<u8*, u64>{nullptr, 0};
++    if (staging) {
+         std::memcpy(staging, value, num_bytes);
+         copy.srcOffset = offset;
+         staging_buffer.Commit();
+     } else {
+-        // For large one time transfers use a temporary host buffer.
+-        // RenderDoc can lag quite a bit if the stream buffer is too large.
++        // Use owned storage when the ring is busy or the write is too large.
+         Buffer temp_buffer{
+             instance, scheduler, MemoryUsage::Upload, 0, vk::BufferUsageFlagBits::eTransferSrc,
+             num_bytes};
+         src_buffer = temp_buffer.Handle();
+         u8* const staging = temp_buffer.mapped_data.data();
+         std::memcpy(staging, value, num_bytes);
++        if (!temp_buffer.is_coherent) {
++            const auto result = vmaFlushAllocation(instance.GetAllocator(),
++                                                   temp_buffer.buffer.allocation, 0, num_bytes);
++            ASSERT_MSG(result == VK_SUCCESS, "Failed flushing upload buffer: {}",
++                       vk::to_string(vk::Result{result}));
++        }
+         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable {});
+     }
+     scheduler.EndRendering();
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -126,6 +126,11 @@
+     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false,
+                     std::source_location caller = std::source_location::current());
+ 
++    /// Read GPU-owned image-hash bytes through existing cached allocations.
++    /// Revalidate allocations after any completion callbacks before restoring access.
++    void ReadCachedMemory(VAddr device_addr, u64 size,
++                          std::source_location caller = std::source_location::current());
++
+     /// Prepare recently requested CPU readbacks at a guest compute completion boundary.
+     /// GPU thread only; leaves guest memory protected until the CPU consumes the result.
+     void PrefetchCpuReadbacks();
+@@ -165,6 +170,11 @@
+ 
+     /// Return true when the exact byte range intersects a GPU-resident write.
+     [[nodiscard]] bool IsRegionGpuModifiedExact(VAddr addr, size_t size) const;
++
++    /// True only if every byte still belongs to an announced GPU write.
++    [[nodiscard]] bool IsRegionGpuModifiedFully(VAddr addr, size_t size) const {
++        return gpu_modified_ranges.Contains(addr, size);
++    }
+ 
+     /// Return buffer id for the specified region
+     BufferId FindBuffer(VAddr device_addr, u32 size);
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -7747,6 +7747,10 @@
+     barriers.emplace_back(*combined);
+ }
+ 
++static bool NeedsShaderWriteRefresh(const Pipeline* pipeline,
++                                    const VideoCore::BufferCache& cache,
++                                    Core::MemoryManager* memory);
++
+ static void FinalizeDreamsDynamicReads(const Pipeline* pipeline, Rasterizer& rasterizer,
+                                        VideoCore::BufferCache& cache,
+                                        Pipeline::BufferBarriers& barriers,
+@@ -7919,6 +7923,16 @@
+     const auto& fetch_shader = pipeline->GetFetchShader();
+     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+ 
++    // Target preparation can read back aliased buffer bytes after BindResources
++    // announced this draw's writes. Re-establish only lost declarations before
++    // execution; otherwise the subsequent CPU access can see stale backing data.
++    if (NeedsShaderWriteRefresh(pipeline, buffer_cache, memory)) {
++        RefreshBufferResources(pipeline);
++        static u32 write_refresh_reports{};
++        if (write_refresh_reports++ < 4) {
++            LOG_WARNING(Render_Vulkan, "Restored pending shader writes after target readback");
++        }
++    }
+     FinalizeDreamsDynamicReads(pipeline, *this, buffer_cache, buffer_barriers,
+         std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()});
+     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+@@ -13509,6 +13523,16 @@
+         }
+     }
+ 
++    // Target preparation can read back aliased buffer bytes after BindResources
++    // announced this draw's writes. Re-establish only lost declarations before
++    // execution; otherwise the subsequent CPU access can see stale backing data.
++    if (NeedsShaderWriteRefresh(pipeline, buffer_cache, memory)) {
++        RefreshBufferResources(pipeline);
++        static u32 write_refresh_reports{};
++        if (write_refresh_reports++ < 4) {
++            LOG_WARNING(Render_Vulkan, "Restored pending shader writes after target readback");
++        }
++    }
+     FinalizeDreamsDynamicReads(pipeline, *this, buffer_cache, buffer_barriers,
+         std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()});
+     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+@@ -26829,6 +26853,27 @@
+         }
+     }
+     return *bound;
++}
++
++static bool NeedsShaderWriteRefresh(const Pipeline* pipeline,
++                                    const VideoCore::BufferCache& cache,
++                                    Core::MemoryManager* memory) {
++    for (const auto* stage : pipeline->GetStages()) {
++        if (!stage) continue;
++        for (u32 i = 0; i < stage->buffers.size(); ++i) {
++            const auto& desc = stage->buffers[i];
++            if (desc.IsSpecial() || !desc.is_written) continue;
++            const auto sharp = desc.GetSharp(*stage);
++            if (!sharp.base_address || !sharp.GetSize()) continue;
++            const u32 size = ResolveGuestBufferBindingSize(memory, *stage, i, desc, sharp);
++            const u32 written = desc.is_formatted ? size :
++                std::min(size, DreamsLinearWriteSize(*stage, i, desc, sharp, size));
++            if (written && !cache.IsRegionGpuModifiedFully(sharp.base_address, written)) {
++                return true;
++            }
++        }
++    }
++    return false;
+ }
+ 
+ u32 Rasterizer::RefreshBufferResources(const Pipeline* pipeline, bool trace_handle_changes,
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -5,6 +5,7 @@
+ #include "common/elf_info.h"
+ #include "video_core/renderer_vulkan/dreams_wait_probe.h"
+ #include "common/debug.h"
++#include "common/scope_exit.h"
+ #include "common/thread.h"
+ #include "imgui/renderer/texture_manager.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+@@ -149,9 +150,14 @@
+ void Scheduler::PopPendingOperations() {
+     std::unique_lock lk(pending_ops_mutex);
+     master_semaphore.Refresh();
+-    while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+-        pending_ops.front().callback();
+-        pending_ops.pop();
++    while (!pending_ops.empty() && pending_ops.front().callback &&
++           master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
++        // A callback may submit more work and re-enter this function. Keep its
++        // now-empty queue entry until it returns: nested processing must not run
++        // this callback twice or start later callbacks before it has finished.
++        SCOPE_EXIT { pending_ops.pop(); };
++        auto callback = std::move(pending_ops.front().callback);
++        callback();
+     }
+ }
+ 
+@@ -179,7 +185,7 @@
+ 
+ void Scheduler::SubmitExecution(SubmitInfo& info) {
+     const auto span_token = submission_span ? submission_span->EnterSubmit() : nullptr;
+-    std::scoped_lock lk{submit_mutex};
++    std::unique_lock lk{submit_mutex};
+     const u64 signal_value = master_semaphore.NextTick();
+ 
+ #if TRACY_GPU_ENABLED
+@@ -229,6 +235,10 @@
+     master_semaphore.Refresh();
+     AllocateWorkerCommandBuffers();
+ 
++    // Completion callbacks can submit more work. The queue submission and next
++    // command buffer are ready; do not hold the global submission lock through
++    // callbacks, or a nested submission deadlocks on this nonrecursive mutex.
++    lk.unlock();
+     // Apply pending operations
+     PopPendingOperations();
+     if (submission_span) submission_span->ReturnSubmit(span_token, master_semaphore.KnownGpuTick());
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -210,18 +210,19 @@
+     const u64 alignment = std::max<u64>(instance.StorageMinAlignment(),
+                                         instance.NonCoherentAtomSize());
+     const u64 reserve_size = Common::AlignUp<u64>(writeback_size, alignment);
+-    // A batch can wrap the ring before its CPU writebacks run. Keep each queued
+-    // download in owned storage until the batch has been copied to guest memory.
+-    // Oversized immediate downloads also need storage outside the fixed ring.
++    // Keep queued downloads in owned storage until their CPU writebacks run.
++    // An immediate download may use free ring space, but must not submit during
++    // allocation while the selected image and its metadata are still borrowed.
+     std::shared_ptr<Buffer> owned_download;
+-    if (!immediate || reserve_size > download_ring.SizeBytes()) {
++    auto [download, offset] = immediate && reserve_size <= download_ring.SizeBytes()
++        ? download_ring.Map(reserve_size, alignment, false)
++        : std::pair<u8*, u64>{nullptr, 0};
++    if (!download) {
+         owned_download = std::make_shared<Buffer>(
+             instance, scheduler, MemoryUsage::Download, 0, AllFlags, reserve_size);
++        download = owned_download->mapped_data.data();
+     }
+     auto& download_buffer = owned_download ? *owned_download : static_cast<Buffer&>(download_ring);
+-    const auto [download, offset] = owned_download
+-        ? std::pair{owned_download->mapped_data.data(), u64{0}}
+-        : download_ring.Map(reserve_size, alignment);
+     if (!download) {
+         LOG_ERROR(Render_Vulkan, "Image download exceeds staging capacity: {:#x}", writeback_size);
+         return {};
+@@ -384,11 +385,35 @@
+     flush_pending();
+ }
+ 
++// Hashing visits the complete range. Resolve GPU-owned bytes within existing buffers before
++// touching protected guest pages, instead of faulting and waiting per read window.
++// The hash still observes the same current bytes and preserves the dirty checks.
++static u64 HashImageMemory(BufferCache& buffer_cache, VAddr address, u32 size) {
++    if (size && buffer_cache.IsRegionGpuModified(address, size)) {
++        buffer_cache.ReadCachedMemory(address, size);
++    }
++    return XXH3_64bits(std::bit_cast<const u8*>(address), size);
++}
++
++// MarkGpuModified snapshots the guest mip bytes on first GPU ownership or
++// after CPU dirtiness. Resolve that snapshot within existing buffers before its hash loop,
++// rather than faulting and waiting separately for every protected read window.
++static void MarkImageGpuModified(BufferCache& buffer_cache, Image& image) {
++    if ((False(image.flags & ImageFlagBits::GpuModified) ||
++         True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) &&
++        image.info.guest_address != 0 && image.info.num_samples == 1 &&
++        image.info.guest_size != 0 &&
++        buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size)) {
++        buffer_cache.ReadCachedMemory(image.info.guest_address, image.info.guest_size);
++    }
++    image.MarkGpuModified();
++}
++
+ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
+     if (image.hash == 0) {
+         // Initialize hash
+-        const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
+-        image.hash = XXH3_64bits(addr, image.info.guest_size);
++        image.hash = HashImageMemory(buffer_cache, image.info.guest_address,
++                                     image.info.guest_size);
+     }
+     if (TraceDreamsVolumeRefreshes() && IsDreamsVolumeTraceCandidate(image.info)) {
+         auto& stats = GetDreamsVolumeRefreshStats(image.info);
+@@ -832,7 +857,7 @@
+             }
+             // Preserve ownership only for current GPU contents actually copied.
+             if (cache_image.SafeToDownload()) {
+-                new_image.MarkGpuModified();
++                MarkImageGpuModified(buffer_cache, new_image);
+             }
+         } else if (cache_image.info.num_samples == 1 && new_info.props.is_depth &&
+                    new_info.num_samples > 1) {
+@@ -846,7 +871,7 @@
+                 cache_image.info.pixel_format, new_info.pixel_format, cache_image.GetImage(),
+                 new_image.GetImage());
+             if (cache_image.SafeToDownload()) {
+-                new_image.MarkGpuModified();
++                MarkImageGpuModified(buffer_cache, new_image);
+             }
+         } else {
+             LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
+@@ -1140,7 +1165,7 @@
+                     RefreshImage(merged_image);
+                     merged_image.CopyMip(cache_image, mip, slice);
+                     if (cache_image.SafeToDownload()) {
+-                        merged_image.MarkGpuModified();
++                        MarkImageGpuModified(buffer_cache, merged_image);
+                     }
+                     FreeImage(cache_image_id);
+                 }
+@@ -1183,7 +1208,7 @@
+ 
+     // A copy into a fresh backing must not make GPU-written data look CPU-only.
+     if (src_image.SafeToDownload()) {
+-        new_image.MarkGpuModified();
++        MarkImageGpuModified(buffer_cache, new_image);
+     }
+ 
+     if (src_image.binding.is_bound || src_image.binding.is_target) {
+@@ -1335,7 +1360,7 @@
+     Image& image = slot_images[image_id];
+     UpdateImage(image_id);
+     if (desc.type == BindingType::Storage) {
+-        image.MarkGpuModified();
++        MarkImageGpuModified(buffer_cache, image);
+         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+             image.info.guest_address != 0) {
+             std::unique_lock lk{download_images_mutex};
+@@ -1353,7 +1378,7 @@
+     }
+     image.usage.render_target = 1u;
+     UpdateImage(image_id);
+-    image.MarkGpuModified();
++    MarkImageGpuModified(buffer_cache, image);
+ 
+     // Register meta data for this color buffer
+     if (desc.info.meta_info.cmask_addr) {
+@@ -1375,7 +1400,7 @@
+     Image& image = slot_images[image_id];
+     image.usage.depth_target = 1u;
+     UpdateImage(image_id);
+-    image.MarkGpuModified();
++    MarkImageGpuModified(buffer_cache, image);
+ 
+     // Register meta data for this depth buffer
+     if (desc.info.meta_info.htile_addr) {
+@@ -1440,8 +1465,8 @@
+         // Match the complete guest range hashed by MarkAsMaybeDirty. Once a
+         // shared page is untracked, writes can affect later rows, layers or mips
+         // without another fault. CPU bytes cannot disprove a known GPU update.
+-        const auto addr = std::bit_cast<const u8*>(image.info.guest_address);
+-        const u64 hash = XXH3_64bits(addr, image.info.guest_size);
++        const u64 hash = HashImageMemory(buffer_cache, image.info.guest_address,
++                                         image.info.guest_size);
+         if (image.hash == hash) {
+             if (volume_stats != nullptr) {
+                 const u64 count = ++volume_stats->maybe_hash_matches;
+@@ -1476,8 +1501,8 @@
+         // A buffer refresh must advance a changed CPU baseline too, but its
+         // GPU upload must not be skipped just because the CPU hash matches.
+         if (is_gpu_modified && (!is_gpu_dirty || cpu_touched)) {
+-            const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
+-            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
++            const u64 hash = HashImageMemory(buffer_cache,
++                                             image.info.guest_address + mip_offset, mip_size);
+             if (!is_gpu_dirty && image.mip_hashes[m] == hash) {
+                 continue;
+             }
+@@ -1598,7 +1623,9 @@
+     }
+     image.flags &= ~ImageFlagBits::Registered;
+     lru_cache.Free(image.lru_id);
+-    total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
++    // Driver-reported usage can be smaller than a guest image's padded span.
++    total_used_memory -= std::min<u64>(total_used_memory,
++                                      Common::AlignUp(image.info.guest_size, 1024));
+     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
+         const auto page_it = page_table.find(page);
+         if (page_it == nullptr) {
+@@ -1736,7 +1763,10 @@
+     // overwritten by a delayed callback. Submit all dirty downloads together.
+     std::vector<std::pair<ImageId, Common::UniqueFunction<bool>>> pending_downloads;
+     u64 pending_bytes = 0;
+-    const auto projected_usage = [&] { return total_used_memory - pending_bytes; };
++    const auto projected_usage = [&] {
++        // Pending guest spans are estimates, not guaranteed native allocations.
++        return total_used_memory - std::min(total_used_memory, pending_bytes);
++    };
+     bool pressured = false;
+     bool aggresive = false;
+     u64 ticks_to_destroy = 0;
+--- a/src/video_core/texture_cache/tile_manager.cpp
++++ b/src/video_core/texture_cache/tile_manager.cpp
+@@ -2,7 +2,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cstdlib>
++#include <cstring>
+ #include <string_view>
++#include <utility>
+ #include "common/elf_info.h"
+ #include "video_core/buffer_cache/buffer.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+@@ -20,6 +22,35 @@
+ #include <vk_mem_alloc.h>
+ 
+ namespace VideoCore {
++
++static vk::DescriptorBufferInfo UploadTilingParameters(const Vulkan::Instance& instance,
++                                                      Vulkan::Scheduler& scheduler,
++                                                      StreamBuffer& stream_buffer,
++                                                      const TilingInfo& params) {
++    // Both callers already hold image references and borrowed source/destination
++    // buffers. Submitting here could let completion callbacks retire those resources.
++    const auto [data, offset] =
++        stream_buffer.Map(sizeof(params), instance.UniformMinAlignment(), false);
++    if (data) {
++        std::memcpy(data, &params, sizeof(params));
++        stream_buffer.Commit();
++        return {stream_buffer.Handle(), offset, sizeof(params)};
++    }
++
++    // A busy ring needs only an owned parameter block, not a queue submission.
++    Buffer temporary{instance, scheduler, MemoryUsage::Upload, 0,
++                     vk::BufferUsageFlagBits::eUniformBuffer, sizeof(params)};
++    std::memcpy(temporary.mapped_data.data(), &params, sizeof(params));
++    if (!temporary.is_coherent) {
++        const auto result = vmaFlushAllocation(instance.GetAllocator(),
++                                               temporary.buffer.allocation, 0, sizeof(params));
++        ASSERT_MSG(result == VK_SUCCESS, "Failed flushing tiling parameters: {}",
++                   vk::to_string(vk::Result{result}));
++    }
++    const vk::DescriptorBufferInfo descriptor{temporary.Handle(), 0, sizeof(params)};
++    scheduler.DeferOperation([buffer = std::move(temporary)]() mutable {});
++    return descriptor;
++}
+ 
+ static bool DreamsPooledTilingAllocationsEnabled() {
+     static const bool enabled = [] {
+@@ -182,11 +213,8 @@
+ 
+     const TilingInfo params = MakeTilingInfo(info, info.resources.levels);
+ 
+-    const vk::DescriptorBufferInfo params_buffer_info{
+-        .buffer = stream_buffer.Handle(),
+-        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
+-        .range = sizeof(params),
+-    };
++    const auto params_buffer_info =
++        UploadTilingParameters(instance, scheduler, stream_buffer, params);
+ 
+     const auto [out_buffer, out_allocation] = GetScratchBuffer(info.guest_size);
+     scheduler.DeferOperation([this, out_buffer, out_allocation]() {
+@@ -264,11 +292,8 @@
+                copy.bufferOffset == info.mips_layout[mip].offset);
+     }
+ 
+-    const vk::DescriptorBufferInfo params_buffer_info{
+-        .buffer = stream_buffer.Handle(),
+-        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
+-        .range = sizeof(params),
+-    };
++    const auto params_buffer_info =
++        UploadTilingParameters(instance, scheduler, stream_buffer, params);
+ 
+     const auto [temp_buffer, temp_allocation] = GetScratchBuffer(copy_size);
+     scheduler.DeferOperation([this, temp_buffer, temp_allocation]() {
