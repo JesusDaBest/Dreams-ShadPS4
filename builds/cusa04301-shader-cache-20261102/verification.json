@@ -1,0 +1,73 @@
+{
+  "exact_tested_private_binary": false,
+  "production_changes_preserved": true,
+  "changed_production_objects": 4,
+  "identical_tested_pipeline_objects": true,
+  "buffer_source_rebuilt_without_debug_scopes": true,
+  "buffer_copy_gpu_cases": 60,
+  "image_buffer_gpu_cases": 432,
+  "buffer_regression_cases": 259,
+  "cache_gpu_cases": 10,
+  "cache_depth_pixels_compared": 6144,
+  "saved_pipeline_replay_cases": 312,
+  "saved_variants_verified": 354,
+  "slot_conflict_guards": 140,
+  "candidate_validation_errors": 0,
+  "owner_visual_check_passed": true,
+  "owner_reported_sculpt_pause_absent": true,
+  "live_pipelines_preloaded": 331,
+  "live_pipelines_skipped": 0,
+  "qt_default_route_verified": true,
+  "direct_route_verified": true,
+  "user_requested_promotion": true,
+  "source_patch_reconstruction_verified": true,
+  "earlier_fixes_retained": true,
+  "custom_debug_tools_included": false,
+  "user_saves_included": false,
+  "builder_included": false,
+  "vr_included": false,
+  "shader_cache_included": false,
+  "real_profiles_written": false,
+  "publication_started_game": false,
+  "optional_tutorial_gui_unchanged": true,
+  "fresh_full_source_rebuild_verified": false,
+  "limitations": [
+    "Shaders are learned during use; unseen shaders can still compile during play. Subsequent launches preload compatible saved pipelines.",
+    "The clean release retains the tested pipeline objects. Its buffer source differs only by removing diagnostic scopes. It was not separately played.",
+    "GPU-copy defects were reproduced by synchronization validation, not pixel mismatches on the tested GPU.",
+    "No controlled steady-state FPS improvement is claimed."
+  ],
+  "core_sha256": "c2c8ddebad55561449a744a56ccc963266d21d3e7f07128b572c4fbc68caeb89",
+  "clean_regression": {
+    "regression": {
+      "cases": 259,
+      "failures": 0,
+      "validation_errors": 0
+    },
+    "cache": {
+      "cold_ms": 81.2776,
+      "cold_pipelines": 4,
+      "depth_pixels_compared": 6144,
+      "fresh_depth_written": [
+        1024,
+        512,
+        512,
+        256,
+        1024,
+        1024
+      ],
+      "graphics_cases": 6,
+      "graphics_helper_preserved": true,
+      "identical_spirv": true,
+      "legacy_pipeline_rejected": true,
+      "normal_cache_untouched": true,
+      "persisted_setting_unchanged": true,
+      "preloaded_pipelines": 4,
+      "validation_errors": 0,
+      "warm_ms": 21.2558
+    }
+  },
+  "zip_sha256": "91fbf122db69a781c29de311da864da316e6cbb80002028139fe4e35b3dbf1e7",
+  "zip_bytes": 60999531,
+  "zip_members": 47
+}

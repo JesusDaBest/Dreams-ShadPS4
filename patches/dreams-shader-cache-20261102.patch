@@ -1,0 +1,233 @@
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -802,7 +802,7 @@
+     const vk::BufferMemoryBarrier2 buf_barriers_before[2] = {
+         {
+             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
++            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+             .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+             .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+             .buffer = dst_buffer.Handle(),
+@@ -1304,20 +1304,22 @@
+         return false;
+     }
+     InvalidateCpuReadbacks(image.info.guest_address, copy_size);
+-    // TileImage writes the cached buffer from a compute shader without going through Buffer's
+-    // access tracker. Record that write state explicitly: the normal descriptor binding barrier
+-    // can then make the detiled data visible to the following shader read.
++    // TileImage uses a compute writer for tiled data and a transfer for linear
++    // data. Binding can update access tracking before its barrier is submitted.
++    // Order actual earlier accesses before overwriting this cached buffer.
+     scheduler.EndRendering();
+-    if (auto barrier =
+-            buffer.GetBarrier(vk::AccessFlagBits2::eShaderWrite,
+-                              vk::PipelineStageFlagBits2::eComputeShader, buf_offset, true)) {
+-        const auto cmdbuf = scheduler.CommandBuffer();
+-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+-            .bufferMemoryBarrierCount = 1,
+-            .pBufferMemoryBarriers = &*barrier,
+-        });
+-    }
++    const bool tiled = image.info.props.is_tiled;
++    auto barrier = *buffer.GetBarrier(
++        tiled ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eTransferWrite,
++        tiled ? vk::PipelineStageFlagBits2::eComputeShader : vk::PipelineStageFlagBits2::eTransfer,
++        buf_offset, true);
++    barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
++    barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
++    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
++        .bufferMemoryBarrierCount = 1,
++        .pBufferMemoryBarriers = &barrier,
++    });
+     auto& tile_manager = texture_cache.GetTileManager();
+     tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);
+     return true;
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -392,12 +392,11 @@
+         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+         .needs_image_view_min_lod = !instance_.IsImageViewMinLodSupported(),
+     };
+-    WarmUp();
+-
+     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
+                vk::to_string(cache_result));
+     pipeline_cache = std::move(cache);
++    WarmUp();
+ }
+ 
+ PipelineCache::~PipelineCache() = default;
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -184,6 +184,11 @@
+ 
+     boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
+         shader_stages;
++    std::vector<vk::UniqueShaderModule> auxiliary_modules;
++    const auto compile_auxiliary = [&](const std::vector<u32>& spv) {
++        auxiliary_modules.emplace_back(CompileSPV(spv, device), device);
++        return *auxiliary_modules.back();
++    };
+     auto stage = u32(Shader::LogicalStage::Vertex);
+     if (infos[stage]) {
+         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+@@ -226,7 +231,7 @@
+         }
+         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+             .stage = vk::ShaderStageFlagBits::eTessellationControl,
+-            .module = CompileSPV(sdata.tcs, instance.GetDevice()),
++            .module = compile_auxiliary(sdata.tcs),
+             .pName = "main",
+         });
+     }
+@@ -253,7 +258,7 @@
+         }
+         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
+-            .module = CompileSPV(sdata.tes, instance.GetDevice()),
++            .module = compile_auxiliary(sdata.tes),
+             .pName = "main",
+         });
+     }
+@@ -264,7 +269,9 @@
+             .module = modules[stage],
+             .pName = "main",
+         });
+-    } else if (runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.clip_distance_emulation) {
++    } else if (preloading ? !sdata.fragment.empty()
++                          : runtime_infos[u32(Shader::LogicalStage::Fragment)]
++                                .fs_info.clip_distance_emulation) {
+         if (!preloading) {
+             const auto vs_runtime_info =
+                 runtime_infos[static_cast<u32>(Shader::LogicalStage::Vertex)].vs_info;
+@@ -274,7 +281,7 @@
+         }
+         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+             .stage = vk::ShaderStageFlagBits::eFragment,
+-            .module = CompileSPV(sdata.fragment, instance.GetDevice()),
++            .module = compile_auxiliary(sdata.fragment),
+             .pName = "main",
+         });
+     }
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <spirv/unified1/spirv.hpp11>
++#include <cstdlib>
++#include "common/elf_info.h"
+ 
+ #include "common/serdes.h"
+ #include "core/emulator_settings.h"
+@@ -27,7 +29,8 @@
+ // when no offset needs lowering. This prevents repeating legacy invalidation.
+ static constexpr u32 OffsetShaderMetaVersion = 7u;
+ static constexpr u32 ViewMinLodShaderMetaVersion = 8u;
+-static constexpr u32 PipelineKeyVersion = 3u;
++// v4 preserves the auxiliary fragment stage used by depth-only clipping.
++static constexpr u32 PipelineKeyVersion = 4u;
+ static constexpr size_t PreviousRuntimeInfoSize = 248u;
+ static_assert(sizeof(Shader::RuntimeInfo) == 256u);
+ } // namespace Serialization
+@@ -474,6 +477,7 @@
+     sdata.Write(multisampling);
+     sdata.Write(tcs);
+     sdata.Write(tes);
++    sdata.Write(fragment);
+ }
+ 
+ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
+@@ -485,6 +489,7 @@
+     sdata.Read(multisampling);
+     sdata.Read(tcs);
+     sdata.Read(tes);
++    sdata.Read(fragment);
+     return true;
+ }
+ 
+@@ -608,20 +613,27 @@
+         module = CompileSPV(spv, instance.GetDevice());
+         it_pgm.value() = std::move(program);
+     } else {
+-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
+-        if (it != it_pgm.value()->modules.end()) {
+-            // A matching permutation is valid only at its original index. A different index means
+-            // the store holds entries from more than one cache generation, so this pipeline is
+-            // left to compile at runtime.
+-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
+-            if (perm_idx != idx) {
++        const auto& saved_modules = it_pgm.value()->modules;
++        if (perm_idx < saved_modules.size() && saved_modules[perm_idx].spec.Valid()) {
++            const auto& saved = saved_modules[perm_idx];
++            // Runtime specialization equality is directional reuse compatibility. It can match
++            // a different permutation, so disk reload must address the recorded slot directly.
++            // An occupied slot may be reused only for the exact saved specialization and code.
++            Serialization::Archive saved_spec{}, incoming_spec{};
++            saved.spec.Serialize(saved_spec);
++            spec.Serialize(incoming_spec);
++            const auto code = effective_spirv.find(saved.module);
++            if (saved.spec.offset_lod_analysis != spec.offset_lod_analysis ||
++                saved.spec.view_min_lod_analysis != spec.view_min_lod_analysis ||
++                saved_spec.TakeOff() != incoming_spec.TakeOff() ||
++                code == effective_spirv.end() || code->second != spv) {
+                 LOG_WARNING(Render_Vulkan,
+-                            "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
+-                            "preload",
+-                            perm_idx, program->info.stage, program->info.pgm_hash, idx);
++                            "Cached permutation {} of {}_{:x} conflicts with its saved slot, "
++                            "skipping preload",
++                            perm_idx, program->info.stage, program->info.pgm_hash);
+                 return false;
+             }
+-            module = it->module;
++            module = saved.module;
+         } else {
+             module = CompileSPV(spv, instance.GetDevice());
+         }
+@@ -645,8 +657,29 @@
+         LOG_INFO(Render, "Pipeline cache disabled while 3D ImageGather capture is active");
+         return;
+     }
+-    if (!EmulatorSettings.IsPipelineCacheEnabled()) {
++    // Private performance trial: keep both settings and old cache generations intact.
++    // The namespace belongs to the exact parent compiler/build used by this candidate.
++    const char* private_root = std::getenv("SHADPS4_DREAMS_PRIVATE_SHADER_CACHE");
++    const bool private_cache = private_root && *private_root &&
++                              Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
++    if (!EmulatorSettings.IsPipelineCacheEnabled() && !private_cache) {
+         return;
++    }
++    if (private_cache) {
++        const std::filesystem::path root{private_root};
++        if (!root.is_absolute()) {
++            LOG_WARNING(Render, "Private shader cache requires an absolute path; cache disabled");
++            return;
++        }
++        const auto cache_path = root / "build-248ff74e40aa80036261f9ba793be251555387af6bdc7795ab5eb3cf266f2117-cache-v4";
++        std::error_code error;
++        std::filesystem::create_directories(cache_path, error);
++        if (error || !std::filesystem::is_directory(cache_path, error)) {
++            LOG_WARNING(Render, "Private shader cache directory unavailable; cache disabled");
++            return;
++        }
++        Common::FS::SetUserPath(Common::FS::PathType::CacheDir, cache_path);
++        LOG_WARNING(Render, "Dreams private shader cache enabled for this verified build");
+     }
+ 
+     Storage::DataBase::Instance().Open();
+@@ -715,6 +748,10 @@
+         });
+ 
+     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
++    if (private_cache) {
++        LOG_WARNING(Render, "Dreams private shader cache preloaded {} of {} pipelines",
++                    num_pipelines, num_total_pipelines);
++    }
+     if (num_total_pipelines > num_pipelines) {
+         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
+                     num_total_pipelines - num_pipelines);
