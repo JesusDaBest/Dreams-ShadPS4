@@ -1,0 +1,52 @@
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -1037,10 +1037,13 @@
+     const auto cmdbuf = scheduler.CommandBuffer();
+ 
+     boost::container::static_vector<vk::BufferMemoryBarrier2, 2> pre_barriers{};
+-    if (auto src_barrier = overlap.GetBarrier(vk::AccessFlagBits2::eTransferRead,
+-                                              vk::PipelineStageFlagBits2::eTransfer)) {
+-        pre_barriers.push_back(*src_barrier);
+-    }
++    // A binding can update tracked access before emitting its barrier. Preserve
++    // prior GPU writes when the cache copies that allocation into a replacement.
++    auto src_barrier = *overlap.GetBarrier(vk::AccessFlagBits2::eTransferRead,
++                                          vk::PipelineStageFlagBits2::eTransfer, 0, true);
++    src_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
++    src_barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
++    pre_barriers.push_back(src_barrier);
+     if (auto dst_barrier =
+             new_buffer.GetBarrier(vk::AccessFlagBits2::eTransferWrite,
+                                   vk::PipelineStageFlagBits2::eTransfer, dst_base_offset)) {
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -1539,14 +1539,21 @@
+ 
+     const auto [in_buffer, in_offset] =
+         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+-    if (auto barrier = in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,
+-                                             vk::PipelineStageFlagBits2::eTransfer)) {
+-        scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+-            .bufferMemoryBarrierCount = 1,
+-            .pBufferMemoryBarriers = &barrier.value(),
+-        });
+-    }
++    // Tiled input is consumed by a compute shader; linear input is copied.
++    // Resource binding may have updated access tracking without emitting its
++    // barrier yet. Make prior GPU writes visible to the actual consumer here.
++    const bool tiled = image.info.props.is_tiled;
++    auto barrier = *in_buffer->GetBarrier(
++        tiled ? vk::AccessFlagBits2::eShaderRead : vk::AccessFlagBits2::eTransferRead,
++        tiled ? vk::PipelineStageFlagBits2::eComputeShader : vk::PipelineStageFlagBits2::eTransfer,
++        0, true);
++    barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
++    barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
++    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
++        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
++        .bufferMemoryBarrierCount = 1,
++        .pBufferMemoryBarriers = &barrier,
++    });
+ 
+     if (volume_stats != nullptr) {
+         if (image.info.props.is_tiled) {

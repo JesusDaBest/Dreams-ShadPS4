@@ -2,7 +2,7 @@
 
 ## Current November 1 build
 
-Use the [current source manifest](../builds/cusa04301-readback-correctness-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-readback-correctness-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. The six changed source files reconstruct exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/READBACK_CORRECTNESS_20261101.md).
+Use the [current source manifest](../builds/cusa04301-texture-synchronization-20261101/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-texture-synchronization-20261101.patch` in order. Earlier patches include the microphone encoder and its licenses; no extra codec download is required. Both changed source files reconstruct exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/TEXTURE_SYNCHRONIZATION_20261101.md).
 
 ## Earlier source instructions
 

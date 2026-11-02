@@ -1,0 +1,55 @@
+{
+  "exact_tested_private_binary": false,
+  "production_changes_preserved": true,
+  "corrections": 2,
+  "changed_production_objects": 2,
+  "tested_cache_object_unchanged": true,
+  "buffer_source_rebuilt_without_debug_scopes": true,
+  "private_texture_cases": 360,
+  "private_merge_cases": 48,
+  "private_regression_cases": 259,
+  "parent_texture_sync_hazards": 240,
+  "parent_merge_sync_hazards": 64,
+  "candidate_validation_errors": 0,
+  "owner_visual_check_passed": true,
+  "owner_reported_no_new_pauses": true,
+  "user_requested_promotion": true,
+  "qt_default_route_verified": true,
+  "direct_route_verified": true,
+  "configuration_hash_verified": true,
+  "environment_verified": true,
+  "publication_started_game": false,
+  "real_profiles_written": false,
+  "source_patch_reconstruction_verified": true,
+  "earlier_fixes_retained": true,
+  "custom_debug_tools_included": false,
+  "user_saves_included": false,
+  "builder_included": false,
+  "vr_included": false,
+  "optional_tutorial_gui_unchanged": true,
+  "fresh_full_source_rebuild_verified": false,
+  "limitations": [
+    "Parent and corrected fixtures both produced expected bytes on the tested GPU; the demonstrated failures were missing Vulkan synchronization dependencies.",
+    "The clean executable was not separately played. It retains the tested texture-cache object; the buffer source is rebuilt with only diagnostic scopes removed.",
+    "The user reported correct visuals and movement without new pauses. The specific hazard occurrence in the live scene was not captured.",
+    "No controlled game FPS comparison was performed and no overall speedup is claimed."
+  ],
+  "core_sha256": "268fb188c15da957f8c07fe377e11a01032ce76b4c9d068e1e2bf95160a3b945",
+  "clean_regression": {
+    "merge": {
+      "byte_mismatches": 0,
+      "cases": 48,
+      "parent": false,
+      "unexpected_results": 0,
+      "validation_errors": 0
+    },
+    "regression": {
+      "cases": 259,
+      "failures": 0,
+      "validation_errors": 0
+    }
+  },
+  "zip_sha256": "f6922e4bea16b1a695269374672f30130ca953c2ee36d36eb39efa62dfb67bae",
+  "zip_bytes": 60995699,
+  "zip_members": 47
+}
