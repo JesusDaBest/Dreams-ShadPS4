@@ -1,0 +1,71 @@
+{
+  "exact_tested_private_binary": false,
+  "production_changes_preserved": true,
+  "changed_production_objects": 2,
+  "owner_visual_check_passed": true,
+  "owner_reported_flicker_gone": true,
+  "original_image_readback_restored": true,
+  "tested_fault_object_retained": true,
+  "shader_pipeline_objects_retained": true,
+  "live_preloaded_pipelines": 336,
+  "latest_other_fixes_retained": true,
+  "qt_default_route_verified": true,
+  "direct_route_verified": true,
+  "user_requested_promotion": true,
+  "source_patch_reconstruction_verified": true,
+  "custom_debug_tools_included": false,
+  "builder_included": false,
+  "vr_included": false,
+  "user_saves_included": false,
+  "shader_cache_included": false,
+  "real_profiles_written": false,
+  "publication_started_game": false,
+  "optional_tutorial_gui_unchanged": true,
+  "fresh_full_source_rebuild_verified": false,
+  "limitations": [
+    "The user reported the flicker gone after removing the two eager image-readback calls. The exact underlying batching defect has not been isolated.",
+    "The clean build removes custom debugging tools and two one-time comparison logs; it was not separately played.",
+    "The retained fault-boundary repair alone did not remove the reported flicker.",
+    "No controlled FPS comparison was performed; no performance gain or lack of performance cost is claimed."
+  ],
+  "core_sha256": "b77cafd17c62183dfa0daf083b60d14787e7772868c6d32d4d20bcd8c9125080",
+  "clean_regression": {
+    "regression": {
+      "cases": 259,
+      "failures": 0,
+      "validation_errors": 0
+    },
+    "cache": {
+      "cold_ms": 114.0843,
+      "cold_pipelines": 4,
+      "depth_pixels_compared": 6144,
+      "fresh_depth_written": [
+        1024,
+        512,
+        512,
+        256,
+        1024,
+        1024
+      ],
+      "graphics_cases": 6,
+      "graphics_helper_preserved": true,
+      "identical_spirv": true,
+      "legacy_pipeline_rejected": true,
+      "normal_cache_untouched": true,
+      "persisted_setting_unchanged": true,
+      "preloaded_pipelines": 4,
+      "validation_errors": 0,
+      "warm_ms": 29.3226
+    },
+    "retained_fault_fixture": {
+      "cases": 16,
+      "fixed_stale_bindings": 0,
+      "old_stale_bindings": 3,
+      "unsafe_draws_submitted": 0,
+      "validation_errors": 0
+    }
+  },
+  "zip_sha256": "ce1fa118d1525063e5fae0da3cb15056f0aec3d4a10c7edde173ca28b8d829df",
+  "zip_bytes": 60997341,
+  "zip_members": 47
+}

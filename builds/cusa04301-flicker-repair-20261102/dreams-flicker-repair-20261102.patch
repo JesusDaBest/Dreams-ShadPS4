@@ -1,0 +1,73 @@
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -385,27 +385,13 @@
+     flush_pending();
+ }
+ 
+-// Hashing visits the complete range. Resolve GPU-owned bytes within existing buffers before
+-// touching protected guest pages, instead of faulting and waiting per read window.
+-// The hash still observes the same current bytes and preserves the dirty checks.
++// Use the original fault-driven guest reads for
++// image hashes. The mip baselines, dirty checks and image-copy repairs are retained.
+ static u64 HashImageMemory(BufferCache& buffer_cache, VAddr address, u32 size) {
+-    if (size && buffer_cache.IsRegionGpuModified(address, size)) {
+-        buffer_cache.ReadCachedMemory(address, size);
+-    }
+     return XXH3_64bits(std::bit_cast<const u8*>(address), size);
+ }
+ 
+-// MarkGpuModified snapshots the guest mip bytes on first GPU ownership or
+-// after CPU dirtiness. Resolve that snapshot within existing buffers before its hash loop,
+-// rather than faulting and waiting separately for every protected read window.
+ static void MarkImageGpuModified(BufferCache& buffer_cache, Image& image) {
+-    if ((False(image.flags & ImageFlagBits::GpuModified) ||
+-         True(image.flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) &&
+-        image.info.guest_address != 0 && image.info.num_samples == 1 &&
+-        image.info.guest_size != 0 &&
+-        buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size)) {
+-        buffer_cache.ReadCachedMemory(image.info.guest_address, image.info.guest_size);
+-    }
+     image.MarkGpuModified();
+ }
+ 
+--- a/src/video_core/buffer_cache/fault_manager.cpp
++++ b/src/video_core/buffer_cache/fault_manager.cpp
+@@ -83,6 +83,19 @@
+         scheduler.PopPendingOperations();
+     }
+ 
++    // A completion callback may run during resource preparation (for example,
++    // inside a readback wait). It must not join buffers while the current draw
++    // still holds descriptors for them. Resolve completed faults here, at the
++    // guest-submit boundary, after the previous draws have been recorded.
++    // Detach the ranges first: FindBuffer may submit work and run more callbacks.
++    RangeSet ready_faults;
++    ready_faults.m_ranges_set.swap(fault_ranges.m_ranges_set);
++    ready_faults.ForEach([&](VAddr start, VAddr end) {
++        ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
++                   "Buffer size is too large");
++        buffer_cache.FindBuffer(start, static_cast<u32>(end - start));
++    });
++
+     const u32 offset = current_area * PageFaultAreaSize;
+     u8* mapped = download_buffer.mapped_data.data() + offset;
+     std::memset(mapped, 0, PageFaultAreaSize);
+@@ -155,18 +168,12 @@
+     });
+ 
+     scheduler.DeferOperation([this, mapped, area = current_area] {
+-        fault_ranges.Clear();
+         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
+         const u32 fault_count = fault_buf[0];
+         for (u32 i = 1; i <= fault_count; ++i) {
+             fault_ranges.Add(fault_buf[i], caching_pagesize);
+             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
+         }
+-        fault_ranges.ForEach([&](VAddr start, VAddr end) {
+-            ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
+-                       "Buffer size is too large");
+-            buffer_cache.FindBuffer(start, static_cast<u32>(end - start));
+-        });
+         fault_areas[area] = 0;
+     });
+ 
