@@ -1,0 +1,67 @@
+{
+  "exact_tested_private_binary": false,
+  "production_changes_preserved": true,
+  "changed_production_objects": 2,
+  "owner_visual_check_passed": false,
+  "owner_reported_growing_black_patch_gone": true,
+  "remaining_visual_report_unresolved": true,
+  "performance_gain_verified": false,
+  "latest_other_fixes_retained": true,
+  "qt_default_route_verified": true,
+  "direct_route_verified": true,
+  "user_requested_promotion": true,
+  "source_patch_reconstruction_verified": true,
+  "custom_debug_tools_included": false,
+  "builder_included": false,
+  "vr_included": false,
+  "user_saves_included": false,
+  "shader_cache_included": false,
+  "real_profiles_written": false,
+  "publication_started_game": false,
+  "optional_tutorial_gui_unchanged": true,
+  "fresh_full_source_rebuild_verified": false,
+  "limitations": [
+    "The user reported that the growing black patch in tweak menus was gone but another visual effect remained, and explicitly requested promotion.",
+    "The remaining visual effect has not been identified or linked to this change; this is not an all-clear visual result.",
+    "The 528 GPU cases use bounded source-buffer fixtures and do not cover every CPU/GPU page-ownership interaction.",
+    "No matched FPS comparison was established; no performance improvement or absence of regressions is claimed.",
+    "The clean executable removes diagnostic tools and one-time logs; it was not separately played."
+  ],
+  "core_sha256": "5e8198a709662440d351ba023229c26bbb78277c3aa74eae7510e64ca7eaab1c",
+  "clean_regression": {
+    "unchanged_clean_object_gpu_suites": {
+      "candidate-write": {
+        "failed_cases": 0,
+        "gpu_cases": 192,
+        "protected_guest_calls": 16,
+        "validation_errors": 0
+      },
+      "mip-regression": {
+        "bytes_checked": 182272,
+        "failed_cases": 0,
+        "gpu_cases": 96,
+        "validation_errors": 0
+      },
+      "copy-regression": {
+        "clean_bind_calls": 2400000,
+        "failed_cases": 0,
+        "gpu_cases": 240,
+        "large_snapshot_cost": {
+          "clean_mark_ns": 1.0208,
+          "guest_bytes": 89479168,
+          "maximum_ms": 3.2353,
+          "median_ms": 2.879,
+          "samples": 9
+        },
+        "nanoseconds_per_clean_bind": 3.4080416666666666,
+        "validation_errors": 0
+      }
+    },
+    "rerun_required": false,
+    "scope": "Existing suites use the exact release production objects; no rendering source changed during promotion.",
+    "limits": "Bounded source-buffer fixtures do not cover all CPU/GPU page-ownership interactions. Remaining visual report is unresolved."
+  },
+  "zip_sha256": "319bd6e335cbb66bf8bc187e8b6dbd8d9525959ced58ba0420669aa478a07def",
+  "zip_bytes": 60997878,
+  "zip_members": 47
+}

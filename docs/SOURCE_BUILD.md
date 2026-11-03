@@ -2,7 +2,7 @@
 
 ## Current November 2 build
 
-Use the [current source manifest](../builds/cusa04301-flicker-repair-20261102/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-flicker-repair-20261102.patch` in order. The stack retains shader preloading, recording support and the previous rendering fixes. Both changed files reconstruct exactly. Full fresh-build reproducibility has not been established. See [the update record](updates/FLICKER_REPAIR_20261102.md).
+Use the [current source manifest](../builds/cusa04301-single-mip-write-20261102/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-single-mip-write-20261102.patch` in order. Both changed files reconstruct exactly; all earlier published fixes are retained. Full fresh-build reproducibility has not been established. See [the update record and remaining visual issue](updates/SINGLE_MIP_WRITE_20261102.md).
 
 ## Earlier source instructions
 

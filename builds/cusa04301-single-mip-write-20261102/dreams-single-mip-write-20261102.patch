@@ -1,0 +1,40 @@
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -356,10 +356,13 @@
+ }
+ 
+ void Image::MarkGpuModified() {
++    // A definite CPU write selects the only mip of a single-level image.
++    // There are no other mip levels to preserve by comparing CPU snapshots.
++    // Shared-page uncertainty is resolved separately by MarkAsMaybeDirty.
+     if ((False(flags & ImageFlagBits::GpuModified) ||
+          True(flags & (ImageFlagBits::CpuDirty | ImageFlagBits::MaybeCpuDirty))) &&
+         info.guest_address != 0 &&
+-        info.num_samples == 1) {
++        info.num_samples == 1 && info.resources.levels > 1) {
+         const auto* address = std::bit_cast<const u8*>(info.guest_address);
+         for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+             const auto& layout = info.mips_layout[mip];
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -279,7 +279,7 @@
+                                                        download, writeback_size)) {
+             return false;
+         }
+-        if (immediate) {
++        if (immediate && slot_images[image_id].info.resources.levels > 1) {
+             // Hash the downloaded bytes, not backing that the CPU may edit next.
+             auto& retained_image = slot_images[image_id];
+             const auto& retained_info = retained_image.info;
+@@ -1486,7 +1486,10 @@
+         // Compare CPU updates against the last CPU contents, not the GPU data.
+         // A buffer refresh must advance a changed CPU baseline too, but its
+         // GPU upload must not be skipped just because the CPU hash matches.
+-        if (is_gpu_modified && (!is_gpu_dirty || cpu_touched)) {
++        // For a single mip, a definite CPU write must win even when its
++        // bytes equal an older CPU snapshot. MaybeCpuDirty was checked above;
++        // only multi-mip images need the per-mip preservation decision here.
++        if (num_mips > 1 && is_gpu_modified && (!is_gpu_dirty || cpu_touched)) {
+             const u64 hash = HashImageMemory(buffer_cache,
+                                              image.info.guest_address + mip_offset, mip_size);
+             if (!is_gpu_dirty && image.mip_hashes[m] == hash) {
