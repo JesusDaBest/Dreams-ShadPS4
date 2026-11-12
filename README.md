@@ -18,15 +18,4 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 
 **FPS display:** press **F10** to show or hide it, including in fullscreen. Your choice is saved.
 
-## What's included
-
-- Shadow repairs, including the Light gadget, plus corrections to texture detail selection, sampling, transfers and cache reuse, including fallback support for missing GPU features.
-- A fix for Tren disappearing after certain collisions.
-- Working Sound gadget microphone recording and playback.
-- Corrected display colours, the graphical launcher and an optional tutorial-skip tool.
-
-## Known issues
-
-This is experimental. Lag and intermittent black patches/white flashes remain; no overall speedup is claimed. Testing has focused on AMD Radeon 8060S and Dreams CUSA04301 version 2.64. Other GPUs and versions remain unverified.
-
 [Latest release details](docs/updates/SINGLE_MIP_WRITE_20261102.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
