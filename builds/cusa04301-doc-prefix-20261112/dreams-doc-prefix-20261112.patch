@@ -1,0 +1,102 @@
+--- a/src/video_core/host_shaders/dreams_ordered_prefix.comp
++++ b/src/video_core/host_shaders/dreams_ordered_prefix.comp
+@@ -3,7 +3,7 @@
+ 
+ #version 450
+ 
+-layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
++layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout(std430, binding = 0) buffer global_data_share {
+     uint gds[];
+@@ -23,10 +23,13 @@
+     uint matrix_scratch_stream_stride;
+ };
+ 
++shared uint partial[128];
++shared uint initial;
++
+ void main() {
+     const bool matrix_mode = matrix_stream_count != 0;
+     const uint stream_index =
+-        matrix_mode ? gl_GlobalInvocationID.x : gl_LocalInvocationID.x;
++        gl_WorkGroupID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x;
+     const uint active_stream_count = matrix_mode ? matrix_stream_count : stream_count;
+     if (stream_index >= active_stream_count) {
+         return;
+@@ -48,12 +51,39 @@
+         count = group_count_from_gds ? min(gds[stream.w], stream.x) : stream.x;
+     }
+ 
+-    uint running = gds[stream.y];
+-    for (uint group = 0; group < count; ++group) {
+-        const uint entry = stream.z + group * entry_stride;
+-        const uint payload = gds[entry];
+-        gds[entry + 1] = running;
+-        running += payload;
++    const uint lane=gl_LocalInvocationID.x;
++    if(count<=8u) {
++        if(lane==0u) {
++            uint running=gds[stream.y];
++            for(uint i=0;i<count;++i) {
++                uint entry=stream.z+i*entry_stride;
++                uint value=gds[entry];gds[entry+1]=running;running+=value;
++            }
++            gds[stream.y]=running;
++        }
++        return;
+     }
+-    gds[stream.y] = running;
++    // Adjacent ranges in guest order, exclusive prefix with uint32 wraparound.
++    // One group owns a stream; there are no cross-workgroup waits or counters.
++    const uint per_lane=(count+127u)/128u;
++    const uint first=min(count,lane*per_lane);
++    const uint last=min(count,first+per_lane);
++    uint total=0;
++    for(uint i=first;i<last;++i)total+=gds[stream.z+i*entry_stride];
++    if(lane==0)initial=gds[stream.y];
++    partial[lane]=total;
++    barrier();
++    for(uint distance=1;distance<128;distance*=2) {
++        uint addend=lane>=distance?partial[lane-distance]:0;
++        barrier();
++        partial[lane]+=addend;
++        barrier();
++    }
++    uint running=initial+(lane==0?0:partial[lane-1]);
++    for(uint i=first;i<last;++i) {
++        const uint entry=stream.z+i*entry_stride;
++        const uint value=gds[entry];
++        gds[entry+1]=running;running+=value;
++    }
++    if(lane==0)gds[stream.y]=initial+partial[127];
+ }
+--- a/src/video_core/renderer_vulkan/host_passes/dreams_ordered_prefix_pass.cpp
++++ b/src/video_core/renderer_vulkan/host_passes/dreams_ordered_prefix_pass.cpp
+@@ -4,6 +4,7 @@
+ #include "video_core/renderer_vulkan/host_passes/dreams_ordered_prefix_pass.h"
+ 
+ #include <array>
++#include <algorithm>
+ #include <limits>
+ 
+ #include "common/assert.h"
+@@ -163,7 +164,8 @@
+     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0, writes);
+     cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
+                          sizeof(constants), &constants);
+-    cmdbuf.dispatch((matrix.stream_count + 7) / 8, 1, 1);
++    const u32 groups_x = std::min(matrix.stream_count, 65535u);
++    cmdbuf.dispatch(groups_x, (matrix.stream_count + groups_x - 1) / groups_x, 1);
+ 
+     const std::array after_scan_barriers{
+         vk::BufferMemoryBarrier2{
+@@ -354,7 +356,7 @@
+     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0, writes);
+     cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
+                          sizeof(constants), &constants);
+-    cmdbuf.dispatch(1, 1, 1);
++    cmdbuf.dispatch(constants.stream_count, 1, 1);
+ 
+     cmdbuf.pipelineBarrier2({
+         .bufferMemoryBarrierCount = after_scan_barrier_count,

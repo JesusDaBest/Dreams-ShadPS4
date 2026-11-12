@@ -83,3 +83,5 @@ git apply "$dreamsPatches/save-mount-lifecycle-20261002.patch"
 ## Research patches are separate
 
 The September 2 WIP and September 4/7 research deltas have different bases and validation limits. Do not apply every patch in this repository as one stack. See [DEVELOPMENT.md](DEVELOPMENT.md) for historical research provenance and [Dreams-runtime-setting-fix-20260904.md](Dreams-runtime-setting-fix-20260904.md) for the configuration comparison.
+
+Latest update: [parallel DOC prefix](updates/DOC_PREFIX_20261112.md); use the [complete source manifest](../builds/cusa04301-doc-prefix-20261112/source-manifest.json).

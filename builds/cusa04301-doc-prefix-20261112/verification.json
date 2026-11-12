@@ -1,0 +1,41 @@
+{
+  "production_changes_preserved": true,
+  "changed_production_objects": 1,
+  "owner_visual_check_passed": true,
+  "owner_reported_best_performance_so_far": true,
+  "matched_game_fps_gain_verified": false,
+  "native_ps4_parity_verified": false,
+  "latest_other_fixes_retained": true,
+  "custom_debug_tools_included": false,
+  "builder_included": false,
+  "vr_included": false,
+  "user_saves_included": false,
+  "shader_cache_included": false,
+  "real_profiles_written": false,
+  "publication_started_game": false,
+  "qt_default_route_verified": true,
+  "direct_route_verified": true,
+  "source_patch_reconstruction_verified": true,
+  "limitations": [
+    "No matched old/new game FPS measurement or native PS4 DOC timing baseline.",
+    "Synthetic shader fixtures do not cover every Dreams scene. Eight-group full-path timing was slightly slower.",
+    "The clean release strips custom debug tools; the matching private build passed the owner visual check."
+  ],
+  "core_sha256": "a66eed9a290cc939abd63b6174b02a07509e7a7e6a0ac8c284b42fb3a21fa601",
+  "clean_regression": {
+    "prefix_cases": 720,
+    "layout_cases": 468,
+    "full_shader_cases": 1056,
+    "full_path_ab_cases": 184,
+    "validation_errors": 0,
+    "exact_tested_prefix_object_reused": true,
+    "owner_visual_check_passed": true,
+    "owner_reported_best_performance_so_far": true,
+    "matched_game_fps_gain_verified": false,
+    "native_ps4_parity_verified": false,
+    "small_dispatch_timing_regression": "8-group full-path median 38.44 to 39.78 us; isolated tiny cases also slightly slower"
+  },
+  "zip_sha256": "0b0ec3cd48ba97fc081554b64c9b841d7b9effb9b5269954ab8b3c5ca728ad50",
+  "zip_bytes": 60998226,
+  "zip_members": 47
+}
