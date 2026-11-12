@@ -4,6 +4,8 @@ A Windows build of shadPS4 with fixes for **Dreams (CUSA04301)**.
 
 **[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-single-mip-write-20261102/Dreams-graphical-launcher-single-mip-write-20261102.zip)**
 
+[Join the Discord for more](https://discord.gg/7jFj63vND)
+
 Updated November 2, 2026.
 
 ## How to play
