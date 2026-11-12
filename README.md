@@ -18,4 +18,17 @@ The included fixes and settings apply automatically. No commands needed. Keep th
 
 **FPS display:** press **F10** to show or hide it, including in fullscreen. Your choice is saved.
 
+## Performance
+
+Owner-reported result from the heaviest tested **Tren** scene: **20 render FPS / 11 game FPS**.
+
+| Test hardware | Configuration |
+| --- | --- |
+| CPU | AMD Ryzen AI Max+ 395 — 16 cores / 32 threads |
+| GPU | AMD Radeon 8060S |
+| Memory | 64 GB LPDDR5X-8000 |
+| Processor power limit | 20 W |
+
+Approximate Intel/NVIDIA performance-tier equivalents at 20 W: **Core i7-12700H-class CPU + GeForce GTX 1650 Laptop-class GPU**. These are workload-dependent estimates, not measured Dreams results on those components. [CPU comparison](https://www.computerbase.de/forum/threads/onexplayer-superx-tablet-mit-amd-395.2264935/) · [GPU comparison](https://www.notebookcheck.net/Intel-Panther-Lake-Arc-B390-performance-and-efficiency-analysis-Intel-s-new-iGPU-trades-blows-with-the-Nvidia-GeForce-RTX-4050.1212582.0.html)
+
 [Latest release details](docs/updates/SINGLE_MIP_WRITE_20261102.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
