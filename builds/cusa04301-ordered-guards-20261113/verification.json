@@ -1,0 +1,44 @@
+{
+  "ordered_kernels": [
+    "fff20d00",
+    "2bfebd3c",
+    "252ccde6"
+  ],
+  "full_captured_input_replay_verified": true,
+  "live_activation_verified": true,
+  "deliberate_overlap_rejects": true,
+  "tokens_and_unrelated_gds_preserved": true,
+  "existing_ordered_kernels_unchanged": true,
+  "latest_other_fixes_retained": true,
+  "custom_debug_tools_included": false,
+  "builder_included": false,
+  "vr_included": false,
+  "user_saves_included": false,
+  "shader_cache_included": false,
+  "real_profiles_written": false,
+  "publication_started_game": false,
+  "qt_default_route_verified": true,
+  "direct_route_verified": true,
+  "source_patch_reconstruction_verified": true,
+  "no_speedup_claim": true,
+  "limitations": [
+    "252ccde6 retains synchronous readback and private GPU input snapshots.",
+    "Unsupported/uncertain dispatches retain atomic fallback.",
+    "Captured dispatches do not prove every future scene or GPU.",
+    "Clean release removes private hooks; production compiler objects are reused unchanged."
+  ],
+  "core_sha256": "45d9d4030354453401be75ac6be4031ef652ceb69aa5e9fbb0df6fe5b6455195",
+  "clean_regression": {
+    "full_captured_inputs_verified": true,
+    "live_phases_verified": true,
+    "tokens_and_unrelated_gds_preserved": true,
+    "deliberate_overlap_rejects": true,
+    "existing_ordered_kernels_unchanged": true,
+    "clean_source_reconstruction_verified": true,
+    "exact_candidate_compiler_objects_reused": true,
+    "no_speedup_claim": true
+  },
+  "zip_sha256": "c7ea523a108e23194775d4c56dc37e7c7cbba657ba90c6d39410446096035abd",
+  "zip_bytes": 61018223,
+  "zip_members": 47
+}

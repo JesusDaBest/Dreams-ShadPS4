@@ -82,3 +82,5 @@ builds/cusa04301-single-mip-write-20261102/** -text whitespace=blank-at-eol,blan
 builds/cusa04301-single-mip-write-20261102/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-doc-prefix-20261112/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-doc-prefix-20261112/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-ordered-guards-20261113/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-ordered-guards-20261113/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
