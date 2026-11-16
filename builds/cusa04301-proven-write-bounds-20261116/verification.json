@@ -1,0 +1,30 @@
+{
+  "core_sha256": "5a9833e6aa1a967d465e07889ccf078996b4b10820d4d0b256a837b929db4074",
+  "audited_new_kernel_candidates": 58,
+  "potential_new_bounded_bindings": 85,
+  "private_live_activation_verified": true,
+  "private_live_activated_kernels": 27,
+  "private_live_activated_bindings": 40,
+  "inherited_real_module_gpu_cases": 645,
+  "clean_guard_checks": 420481,
+  "real_modules_GPU_tested": 43,
+  "prior_observed_wall_dip_fps": 24,
+  "current_observed_wall_dip_fps": 20,
+  "additional_FPS_gain_established": false,
+  "clean_binary_live_gameplay_tested": false,
+  "custom_debug_tools": false,
+  "shader_math_unchanged": true,
+  "source_patch_reconstruction_verified": true,
+  "user_saves_included": false,
+  "shader_cache_included": false,
+  "limitations": [
+    "The broader wall-break run was worse than the prior two-kernel run: 20 FPS versus 24 FPS reported.",
+    "The intact-wall same-process comparison stayed near 30 FPS with both marking modes.",
+    "15 candidate modules have static proof/guards but were not exercised by the real-GPU harness.",
+    "Coverage is the audited shader corpus, not every possible future scene/input. Unproved cases retain full tracking.",
+    "No additional overall FPS gain is established."
+  ],
+  "direct_package_launcher_verified": true,
+  "qt_package_launcher_verified": true,
+  "real_profile_modified": false
+}

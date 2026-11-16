@@ -1,0 +1,673 @@
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/audited_kernels.h
+@@ -0,0 +1,69 @@
++#pragma once
++#include <cstdint>
++namespace Vulkan::ProvenWrites {
++// Audited ordinary-dispatch candidates only. Existing per-kernel/ordered paths stay intact.
++inline bool AuditedKernel(std::uint64_t hash) {
++    switch(hash) {
++    case 0x02f20fa2:
++    case 0x03a75c5d:
++    case 0x03e31a2b:
++    case 0x1adbf692:
++    case 0x1c4fde4c:
++    case 0x28dc6594:
++    case 0x2a85d31c:
++    case 0x2f555c74:
++    case 0x337322e0:
++    case 0x388a0f44:
++    case 0x3cafb70c:
++    case 0x44bd1428:
++    case 0x4695cd42:
++    case 0x48d20f87:
++    case 0x4bb27375:
++    case 0x537491fe:
++    case 0x5728bbbc:
++    case 0x5ab84461:
++    case 0x5c350fd1:
++    case 0x5d25ce07:
++    case 0x624b6ada:
++    case 0x68ec89c4:
++    case 0x6b6599c0:
++    case 0x6c4c38b2:
++    case 0x75a1e560:
++    case 0x7d1bf888:
++    case 0x8106c0d8:
++    case 0x8126e79d:
++    case 0x87cda19d:
++    case 0x8bf43c25:
++    case 0x8d397431:
++    case 0x91b88ec8:
++    case 0x934e15fc:
++    case 0x97e4e003:
++    case 0x9e16e6ad:
++    case 0xa3182105:
++    case 0xad411ac5:
++    case 0xb04c13b9:
++    case 0xc51cf267:
++    case 0xcbb4afe3:
++    case 0xcccfbe0f:
++    case 0xd22e320d:
++    case 0xd79add06:
++    case 0xd96735ae:
++    case 0xd9e27dc7:
++    case 0xda4c2318:
++    case 0xdc0fc7b9:
++    case 0xdde952ef:
++    case 0xe0ea17eb:
++    case 0xe9bbf231:
++    case 0xeb36a143:
++    case 0xebfbb7b3:
++    case 0xecacd603:
++    case 0xf4b134bf:
++    case 0xf5f48dc7:
++    case 0xf6e037c1:
++    case 0xfcaa2a08:
++    case 0xfebc9c5f:
++        return true;
++    default:return false;
++    }
++}
++}
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/proven_write_bounds.h
+@@ -0,0 +1,387 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++#define SPV_ENABLE_UTILITY_CODE
++#include <spirv/unified1/spirv.hpp>
++#include <spirv/unified1/GLSL.std.450.h>
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <map>
++#include <optional>
++#include <set>
++#include <span>
++#include <string>
++#include <vector>
++
++namespace Vulkan::ProvenWrites {
++using U32 = std::uint32_t;
++using U64 = std::uint64_t;
++constexpr U32 MaxBindings = 256;
++constexpr U64 Unknown = std::numeric_limits<U64>::max();
++struct Launch {
++    bool direct{};
++    std::array<U32,3> groups{}, local{}, start{};
++    bool operator==(const Launch&) const = default;
++};
++struct Range { U64 lo{}, hi{Unknown}; };
++struct Result {
++    bool valid{};
++    std::string reason;
++    std::array<U64,MaxBindings> end{};
++    std::array<bool,MaxBindings> declared{}, written{};
++};
++
++// The analyzer over-approximates every address, including inactive branches. It never
++// substitutes sampled GPU data, CPU scalar copies, or loop trip-count guesses.
++class Module {
++    struct Inst { spv::Op op{}; std::vector<U32> a; };
++    struct Deco { std::optional<U32> binding, set, stride, builtin; };
++    struct Pointer {
++        enum Kind { UnknownPointer, LocalPointer, BufferPointer } kind{UnknownPointer};
++        U32 binding{}, type{};
++        U64 end_offset{};
++        bool bounded{true};
++    };
++    std::vector<U32> words;
++    std::vector<Inst> instructions;
++    std::vector<const Inst*> definitions;
++    std::vector<Deco> decorations;
++    std::map<std::pair<U32,U32>,U32> offsets;
++    std::array<U32,3> local{};
++    U32 model{~U32{0}};
++    bool valid{};
++    std::string reason;
++    std::map<U32,std::string> imports;
++    std::vector<U32> stores;
++    std::array<bool,MaxBindings> declared{};
++
++    const Inst* Def(U32 id) const {return id<definitions.size()?definitions[id]:nullptr;}
++    U32 Type(U32 id) const {
++        const auto* d=Def(id);if(!d)return 0;
++        bool result{},typed{};spv::HasResultAndType(d->op,&result,&typed);
++        return typed&&!d->a.empty()?d->a[0]:0;
++    }
++    U32 Bits(U32 id) const {
++        const auto* t=Def(Type(id));
++        return t&&t->op==spv::OpTypeInt&&t->a.size()==3&&t->a[1]&&t->a[1]<=64?t->a[1]:64;
++    }
++    static U64 Mask(U32 bits) {return bits>=64?Unknown:(U64{1}<<bits)-1;}
++    std::optional<U64> Constant(U32 id) const {
++        const auto* d=Def(id);if(!d)return {};
++        if(d->op==spv::OpConstant&&d->a.size()>=3) {
++            const auto* t=Def(d->a[0]);
++            if(t&&t->op==spv::OpTypeInt&&t->a[1]<=64)
++                return (U64(d->a[2])|(d->a.size()>3?U64(d->a[3])<<32:0))&Mask(t->a[1]);
++        }
++        if(d->op==spv::OpConstantNull)return 0;
++        return {};
++    }
++    U64 Width(U32 type) const {
++        const auto* d=Def(type);if(!d)return Unknown;
++        if((d->op==spv::OpTypeInt||d->op==spv::OpTypeFloat)&&d->a.size()>=2&&
++           (d->a[1]==8||d->a[1]==16||d->a[1]==32||d->a[1]==64))return d->a[1]/8;
++        if(d->op==spv::OpTypeVector&&d->a.size()==3) {
++            const U64 w=Width(d->a[1]);
++            if(w<=16&&d->a[2]<=16)return w*d->a[2];
++        }
++        return Unknown; // Matrices/struct copies need their own layout proof.
++    }
++    static bool PureBody(spv::Op op) {
++        switch(op) {
++        case spv::OpUndef:case spv::OpNop:case spv::OpLine:case spv::OpNoLine:
++        case spv::OpFunction:case spv::OpFunctionEnd:case spv::OpFunctionParameter:
++        case spv::OpFunctionCall:case spv::OpVariable:
++        case spv::OpLoad:case spv::OpAccessChain:case spv::OpInBoundsAccessChain:
++        case spv::OpPtrAccessChain:case spv::OpInBoundsPtrAccessChain:
++        case spv::OpImageTexelPointer:case spv::OpCopyObject:
++        case spv::OpVectorExtractDynamic:case spv::OpVectorInsertDynamic:
++        case spv::OpVectorShuffle:case spv::OpCompositeConstruct:case spv::OpCompositeExtract:
++        case spv::OpCompositeInsert:case spv::OpSampledImage:
++        case spv::OpImageSampleImplicitLod:case spv::OpImageSampleExplicitLod:
++        case spv::OpImageSampleDrefImplicitLod:case spv::OpImageSampleDrefExplicitLod:
++        case spv::OpImageFetch:case spv::OpImageGather:case spv::OpImageDrefGather:
++        case spv::OpImageRead:case spv::OpImageQuerySize:case spv::OpImageQuerySizeLod:
++        case spv::OpImageQueryLevels:case spv::OpImageQuerySamples:case spv::OpImageQueryLod:
++        case spv::OpConvertFToU:case spv::OpConvertFToS:case spv::OpConvertSToF:
++        case spv::OpConvertUToF:case spv::OpUConvert:case spv::OpSConvert:case spv::OpFConvert:
++        case spv::OpConvertUToPtr:case spv::OpConvertPtrToU:case spv::OpBitcast:
++        case spv::OpSNegate:case spv::OpFNegate:case spv::OpIAdd:case spv::OpFAdd:
++        case spv::OpISub:case spv::OpFSub:case spv::OpIMul:case spv::OpFMul:
++        case spv::OpUDiv:case spv::OpSDiv:case spv::OpFDiv:case spv::OpUMod:
++        case spv::OpSRem:case spv::OpSMod:case spv::OpFRem:case spv::OpFMod:
++        case spv::OpIAddCarry:case spv::OpISubBorrow:case spv::OpUMulExtended:
++        case spv::OpSMulExtended:case spv::OpIsNan:case spv::OpIsInf:
++        case spv::OpLogicalEqual:case spv::OpLogicalNotEqual:case spv::OpLogicalOr:
++        case spv::OpLogicalAnd:case spv::OpLogicalNot:case spv::OpSelect:
++        case spv::OpIEqual:case spv::OpINotEqual:case spv::OpUGreaterThan:
++        case spv::OpSGreaterThan:case spv::OpUGreaterThanEqual:case spv::OpSGreaterThanEqual:
++        case spv::OpULessThan:case spv::OpSLessThan:case spv::OpULessThanEqual:
++        case spv::OpSLessThanEqual:case spv::OpFOrdEqual:case spv::OpFUnordEqual:
++        case spv::OpFOrdNotEqual:case spv::OpFUnordNotEqual:case spv::OpFOrdLessThan:
++        case spv::OpFUnordLessThan:case spv::OpFOrdGreaterThan:case spv::OpFUnordGreaterThan:
++        case spv::OpFOrdLessThanEqual:case spv::OpFUnordLessThanEqual:
++        case spv::OpFOrdGreaterThanEqual:case spv::OpFUnordGreaterThanEqual:
++        case spv::OpShiftRightLogical:case spv::OpShiftRightArithmetic:
++        case spv::OpShiftLeftLogical:case spv::OpBitwiseOr:case spv::OpBitwiseXor:
++        case spv::OpBitwiseAnd:case spv::OpNot:case spv::OpBitFieldInsert:
++        case spv::OpBitFieldSExtract:case spv::OpBitFieldUExtract:
++        case spv::OpBitReverse:case spv::OpBitCount:
++        case spv::OpControlBarrier:case spv::OpMemoryBarrier:case spv::OpAtomicLoad:
++        case spv::OpPhi:case spv::OpLoopMerge:case spv::OpSelectionMerge:case spv::OpLabel:
++        case spv::OpBranch:case spv::OpBranchConditional:case spv::OpSwitch:
++        case spv::OpReturn:case spv::OpReturnValue:case spv::OpKill:case spv::OpUnreachable:
++        case spv::OpGroupNonUniformAny:case spv::OpGroupNonUniformAll:
++        case spv::OpGroupNonUniformBroadcastFirst:case spv::OpGroupNonUniformBallot:
++        case spv::OpGroupNonUniformBallotFindLSB:case spv::OpGroupNonUniformBallotFindMSB:
++        case spv::OpGroupNonUniformShuffle:case spv::OpGroupNonUniformQuadBroadcast:
++        case spv::OpDemoteToHelperInvocationEXT:return true;
++        default:return false;
++        }
++    }
++    static bool AtomicWrite(spv::Op op) {
++        return op==spv::OpAtomicStore||(op>=spv::OpAtomicExchange&&op<=spv::OpAtomicXor)||
++               op==spv::OpAtomicFlagTestAndSet||op==spv::OpAtomicFlagClear;
++    }
++    void Parse() {
++        if(words.size()<5||words[0]!=spv::MagicNumber||!words[3]||words[3]>262144) {
++            reason="invalid module/budget";return;
++        }
++        definitions.resize(words[3]);decorations.resize(words[3]);
++        // Build first, then publish pointers: vector growth must not invalidate definitions.
++        for(size_t pos=5;pos<words.size();) {
++            const U32 n=words[pos]>>16,opcode=words[pos]&0xffff;
++            if(!n||n>words.size()-pos){reason="malformed instruction";return;}
++            instructions.push_back({static_cast<spv::Op>(opcode),{words.begin()+pos+1,words.begin()+pos+n}});pos+=n;
++        }
++        unsigned functions=0,entries=0;bool body=false;
++        U32 function{};std::set<U32> defined_functions;
++        for(U32 index=0;index<instructions.size();++index) {
++            const auto& d=instructions[index];const auto& a=d.a;
++            bool has{},typed{};spv::HasResultAndType(d.op,&has,&typed);
++            if(has) {
++                const U32 offset=typed?1:0;
++                if(a.size()<=offset||a[offset]>=definitions.size()||definitions[a[offset]]){reason="invalid result id";return;}
++                definitions[a[offset]]=&d;
++            }
++            if(d.op==spv::OpEntryPoint) {if(a.size()<3){reason="entry point";return;}model=a[0];++entries;}
++            if(d.op==spv::OpExecutionMode&&a.size()==5&&a[1]==spv::ExecutionModeLocalSize)local={a[2],a[3],a[4]};
++            if(d.op==spv::OpExecutionModeId){reason="specialized execution size";return;}
++            if(d.op==spv::OpExtInstImport&&a.size()>1)imports[a[0]]=std::string(reinterpret_cast<const char*>(a.data()+1),strnlen(reinterpret_cast<const char*>(a.data()+1),(a.size()-1)*4));
++            if(d.op==spv::OpDecorate&&a.size()>=2&&a[0]<decorations.size()) {
++                auto& dec=decorations[a[0]];
++                if(a.size()==3) {
++                    if(a[1]==spv::DecorationBinding)dec.binding=a[2];
++                    if(a[1]==spv::DecorationDescriptorSet)dec.set=a[2];
++                    if(a[1]==spv::DecorationArrayStride)dec.stride=a[2];
++                    if(a[1]==spv::DecorationBuiltIn)dec.builtin=a[2];
++                }
++                if(a[1]==spv::DecorationVolatile||a[1]==spv::DecorationCoherent){reason="volatile/coherent resource";return;}
++            }
++            if(d.op==spv::OpMemberDecorate&&a.size()==4&&a[2]==spv::DecorationOffset)offsets[{a[0],a[1]}]=a[3];
++            if(d.op==spv::OpFunction){++functions;body=true;function=a.size()>1?a[1]:0;}
++            if(d.op==spv::OpLabel&&function)defined_functions.insert(function);
++            if(d.op==spv::OpFunctionEnd)function=0;
++            if(body) {
++                if(d.op==spv::OpStore||AtomicWrite(d.op)){stores.push_back(index);}
++                else if(d.op==spv::OpImageWrite){} // Image/subresource tracking is left unchanged.
++                else if(d.op==spv::OpExtInst) {
++                    const bool glsl=a.size()>=4&&imports[a[2]]=="GLSL.std.450"&&a[3]<GLSLstd450Count&&
++                        a[3]!=GLSLstd450Modf&&a[3]!=GLSLstd450Frexp;
++                    const bool trinary=a.size()>=4&&imports[a[2]]=="SPV_AMD_shader_trinary_minmax"&&a[3]>=1&&a[3]<=9;
++                    if(!glsl&&!trinary){reason="unproved extended instruction";return;}
++                } else if(!PureBody(d.op)){reason="unproved side effect/opcode "+std::to_string(d.op);return;}
++            }
++        }
++        if(!functions||entries!=1||defined_functions.size()!=functions){reason="undefined functions or entry points";return;}
++        for(const auto& d:instructions)if(d.op==spv::OpFunctionCall) {
++            if(d.a.size()<3||!defined_functions.contains(d.a[2])){reason="unresolved function call";return;}
++        }
++        // Every function's writes are included, even unreachable functions. Call results and
++        // scalar parameters remain unknown; pointer-parameter writes therefore fail closed.
++        for(const auto& d:instructions)if(d.op==spv::OpVariable&&d.a.size()>=3&&d.a[2]==spv::StorageClassStorageBuffer) {
++            const auto& dec=decorations[d.a[1]];
++            if(!dec.binding||!dec.set||*dec.set!=0||*dec.binding>=MaxBindings){reason="descriptor binding/set";return;}
++            declared[*dec.binding]=true;
++        }
++        valid=true;
++    }
++
++    class Evaluation {
++        const Module& m;
++        Launch launch;
++        std::vector<Range> values;
++        std::vector<unsigned char> states;
++        unsigned depth{};
++        Range Full(U32 id)const{return {0,Mask(m.Bits(id))};}
++        Range Builtin(U32 builtin,U32 axis) {
++            if(axis>=3)return {};
++            const U64 local=m.local[axis];
++            if(builtin==spv::BuiltInLocalInvocationId)return local?Range{0,local-1}:Range{};
++            if(builtin==spv::BuiltInWorkgroupSize)return local?Range{local,local}:Range{};
++            if(!launch.direct)return {0,0xffffffffull};
++            const U64 groups=launch.groups[axis];
++            if(!groups)return {};
++            if(builtin==spv::BuiltInWorkgroupId)return {0,groups-1};
++            if(builtin==spv::BuiltInNumWorkgroups)return {groups,groups};
++            if(builtin==spv::BuiltInGlobalInvocationId&&local&&groups*local<=0x100000000ull)return {0,groups*local-1};
++            return {0,0xffffffffull};
++        }
++        Range Component(U32 id,U32 axis) {
++            const auto* d=m.Def(id);if(!d)return {};
++            if(d->op==spv::OpLoad&&d->a.size()>=3) {
++                const U32 var=d->a[2];
++                if(var<m.decorations.size()&&m.decorations[var].builtin)return Builtin(*m.decorations[var].builtin,axis);
++            }
++            if((d->op==spv::OpCompositeConstruct||d->op==spv::OpConstantComposite)&&d->a.size()>2+axis)return Value(d->a[2+axis]);
++            return {};
++        }
++    public:
++        Evaluation(const Module& m,const Launch& launch):m(m),launch(launch),values(m.definitions.size()),states(m.definitions.size()){}
++        Range Value(U32 id) {
++            if(!id||id>=values.size()||depth>256)return Full(id);
++            if(states[id]==2)return values[id];
++            if(states[id]==1)return Full(id); // Cyclic Phi/loop values are never guessed.
++            states[id]=1;++depth;
++            const auto* d=m.Def(id);Range out=Full(id);const U64 mask=out.hi;
++            if(auto c=m.Constant(id))out={*c,*c};
++            else if(d) {
++                const auto& a=d->a;
++                auto val=[&](size_t n){return n<a.size()?Value(a[n]):Range{};};
++                auto combine=[&](Range l,Range r){return Range{std::min(l.lo,r.lo),std::max(l.hi,r.hi)};};
++                if(d->op==spv::OpCompositeExtract&&a.size()==4)out=Component(a[2],a[3]);
++                else if(d->op==spv::OpLoad&&a.size()>=3&&a[2]<m.decorations.size()&&m.decorations[a[2]].builtin) {
++                    const U32 b=*m.decorations[a[2]].builtin;
++                    U64 lanes=1;for(auto v:m.local)lanes=(!v||lanes>0xffffffffull/v)?0:lanes*v;
++                    if((b==spv::BuiltInLocalInvocationIndex||b==spv::BuiltInSubgroupLocalInvocationId||b==spv::BuiltInSubgroupId)&&lanes)out={0,lanes-1};
++                } else if(d->op==spv::OpSelect&&a.size()==5)out=combine(val(3),val(4));
++                else if(d->op==spv::OpPhi&&a.size()>=4) {
++                    out=val(2);for(size_t n=4;n<a.size();n+=2)out=combine(out,val(n));
++                } else if(d->op==spv::OpCopyObject&&a.size()==3)out=val(2);
++                else if(d->op==spv::OpBitcast&&a.size()==3) {
++                    const auto* t=m.Def(m.Type(a[2]));
++                    if(t&&t->op==spv::OpTypeInt&&m.Bits(a[2])==m.Bits(id))out=val(2);
++                } else if(d->op==spv::OpUConvert&&a.size()==3) {
++                    const auto r=val(2);if(r.hi<=mask)out=r;
++                } else if(d->op==spv::OpBitCount&&a.size()==3)out={0,m.Bits(a[2])};
++                else if(d->op==spv::OpBitFieldUExtract&&a.size()==5) {
++                    const auto offset=m.Constant(a[3]),bits=m.Constant(a[4]);
++                    if(offset&&bits&&*offset<=m.Bits(id)&&*bits<=m.Bits(id)-*offset)out={0,Mask(U32(*bits))};
++                } else if(d->op==spv::OpExtInst&&a.size()>=6&&m.imports.at(a[2])=="GLSL.std.450") {
++                    const auto l=val(4),r=val(5);
++                    if(a[3]==GLSLstd450UMin)out={std::min(l.lo,r.lo),std::min(l.hi,r.hi)};
++                    if(a[3]==GLSLstd450UMax)out={std::max(l.lo,r.lo),std::max(l.hi,r.hi)};
++                } else if(a.size()==4) {
++                    const auto l=val(2),r=val(3);const bool exact=l.lo==l.hi&&r.lo==r.hi;
++                    switch(d->op) {
++                    case spv::OpIAdd:
++                        if(exact)out={(l.lo+r.lo)&mask,(l.lo+r.lo)&mask};
++                        else if(r.hi<=mask&&l.hi<=mask-r.hi)out={l.lo+r.lo,l.hi+r.hi};break;
++                    case spv::OpISub:
++                        if(exact)out={(l.lo-r.lo)&mask,(l.lo-r.lo)&mask};
++                        else if(l.lo>=r.hi)out={l.lo-r.hi,l.hi-r.lo};break;
++                    case spv::OpIMul:
++                        if(exact)out={(l.lo*r.lo)&mask,(l.lo*r.lo)&mask};
++                        else if(!l.hi||!r.hi)out={0,0};
++                        else if(r.hi<=mask&&l.hi<=mask/r.hi)out={l.lo*r.lo,l.hi*r.hi};break;
++                    case spv::OpUMod:if(r.lo==r.hi&&r.lo)out={0,r.lo-1};break;
++                    case spv::OpUDiv:if(r.lo)out={l.lo/r.hi,l.hi/r.lo};break;
++                    case spv::OpBitwiseAnd:out=exact?Range{l.lo&r.lo,l.lo&r.lo}:Range{0,std::min(l.hi,r.hi)};break;
++                    case spv::OpBitwiseOr:case spv::OpBitwiseXor:
++                        if(exact){const U64 n=d->op==spv::OpBitwiseOr?l.lo|r.lo:l.lo^r.lo;out={n,n};}
++                        else out={0,Mask(std::bit_width(std::max(l.hi,r.hi)))};break;
++                    case spv::OpShiftRightLogical:
++                        if(r.lo==r.hi&&r.lo<m.Bits(id))out={l.lo>>r.lo,l.hi>>r.lo};break;
++                    case spv::OpShiftLeftLogical:
++                        if(r.lo==r.hi&&r.lo<m.Bits(id)) {
++                            if(exact)out={(l.lo<<r.lo)&mask,(l.lo<<r.lo)&mask};
++                            else if(l.hi<=mask>>r.lo)out={l.lo<<r.lo,l.hi<<r.lo};
++                        }break;
++                    default:break;
++                    }
++                }
++            }
++            if(out.hi>mask||out.lo>out.hi)out={0,mask};
++            --depth;states[id]=2;return values[id]=out;
++        }
++        Pointer Ptr(U32 id,unsigned level=0) {
++            if(level>128)return {};
++            const auto* d=m.Def(id);if(!d)return {};
++            const auto& a=d->a;
++            if(d->op==spv::OpVariable&&a.size()>=3) {
++                const auto* t=m.Def(a[0]);if(!t||t->op!=spv::OpTypePointer||t->a.size()!=3)return {};
++                if(a[2]==spv::StorageClassStorageBuffer) {
++                    const auto& dec=m.decorations[a[1]];
++                    if(dec.binding&&*dec.binding<MaxBindings&&dec.set&&*dec.set==0)
++                        return {Pointer::BufferPointer,*dec.binding,t->a[2],0,true};
++                    return {};
++                }
++                if(a[2]==spv::StorageClassWorkgroup||a[2]==spv::StorageClassPrivate||
++                   a[2]==spv::StorageClassFunction||a[2]==spv::StorageClassOutput)
++                    return {Pointer::LocalPointer,0,t->a[2],0,true};
++                return {};
++            }
++            if(d->op==spv::OpImageTexelPointer)return {Pointer::LocalPointer};
++            if(d->op==spv::OpCopyObject&&a.size()==3)return Ptr(a[2],level+1);
++            if((d->op==spv::OpAccessChain||d->op==spv::OpInBoundsAccessChain)&&a.size()>=4) {
++                auto p=Ptr(a[2],level+1);if(p.kind!=Pointer::BufferPointer)return p;
++                for(size_t n=3;n<a.size();++n) {
++                    const auto* t=m.Def(p.type);if(!t){p.bounded=false;return p;}
++                    U64 add=0;
++                    if(t->op==spv::OpTypeStruct) {
++                        const auto member=m.Constant(a[n]);
++                        if(!member||*member>=t->a.size()-1||!m.offsets.contains({p.type,U32(*member)})){p.bounded=false;return p;}
++                        add=m.offsets.at({p.type,U32(*member)});p.type=t->a[1+*member];
++                    } else if(t->op==spv::OpTypeArray||t->op==spv::OpTypeRuntimeArray) {
++                        const auto stride=m.decorations[p.type].stride;
++                        const auto range=Value(a[n]);
++                        if(!stride||!*stride||range.hi>0xffffffffull/(*stride)){p.bounded=false;return p;}
++                        add=range.hi*(*stride);p.type=t->a[1];
++                    } else if(t->op==spv::OpTypeVector&&t->a.size()==3) {
++                        const auto range=Value(a[n]);const U64 width=m.Width(t->a[1]);
++                        if(width>16||range.hi>=t->a[2]){p.bounded=false;return p;}
++                        add=range.hi*width;p.type=t->a[1];
++                    } else {p.bounded=false;return p;}
++                    if(add>0xffffffffull||p.end_offset>0xffffffffull-add){p.bounded=false;return p;}
++                    p.end_offset+=add;
++                }
++                return p;
++            }
++            return {};
++        }
++    };
++public:
++    explicit Module(std::span<const U32> code):words(code.begin(),code.end()){Parse();}
++    Module(const Module&)=delete;
++    Module& operator=(const Module&)=delete;
++    bool Matches(std::span<const U32> code)const {
++        return code.size()==words.size()&&std::memcmp(code.data(),words.data(),code.size_bytes())==0;
++    }
++    Result Evaluate(Launch launch)const {
++        Result result;result.reason=reason;result.declared=declared;
++        if(!valid)return result;
++        if(model==spv::ExecutionModelGLCompute) {
++            if(!local[0]||!local[1]||!local[2]){result.reason="unknown local size";return result;}
++            if(launch.direct&&(launch.local!=local||launch.start!=std::array<U32,3>{}||
++               !launch.groups[0]||!launch.groups[1]||!launch.groups[2])){result.reason="launch mismatch";return result;}
++        } else launch={}; // Draw invocation counts and screen rectangles are not inferred.
++        Evaluation eval(*this,launch);
++        for(U32 index:stores) {
++            const auto& d=instructions[index];const auto& a=d.a;
++            const U32 at=d.op==spv::OpStore||d.op==spv::OpAtomicStore||d.op==spv::OpAtomicFlagClear?0:2;
++            if(a.size()<=at){result.reason="invalid write";return result;}
++            const auto ptr=eval.Ptr(a[at]);
++            if(ptr.kind==Pointer::LocalPointer)continue;
++            if(ptr.kind!=Pointer::BufferPointer){result.reason="unresolved write pointer";return result;}
++            const U64 width=Width(ptr.type);result.written[ptr.binding]=true;
++            if(!ptr.bounded||width>64||ptr.end_offset>0xffffffffull-width)result.end[ptr.binding]=Unknown;
++            else result.end[ptr.binding]=std::max(result.end[ptr.binding],ptr.end_offset+width);
++        }
++        result.valid=true;return result;
++    }
++    U32 ExecutionModel()const{return model;}
++    const auto& LocalSize()const{return local;}
++};
++}
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/proven_write_runtime.h
+@@ -0,0 +1,89 @@
++#pragma once
++#include "proven_write_bounds.h"
++#include "audited_kernels.h"
++#include <memory>
++#include <unordered_map>
++
++namespace Vulkan::ProvenWritesRuntime {
++namespace P=ProvenWrites;
++inline thread_local P::Launch launch;
++struct StageContext {
++    const void* identity{};
++    P::U64 hash{};
++    P::U32 base{},alignment{};
++    bool compute{};
++    P::Launch evaluated_launch;
++    P::Result result;
++};
++inline thread_local std::array<StageContext,6> stages;
++inline thread_local unsigned nesting{};
++struct LaunchScope {
++    P::Launch previous;
++    std::unique_ptr<std::array<StageContext,6>> previous_stages;
++    explicit LaunchScope(P::Launch value):previous(launch) {
++        if(nesting)previous_stages=std::make_unique<std::array<StageContext,6>>(stages);
++        ++nesting;launch=value;
++    }
++    ~LaunchScope(){if(previous_stages)stages=std::move(*previous_stages);launch=previous;--nesting;}
++};
++inline void BeginBindings(){for(auto& s:stages)s.identity=nullptr;}
++class Cache {
++    struct Entry {
++        std::unique_ptr<P::Module> module;
++        struct Shape {P::Launch launch;P::Result result;};
++        std::vector<Shape> shapes;
++        size_t next_shape{};
++    };
++    std::map<std::pair<std::uintptr_t,size_t>,Entry> entries;
++    size_t stored_words{};
++    P::Result unavailable;
++public:
++    const P::Result& Get(std::span<const P::U32> code,P::Launch dimensions) {
++        if(code.empty()||code.size()>1024*1024)return unavailable;
++        const auto key=std::make_pair(reinterpret_cast<std::uintptr_t>(code.data()),code.size());
++        auto it=entries.find(key);
++        if(it==entries.end()) {
++            if(entries.size()>=256||stored_words+code.size()>8*1024*1024)return unavailable;
++            it=entries.emplace(key,Entry{}).first;stored_words+=code.size();
++        }
++        auto& entry=it->second;
++        // Pointers and hashes alone never authorize reuse. Compare the entire current module.
++        if(!entry.module||!entry.module->Matches(code)) {
++            entry.module=std::make_unique<P::Module>(code);entry.shapes.clear();entry.next_shape=0;
++        }
++        for(const auto& shape:entry.shapes)if(shape.launch==dimensions)return shape.result;
++        // The proof depends on the immutable module and launch shape only, never input contents.
++        if(entry.shapes.size()<8){entry.shapes.push_back({dimensions,entry.module->Evaluate(dimensions)});return entry.shapes.back().result;}
++        auto& shape=entry.shapes[entry.next_shape++%entry.shapes.size()];
++        shape={dimensions,entry.module->Evaluate(dimensions)};return shape.result;
++    }
++};
++inline thread_local Cache cache;
++inline void Prepare(const void* identity,P::U64 hash,P::U32 stage,bool compute,bool excluded,
++                    P::U32 binding_base,P::U32 alignment,P::U64 page_size,
++                    std::span<const P::U32> code) {
++    if(stage>=stages.size())return;
++    auto& out=stages[stage];out.identity=nullptr;
++    if(excluded||!P::AuditedKernel(hash)||!alignment||!std::has_single_bit(alignment)||
++       page_size%alignment)return;
++    const auto evaluated=compute?launch:P::Launch{};
++    const auto& result=cache.Get(code,evaluated);
++    if(!result.valid)return;
++    out.identity=identity;out.hash=hash;out.base=binding_base;out.alignment=alignment;
++    out.compute=compute;out.evaluated_launch=evaluated;out.result=result;
++}
++inline std::optional<P::U32> Bound(const void* identity,P::U64 hash,P::U32 stage,P::U32 binding,
++                                P::U64 address,P::U64 size,bool unusual,bool formatted) {
++    if(stage>=stages.size()||unusual||formatted||!address||!size||
++       size>0xffffffffull||size%4)return {};
++    const auto& s=stages[stage];
++    if(s.identity!=identity||s.hash!=hash||!s.alignment||address%s.alignment||
++       (s.compute&&s.evaluated_launch!=launch)||binding>=P::MaxBindings||
++       s.base>=P::MaxBindings-binding)return {};
++    const auto at=s.base+binding;
++    if(!s.result.valid||!s.result.declared[at]||s.result.end[at]>0xfffffffcul)return {};
++    const P::U64 bytes=(s.result.end[at]+3)&~P::U64{3};
++    if(bytes>size)return {};
++    return P::U32(bytes);
++}
++}
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,3 +1,4 @@
++#include "proven_write_runtime.h"
+ #include "physics_write_bounds.h"
+ #include "gpu252_pass.h"
+ #include "gpu252_code.h"
+@@ -15027,6 +15028,12 @@
+     }
+ 
+     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
++    ProvenWritesRuntime::LaunchScope proven_launch({true,
++        {cs_program.dim_x, cs_program.dim_y, cs_program.dim_z},
++        {cs_program.num_thread_x.full, cs_program.num_thread_y.full, cs_program.num_thread_z.full},
++        {cs_program.start_x, cs_program.start_y, cs_program.start_z}});
++
++
+     const auto previous_physics_context = DreamsPhysicsWrites::current;
+     SCOPE_EXIT { DreamsPhysicsWrites::current = previous_physics_context; };
+     DreamsPhysicsWrites::current = {};
+@@ -23474,6 +23481,9 @@
+     }
+ 
+     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
++    ProvenWritesRuntime::LaunchScope proven_launch({});
++
++
+     TraceComputeShader(cs, true, 0, 0, 0);
+     if (ShouldSkipComputeShader(cs)) {
+         return;
+@@ -26997,6 +27007,7 @@
+ }
+ 
+ bool Rasterizer::BindResources(const Pipeline* pipeline) {
++    ProvenWritesRuntime::BeginBindings();
+     // Source selection reads the bindings of this dispatch, after texture synchronization.
+     if (!DreamsDensitySourceCaptureDirectory()) CaptureDreamsFrameBegin(pipeline);
+     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+@@ -27027,6 +27038,15 @@
+         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
+                           stage->samplers.size());
+         stage->PushUd(binding, push_data);
++        if (Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
++            stage->l_stage == Shader::LogicalStage::Compute &&
++            std::ranges::any_of(stage->buffers, [](const auto& b) {return b.is_written && !b.IsSpecial();})) {
++            ProvenWritesRuntime::Prepare(stage, stage->pgm_hash, static_cast<u32>(stage->l_stage),
++                stage->l_stage == Shader::LogicalStage::Compute,
++                stage->uses_ordered_count || stage->uses_dma, binding.unified,
++                instance.StorageMinAlignment(), VideoCore::BufferCache::CACHING_PAGESIZE,
++                pipeline_cache.GetCurrentShaderSpirv(stage->l_stage));
++        }
+         BindBuffers(*stage, binding, push_data);
+         BindTextures(*stage, binding);
+         if (DreamsDensitySourceCaptureDirectory()) CaptureDreamsFrameBegin(pipeline);
+@@ -27079,11 +27099,34 @@
+     return true;
+ }
+ 
++static u32 DreamsProvenWriteSize(const Shader::Info& stage, u32 binding,
++                                  const Shader::BufferResource& desc, const AmdGpu::Buffer& sharp,
++                                  u64 size, VideoCore::TextureCache* aliases) {
++    if (!aliases) return ~u32{0};
++    const auto bounded = ProvenWritesRuntime::Bound(&stage, stage.pgm_hash,
++        static_cast<u32>(stage.l_stage), binding, sharp.base_address, size,
++        sharp.swizzle_enable || sharp.add_tid_enable || sharp.cache_swizzle || sharp.type != 0,
++        desc.is_formatted);
++    if (!bounded) return ~u32{0};
++    // Preserve image/buffer alias handling in full, including partial image overlaps.
++    if (aliases->HasImageInRange(sharp.base_address, size)) return ~u32{0};
++    if (*bounded < size) {
++        static std::unordered_set<u64> announced;
++        const u64 key = (stage.pgm_hash << 16) ^ (u64(static_cast<u32>(stage.l_stage)) << 8) ^ binding;
++        if (announced.insert(key).second) {
++            LOG_WARNING(Render_Vulkan, "Dreams proven write bound active: shader={:#x} binding={} declared={:#x} tracked={:#x} direct={}",
++                stage.pgm_hash, binding, size, *bounded, ProvenWritesRuntime::launch.direct);
++        }
++    }
++    return *bounded;
++}
++
+ static u32 DreamsLinearWriteSize(const Shader::Info& stage, u32 binding,
+                                  const Shader::BufferResource& desc, const AmdGpu::Buffer& sharp,
+-                                 u64 size) {
+-    if (!desc.is_written || desc.IsSpecial() || stage.l_stage != Shader::LogicalStage::Compute ||
+-        size != sharp.GetSize()) return ~u32{0};
++                                 u64 size, VideoCore::TextureCache* aliases = nullptr) {
++    if (!desc.is_written || desc.IsSpecial() || size != sharp.GetSize()) return ~u32{0};
++    if (stage.l_stage != Shader::LogicalStage::Compute)
++        return DreamsProvenWriteSize(stage, binding, desc, sharp, size, aliases);
+     if (const auto physics = DreamsPhysicsWrites::Bound(DreamsPhysicsWrites::current,
+             stage.pgm_hash, binding, desc.sharp_idx, sharp.GetStride(), size,
+             sharp.swizzle_enable || sharp.add_tid_enable || sharp.cache_swizzle || sharp.type != 0,
+@@ -27101,7 +27144,7 @@
+         binding, desc.sharp_idx, sharp.GetStride(), size,
+         sharp.swizzle_enable || sharp.add_tid_enable || sharp.cache_swizzle || sharp.type != 0,
+         desc.is_formatted);
+-    if (!bound) return ~u32{0};
++    if (!bound) return DreamsProvenWriteSize(stage, binding, desc, sharp, size, aliases);
+     if (*bound < size) {
+         static std::array<bool,6> announced{};
+         const size_t linear_index = stage.pgm_hash == 0xc4947c72 ? 0 : stage.pgm_hash == 0xd9a5eaaf ? 1 :
+@@ -27202,7 +27245,7 @@
+         const auto [vk_buffer, offset] =
+             buffer_cache.ObtainBuffer(refresh.sharp.base_address, refresh.size, desc.is_written,
+                                       desc.is_formatted, refresh.buffer_id,
+-                DreamsLinearWriteSize(*refresh.stage, refresh.descriptor_index, desc, refresh.sharp, refresh.size));
++                DreamsLinearWriteSize(*refresh.stage, refresh.descriptor_index, desc, refresh.sharp, refresh.size, &texture_cache));
+         const u32 offset_aligned = Common::AlignDown(offset, alignment);
+         const u32 adjust = offset - offset_aligned;
+         ASSERT(adjust % 4 == 0);
+@@ -27916,7 +27959,7 @@
+             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
+                 vsharp.base_address, size, desc.is_written,
+                 desc.is_formatted || dreams_image_buffer_alias, buffer_id,
+-                DreamsLinearWriteSize(stage, i, desc, vsharp, size));
++                DreamsLinearWriteSize(stage, i, desc, vsharp, size, &texture_cache));
+             if (desc.is_written) {
+                 DreamsWaitProbe::ObserveWriter(stage.pgm_hash, vsharp.base_address, size);
+             }

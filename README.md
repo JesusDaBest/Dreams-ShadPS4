@@ -2,7 +2,7 @@
 
 A Windows build of shadPS4 with fixes for **Dreams (CUSA04301)**.
 
-**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-physics-bounds-20261116/Dreams-graphical-launcher-physics-bounds-20261116.zip)**
+**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-proven-write-bounds-20261116/Dreams-graphical-launcher-proven-write-bounds-20261116.zip)**
 
 [Join the Discord for more](https://discord.gg/7jFj63vND)
 
@@ -31,4 +31,4 @@ Owner-reported result from the heaviest tested **Tren** scene: **20 render FPS /
 
 Approximate Intel/NVIDIA performance-tier equivalents at 20 W: **Core i7-12700H-class CPU + GeForce GTX 1650 Laptop-class GPU**. These are workload-dependent estimates, not measured Dreams results on those components. [CPU comparison](https://www.computerbase.de/forum/threads/onexplayer-superx-tablet-mit-amd-395.2264935/) · [GPU comparison](https://www.notebookcheck.net/Intel-Panther-Lake-Arc-B390-performance-and-efficiency-analysis-Intel-s-new-iGPU-trades-blows-with-the-Nvidia-GeForce-RTX-4050.1212582.0.html)
 
-[Latest release details](docs/updates/PHYSICS_BOUNDS_20261116.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
+[Latest release details](docs/updates/PROVEN_WRITE_BOUNDS_20261116.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
