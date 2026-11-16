@@ -1,0 +1,27 @@
+{
+  "core_sha256": "c4c68574b20ae75b439752b58a82c63a83d7f13993d8537e320749c273f8ba91",
+  "physics_bounds_kernels": [
+    "0ab70ff8",
+    "fd218d05"
+  ],
+  "private_live_activation_verified": true,
+  "captured_module_gpu_cases": 280,
+  "clean_guard_checks": 5211,
+  "earlier_user_observed_wall_dip_fps": 17,
+  "candidate_user_observed_wall_dip_fps": 24,
+  "controlled_active_physics_speedup_ratio_claimed": false,
+  "clean_binary_live_gameplay_tested": false,
+  "custom_debug_tools": false,
+  "shader_math_unchanged": true,
+  "source_patch_reconstruction_verified": true,
+  "user_saves_included": false,
+  "shader_cache_included": false,
+  "limitations": [
+    "The two wall breaks were separate runs, not a controlled speedup ratio.",
+    "Physics slowdown is reduced in that test, not eliminated generally.",
+    "The broader bounds audit is not included in this release."
+  ],
+  "direct_package_launcher_verified": true,
+  "qt_package_launcher_verified": true,
+  "real_profile_modified": false
+}

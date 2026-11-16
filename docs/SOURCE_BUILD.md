@@ -1,5 +1,9 @@
 # Build the Dreams source fixes
 
+## Current November 16 build
+
+Use the [complete source manifest](../builds/cusa04301-physics-bounds-20261116/source-manifest.json) and apply its patches in order through `dreams-gpu-proof-physics-bounds-20261116.patch`. The new patch reconstructs all changed files exactly. Full fresh-build reproducibility remains unestablished. [Update details](updates/PHYSICS_BOUNDS_20261116.md).
+
 ## Current November 2 build
 
 Use the [current source manifest](../builds/cusa04301-single-mip-write-20261102/source-manifest.json): check out public base `b84847d1b6ca14d349bf9e11e91d14ae182e008d`, initialize its submodules, and apply every listed patch through `dreams-single-mip-write-20261102.patch` in order. Both changed files reconstruct exactly; all earlier published fixes are retained. Full fresh-build reproducibility has not been established. See [the update record and remaining visual issue](updates/SINGLE_MIP_WRITE_20261102.md).

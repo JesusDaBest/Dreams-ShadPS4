@@ -84,3 +84,5 @@ builds/cusa04301-doc-prefix-20261112/** -text whitespace=blank-at-eol,blank-at-e
 builds/cusa04301-doc-prefix-20261112/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-ordered-guards-20261113/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-ordered-guards-20261113/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-physics-bounds-20261116/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-physics-bounds-20261116/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
