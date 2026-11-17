@@ -88,3 +88,5 @@ builds/cusa04301-physics-bounds-20261116/** -text whitespace=blank-at-eol,blank-
 builds/cusa04301-physics-bounds-20261116/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-proven-write-bounds-20261116/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-proven-write-bounds-20261116/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-physics-read-range-20261117/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-physics-read-range-20261117/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

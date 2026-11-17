@@ -1,0 +1,131 @@
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/e165_read_range.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <cstdint>
++#include <optional>
++#include <span>
++
++namespace Vulkan::DreamsE165Reads {
++
++struct Range {
++    std::uint64_t address{};
++    std::uint32_t size{};
++};
++
++// The two audited modules read four dwords per loop iteration, i in [0, flat[80]).
++// Their 32-bit byte offset is (i * 16 + 240). Reject wrapping input counts.
++// flat[80] is from the same stream-buffer copy bound by BindBuffers, not a CPU
++// estimate of a GPU-owned counter. No readback is required.
++inline std::optional<Range> Bound(std::span<const std::uint32_t> ud,
++                                  std::span<const std::uint32_t> flat) {
++    if (ud.size() < 2 || flat.size() < 81) {
++        return {};
++    }
++    const std::uint64_t count = flat[80];
++    if (count == 0) {
++        return Range{}; // The physical-load helper is never called.
++    }
++    constexpr std::uint64_t Offset = 240;
++    constexpr std::uint64_t OffsetLimit = std::uint64_t{1} << 32;
++    constexpr std::uint64_t AddressLimit = std::uint64_t{1} << 40;
++    // Larger tables retain the original
++    // scan instead of requesting a potentially very large joined allocation.
++    constexpr std::uint64_t MaxRecords = 65536; // At most one MiB of table data.
++    if (count > MaxRecords || count > (OffsetLimit - Offset) / 16) {
++        return {};
++    }
++    const std::uint64_t size = count * 16;
++    const std::uint64_t base = std::uint64_t{ud[0]} | (std::uint64_t{ud[1]} << 32);
++    if (!base || (base & 3) || base >= AddressLimit || Offset > AddressLimit - base ||
++        size > AddressLimit - base - Offset) {
++        return {};
++    }
++    return Range{base + Offset, static_cast<std::uint32_t>(size)};
++}
++} // namespace Vulkan::DreamsE165Reads
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,5 +1,6 @@
+ #include "proven_write_runtime.h"
+ #include "physics_write_bounds.h"
++#include "e165_read_range.h"
+ #include "gpu252_pass.h"
+ #include "gpu252_code.h"
+ #include "doc_lookback_pass.h"
+@@ -7717,6 +7718,33 @@
+     // full DMA mode can also turn formerly flattened reads into physical reads.
+     // Accept only the complete, audited compiled modules. Others retain the
+     // mapped-buffer path. No cached raw module pointer survives cache replacement.
++    if (shader.pgm_hash == 0xe165304b) {
++        // Complete physical read set of the two captured compute permutations.
++        // Keep every other DMA shader/version on its existing route.
++        if (shader.l_stage != Shader::LogicalStage::Compute ||
++            shader.uses_ordered_count || shader.ud_mask.mask != 3 || shader.buffers.size() != 11 ||
++            shader.buffers[8].buffer_type != Shader::BufferType::Flatbuf ||
++            shader.buffers[8].is_written) {
++            return {};
++        }
++        const bool module_matches =
++            (code.size_bytes() == 90340 &&
++             XXH3_64bits(code.data(), code.size_bytes()) == 0xb556d23dd3fe9845ULL) ||
++            (code.size_bytes() == 90612 &&
++             XXH3_64bits(code.data(), code.size_bytes()) == 0x8fc011cf8a62c29bULL);
++        if (!module_matches) {
++            return {};
++        }
++        const auto range = DreamsE165Reads::Bound(ud, flat);
++        if (!range) {
++            return {};
++        }
++        DreamsDynamicReads reads;
++        if (range->size) {
++            reads.push_back({range->address, range->size});
++        }
++        return reads;
++    }
+     u64 expected_hash{};
+     size_t expected_bytes{};
+     switch (shader.pgm_hash) {
+@@ -18926,6 +18954,10 @@
+             pipeline_cache.GetCurrentShaderSpirv(Shader::LogicalStage::Compute),
+             std::span<const u8>{reinterpret_cast<const u8*>(&push_data),sizeof(push_data)},
+             std::array<u32,3>{cs_program.dim_x,cs_program.dim_y,cs_program.dim_z},0,vk::DescriptorBufferInfo{}) : nullptr;
++    if (cs.pgm_hash == 0xe165304b) {
++        FinalizeDreamsDynamicReads(pipeline, *this, buffer_cache, buffer_barriers,
++            std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()});
++    }
+     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+     if (dreams_native_volume_pass && cs.pgm_hash == Shader::DreamsCompat::QueueProducerShader &&
+         Common::ElfInfo::Instance().GameSerial() == "CUSA04301") {
+@@ -25753,6 +25785,10 @@
+             pipeline_cache.GetCurrentShaderSpirv(Shader::LogicalStage::Compute),
+             std::span<const u8>{reinterpret_cast<const u8*>(&push_data),sizeof(push_data)},
+             std::array<u32,3>{},args_address,vk::DescriptorBufferInfo{buffer->Handle(),base,12}) : nullptr;
++    if (cs.pgm_hash == 0xe165304b) {
++        FinalizeDreamsDynamicReads(pipeline, *this, buffer_cache, buffer_barriers,
++            std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()});
++    }
+     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+     if (dreams_native_volume_pass && dreams_native_volume_pass->Pending() &&
+         cs.pgm_hash == Shader::DreamsCompat::TraversalShader && cs.buffers.size()>11 &&
+@@ -27081,6 +27117,18 @@
+         } else {
+             for (const auto& read : dynamic_reads) {
+                 buffer_cache.SynchronizeBuffersInRange(read.address, read.size);
++            }
++            if (pipeline->IsCompute() &&
++                pipeline->GetStage(Shader::LogicalStage::Compute).pgm_hash == 0xe165304b) {
++                static std::array<bool, 2> announced{};
++                const size_t state = !dynamic_reads.empty();
++                if (!announced[state]) {
++                    announced[state] = true;
++                    LOG_WARNING(Render_Vulkan,
++                        "Dreams e165 exact DMA reads active: records={} ranges={} full_scan=false",
++                        pipeline->GetStage(Shader::LogicalStage::Compute).flattened_ud_buf[80],
++                        dynamic_reads.size());
++                }
+             }
+         }
+         fault_process_pending = true;

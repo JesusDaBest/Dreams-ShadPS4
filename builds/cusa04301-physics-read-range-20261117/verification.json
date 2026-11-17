@@ -1,0 +1,19 @@
+{
+  "core_sha256": "346a2ff822bd96812bc06f75c16395d607748f29c69ba70190a5506a29ab7488",
+  "shader": "e165304b",
+  "audited_compute_modules": 2,
+  "private_activation_observed": true,
+  "private_observed_record_count": 6,
+  "address_guard_checks": 389917,
+  "gpu_dependency_positive_cases": 300,
+  "detected_missing_dependency_controls": 12,
+  "source_overlay_file_hashes_verified": 73,
+  "staged_launcher_routes_verified": [
+    "direct",
+    "Qt"
+  ],
+  "existing_profile_hash_verified": true,
+  "clean_gameplay_retested": false,
+  "full_game_shader_input_replay": false,
+  "measured_wall_break_fps_improvement": false
+}

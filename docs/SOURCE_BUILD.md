@@ -1,6 +1,10 @@
 # Build the Dreams source fixes
 
-## Current November 16 guarded write-bounds build
+## November 17 physics read-range build
+
+Apply the patches in the [source manifest](../builds/cusa04301-physics-read-range-20261117/source-manifest.json) to the base commit in that manifest. The last patch is [`dreams-physics-read-range-20261117.patch`](../patches/dreams-physics-read-range-20261117.patch). [Update details](updates/PHYSICS_READ_RANGE_20261117.md).
+
+## November 16 guarded write-bounds build
 
 Use the [complete source manifest](../builds/cusa04301-proven-write-bounds-20261116/source-manifest.json) and apply its patches in order through `dreams-proven-write-bounds-20261116.patch`. The new patch reconstructs all changed files exactly. Full fresh-build reproducibility remains unestablished. [Update details](updates/PROVEN_WRITE_BOUNDS_20261116.md).
 
