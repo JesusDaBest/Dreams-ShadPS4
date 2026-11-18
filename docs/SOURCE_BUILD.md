@@ -1,5 +1,9 @@
 # Build the Dreams source fixes
 
+## November 18 display-wait build
+
+Apply the patches in the [source manifest](../builds/cusa04301-display-wait-20261118/source-manifest.json). The last patch is [`dreams-display-wait-20261118.patch`](../patches/dreams-display-wait-20261118.patch). [Update details](updates/DISPLAY_WAIT_20261118.md).
+
 ## November 17 physics read-range build
 
 Apply the patches in the [source manifest](../builds/cusa04301-physics-read-range-20261117/source-manifest.json) to the base commit in that manifest. The last patch is [`dreams-physics-read-range-20261117.patch`](../patches/dreams-physics-read-range-20261117.patch). [Update details](updates/PHYSICS_READ_RANGE_20261117.md).

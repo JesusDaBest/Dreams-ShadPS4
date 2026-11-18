@@ -1,0 +1,24 @@
+{
+  "core_sha256": "cb3f5a07d4fc9220df5a9eacbc0a7e491f80bc2c7ce1799a491829c7b48522c8",
+  "title": "CUSA04301",
+  "previous_link_inputs_verified": 515,
+  "rebuilt_units": [
+    "liverpool.cpp",
+    "driver.cpp"
+  ],
+  "host_wait_test_repetitions_per_scenario": 200,
+  "private_wall_break_gameplay_fps_first_two_seconds": {
+    "before": 19.624704874356027,
+    "after": 28.785675597568606
+  },
+  "private_tren_starter_set_gameplay_fps": {
+    "before": 30.00766721202075,
+    "after": 29.99623538033075
+  },
+  "source_overlay_file_hashes_verified": 76,
+  "staged_launcher_routes_verified": [
+    "direct",
+    "Qt"
+  ],
+  "clean_gameplay_retested": false
+}

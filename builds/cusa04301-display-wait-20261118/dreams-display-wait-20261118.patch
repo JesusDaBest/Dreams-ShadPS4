@@ -1,0 +1,156 @@
+--- a/src/core/libraries/videoout/driver.cpp
++++ b/src/core/libraries/videoout/driver.cpp
+@@ -10,6 +10,7 @@
+ #include "core/libraries/videoout/driver.h"
+ #include "core/libraries/videoout/videoout_error.h"
+ #include "imgui/renderer/imgui_core.h"
++#include "video_core/amdgpu/dreams_display_wait.h"
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/renderer_vulkan/vk_presenter.h"
+ 
+@@ -17,6 +18,23 @@
+ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
+ 
+ namespace Libraries::VideoOut {
++
++static void NotifyDisplayLabelChanged(VideoOutPort& port) {
++    // The display producer has already released vo_mutex. The ordinary host
++    // command queue supplies the same wake-up as a real cache request.
++    if (DreamsDisplayWait::waiting_port.load() == &port) {
++        liverpool->SendCommand([] {});
++    }
++}
++
++static void ClearDisplayLabel(VideoOutPort& port, s32 index) {
++    {
++        std::scoped_lock lock{port.vo_mutex};
++        port.buffer_labels[index] = 0;
++        port.vo_cv.notify_one();
++    }
++    NotifyDisplayLabelChanged(port);
++}
+ 
+ constexpr static bool Is32BppPixelFormat(PixelFormat format) {
+     switch (format) {
+@@ -68,7 +86,12 @@
+     main_port.prev_index = -1;
+ 
+     // Clear port information
+-    std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
++    {
++        std::scoped_lock label_lock{main_port.vo_mutex};
++        main_port.buffer_labels.fill(0);
++        main_port.vo_cv.notify_one();
++    }
++    NotifyDisplayLabelChanged(main_port);
+     std::memset(main_port.groups.data(), 0, sizeof(main_port.groups));
+     std::memset(&main_port.vblank_status, 0, sizeof(main_port.vblank_status));
+     main_port.flip_status = FlipStatus{};
+@@ -166,8 +189,7 @@
+         };
+ 
+         // Reset flip label also when registering buffer
+-        port->buffer_labels[startIndex + i] = 0;
+-        port->SignalVoLabel();
++        ClearDisplayLabel(*port, startIndex + i);
+ 
+         presenter->RegisterVideoOutSurface(group, address);
+         LOG_INFO(Lib_VideoOut, "buffers[{}] = {:#x}", i + startIndex, address);
+@@ -270,8 +292,7 @@
+ 
+     // Reset prev flip label
+     if (port->prev_index != -1) {
+-        port->buffer_labels[port->prev_index] = 0;
+-        port->SignalVoLabel();
++        ClearDisplayLabel(*port, port->prev_index);
+     }
+     // save to prev buf index
+     port->prev_index = req.index;
+--- /dev/null
++++ b/src/video_core/amdgpu/dreams_display_wait.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++
++namespace DreamsDisplayWait {
++
++// shadPS4 has one Liverpool and one VideoOut port per process. Only the
++// command processor publishes a registration. Producers compare its identity.
++inline std::atomic<const void*> waiting_port{};
++
++class Registration {
++public:
++    explicit Registration(const void* port) { waiting_port.store(port); }
++    ~Registration() { waiting_port.store(nullptr); }
++    Registration(const Registration&) = delete;
++    Registration& operator=(const Registration&) = delete;
++};
++
++template <typename Ready, typename HasWork>
++bool WaitForLabelOrCommands(std::mutex& submit_mutex, std::condition_variable_any& submit_cv,
++                            const void* port, Ready&& label_ready, HasWork&& has_work) {
++    // Publish before inspecting the label. A concurrent release either happens
++    // before the first check or queues a notification under submit_mutex.
++    const Registration registration{port};
++    std::unique_lock lock{submit_mutex};
++    bool ready{};
++    submit_cv.wait(lock, [&] {
++        ready = label_ready();
++        return ready || has_work();
++    });
++    return ready;
++}
++
++} // namespace DreamsDisplayWait
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -20,6 +20,7 @@
+ #include "core/memory.h"
+ #include "core/platform.h"
+ #include "video_core/amdgpu/liverpool.h"
++#include "video_core/amdgpu/dreams_display_wait.h"
+ #include "video_core/amdgpu/pm4_cmds.h"
+ #include "video_core/amdgpu/queue_packet_budget.h"
+ #include "video_core/renderdoc.h"
+@@ -1150,7 +1151,37 @@
+                 // there are no other submits to yield to we can sleep the thread
+                 // instead and allow other tasks to run.
+                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+-                if (vo_port->IsVoLabel(wait_addr) &&
++                const bool is_display_label = vo_port->IsVoLabel(wait_addr);
++                if (is_display_label && Common::ElfInfo::Instance().GameSerial() == "CUSA04301") {
++                    auto& graphics = mapped_queues[GfxQueueId];
++                    const auto label_ready = [&] {
++                        std::scoped_lock lock{vo_port->vo_mutex};
++                        return wait_reg_mem->Test(regs.reg_array);
++                    };
++                    for (;;) {
++                        if (label_ready()) {
++                            break;
++                        }
++                        size_t graphics_submits;
++                        {
++                            std::scoped_lock lock{graphics.m_access};
++                            graphics_submits = graphics.submits.size();
++                        }
++                        if (num_submits == graphics_submits) {
++                            const bool ready = DreamsDisplayWait::WaitForLabelOrCommands(
++                                submit_mutex, submit_cv, vo_port, label_ready,
++                                [&] { return num_commands || num_submits != graphics_submits; });
++                            if (ready) {
++                                break;
++                            }
++                        }
++                        // Resume the same packet after servicing host commands or
++                        // the new compute submission. The label test still gates it.
++                        YIELD_GFX();
++                    }
++                    break;
++                }
++                if (is_display_label &&
+                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                     break;
