@@ -1,0 +1,92 @@
+diff --git a/externals/cmake-modules/GetGitRevisionDescription.cmake b/externals/cmake-modules/GetGitRevisionDescription.cmake
+index 087f5de..8366303 100644
+--- a/externals/cmake-modules/GetGitRevisionDescription.cmake
++++ b/externals/cmake-modules/GetGitRevisionDescription.cmake
+@@ -58,7 +58,11 @@ function(get_git_head_revision _refspecvar _hashvar)
+ 		file(READ ${GIT_DIR} submodule)
+ 		string(REGEX REPLACE "gitdir: (.*)\n$" "\\1" GIT_DIR_RELATIVE ${submodule})
+ 		get_filename_component(SUBMODULE_DIR ${GIT_DIR} PATH)
+-		get_filename_component(GIT_DIR ${SUBMODULE_DIR}/${GIT_DIR_RELATIVE} ABSOLUTE)
++		if(IS_ABSOLUTE "${GIT_DIR_RELATIVE}")
++			set(GIT_DIR "${GIT_DIR_RELATIVE}")
++		else()
++			get_filename_component(GIT_DIR "${SUBMODULE_DIR}/${GIT_DIR_RELATIVE}" ABSOLUTE)
++		endif()
+ 	endif()
+ 	set(GIT_DATA "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/git-data")
+ 	if(NOT EXISTS "${GIT_DATA}")
+diff --git a/src/ipc/ipc_client.cpp b/src/ipc/ipc_client.cpp
+index eb5a143..6895e8d 100644
+--- a/src/ipc/ipc_client.cpp
++++ b/src/ipc/ipc_client.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "common/logging/log.h"
+ #include "ipc_client.h"
++#include "qt_gui/gui_settings.h"
+ 
+ IpcClient::IpcClient(QObject* parent, bool log_to_terminal)
+     : QObject(parent), m_log_to_terminal(log_to_terminal) {}
+@@ -33,6 +34,11 @@ void IpcClient::startEmulator(const QFileInfo& exe, const QStringList& args, con
+     if (!disable_ipc) {
+         env.insert("SHADPS4_ENABLE_IPC", "true");
+     }
++    if (gui::IsDreamsLauncher(exe)) {
++        const gui_settings settings;
++        const bool force60Hz = settings.GetValue(gui::dreams_force60HzRendering).toBool();
++        env.insert("SHADPS4_QT_DREAMS_FORCE_60HZ_RENDERING", force60Hz ? "1" : "0");
++    }
+     process->setProcessEnvironment(env);
+ 
+     process->setWorkingDirectory(workDir.isEmpty() ? exe.absolutePath() : workDir);
+diff --git a/src/qt_gui/gui_context_menus.h b/src/qt_gui/gui_context_menus.h
+index 77a26a2..1ee2d74 100644
+--- a/src/qt_gui/gui_context_menus.h
++++ b/src/qt_gui/gui_context_menus.h
+@@ -120,6 +120,19 @@ public:
+                                     (m_games[itemID].serial + ".json")))
+             gameConfigMenu->addAction(&gameConfigDelete);
+ 
++        const QFileInfo selectedVersion(m_gui_settings->GetValue(gui::vm_versionSelected).toString());
++        if (m_games[itemID].serial == "CUSA04301" && gui::IsDreamsLauncher(selectedVersion)) {
++            gameConfigMenu->addSeparator();
++            gameConfigMenu->setToolTipsVisible(true);
++            auto* force60Hz = gameConfigMenu->addAction(tr("Force 60 Hz Rendering"));
++            force60Hz->setCheckable(true);
++            force60Hz->setChecked(m_gui_settings->GetValue(gui::dreams_force60HzRendering).toBool());
++            force60Hz->setToolTip(tr("Applies the next time you launch Dreams."));
++            connect(force60Hz, &QAction::toggled, gameConfigMenu, [m_gui_settings](bool enabled) {
++                m_gui_settings->SetValue(gui::dreams_force60HzRendering, enabled, true);
++            });
++        }
++
+         menu.addMenu(gameConfigMenu);
+ 
+         QString serialStr = QString::fromStdString(m_games[itemID].serial);
+diff --git a/src/qt_gui/gui_settings.h b/src/qt_gui/gui_settings.h
+index 66e2905..8b9c2b5 100644
+--- a/src/qt_gui/gui_settings.h
++++ b/src/qt_gui/gui_settings.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <QFileInfo>
+ #include <QWindow>
+ #include "settings.h"
+ 
+@@ -74,6 +75,14 @@ const gui_value vm_versionSelected = gui_value(version_manager, "versionSelected
+ const gui_value vm_showChangeLog = gui_value(version_manager, "showChangeLog", "");
+ const gui_value vm_checkOnStartup = gui_value(version_manager, "checkOnStartup", "");
+ 
++const gui_value dreams_force60HzRendering = gui_value("dreams", "force60HzRendering", false);
++
++inline bool IsDreamsLauncher(const QFileInfo& executable) {
++    const auto name = executable.fileName();
++    return name.compare(QStringLiteral("DreamsLauncher.exe"), Qt::CaseInsensitive) == 0 ||
++           name.compare(QStringLiteral("DreamsCore.exe"), Qt::CaseInsensitive) == 0;
++}
++
+ } // namespace gui
+ 
+ class gui_settings : public settings {
