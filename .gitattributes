@@ -94,3 +94,5 @@ builds/cusa04301-display-wait-20261118/** -text whitespace=blank-at-eol,blank-at
 builds/cusa04301-display-wait-20261118/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 builds/cusa04301-qt-render-mode-20261118/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 builds/cusa04301-qt-render-mode-20261118/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+builds/cusa04301-gameplay-fixes-20261118/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+builds/cusa04301-gameplay-fixes-20261118/*.patch -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

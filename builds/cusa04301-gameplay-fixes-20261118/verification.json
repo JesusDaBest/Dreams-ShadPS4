@@ -1,0 +1,39 @@
+{
+  "core_sha256": "4a280f20b5b55deb126b2922ff0ef50b2a9ebcdefa23db00ff47efac9222a537",
+  "title": "CUSA04301",
+  "clean_boot_verified": true,
+  "clean_visual_checks": [
+    "Native intro video",
+    "Homespace and DreamSurfing card",
+    "Ancient Dangers Chapter I portrait and health",
+    "Fern dialogue pages 1 and 2"
+  ],
+  "staged_launcher_routes_verified": [
+    "direct",
+    "Qt"
+  ],
+  "qt_render_mode": [
+    "default off",
+    "on",
+    "retained on next launch",
+    "off"
+  ],
+  "private_gameplay_measurements": {
+    "tren_first_card_render_fps": [
+      15.44,
+      29.76
+    ],
+    "dreamsurfing_card_render_fps": [
+      19.87,
+      29.75
+    ],
+    "ancient_dangers_render_fps_at_original_dip": [
+      19.85,
+      29.76
+    ],
+    "intro_frames_delivered": 372,
+    "intro_frames_decoded": 384,
+    "intro_longest_delivery_gap_ms": 177
+  },
+  "source_overlay_file_hashes_verified": 82
+}

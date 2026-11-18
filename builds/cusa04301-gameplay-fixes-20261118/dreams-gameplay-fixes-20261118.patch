@@ -1,0 +1,808 @@
+--- a/src/core/libraries/avplayer/avplayer_source.cpp
++++ b/src/core/libraries/avplayer/avplayer_source.cpp
+@@ -26,6 +26,7 @@
+ #include <cstdlib>
+ 
+ #include "common/support/avdec.h"
++#include "video_core/amdgpu/dreams_logo_playback.h"
+ 
+ namespace Libraries::AvPlayer {
+ 
+@@ -415,7 +416,8 @@
+ 
+     const auto current_time = CurrentTime();
+     const auto& new_frame = m_video_frames.Front();
+-    if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
++    const bool timed_playback = m_state.GetSyncMode() == AvPlayerAvSyncMode::Default;
++    if (timed_playback) {
+         if (new_frame.info.timestamp > current_time) {
+             return false;
+         }
+@@ -428,6 +430,23 @@
+     }
+ 
+     auto frame = m_video_frames.Pop();
++    if (m_use_realtime_clock && timed_playback) {
++        // Playback can catch up by skipping older frames only while another ready
++        // frame can replace them. A decode worker cannot make this decision.
++        const auto pending = m_video_frames.Size();
++        for (size_t i = 0; i < pending; ++i) {
++            if (!m_video_frames.Size() || m_video_frames.Front().info.timestamp > current_time) {
++                break;
++            }
++            auto next = m_video_frames.Pop();
++            if (!next) {
++                break;
++            }
++            m_video_buffers.Push(std::move(frame->buffer));
++            m_video_buffers_cv.Notify();
++            frame = std::move(next);
++        }
++    }
+     video_info = frame->info;
+ 
+     m_current_video_frame = std::move(frame);
+@@ -754,6 +773,7 @@
+ }
+ 
+ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
++    const DreamsLogoGraphics::PlaybackScope intro_scope{m_use_realtime_clock};
+     using namespace std::chrono;
+     Common::SetCurrentThreadName("shadPS4:AvVideoDecoder");
+ 
+@@ -777,7 +797,7 @@
+             return;
+         }
+         while (res >= 0) {
+-            if (!m_use_realtime_clock && m_video_buffers.Size() == 0 &&
++            if (m_video_buffers.Size() == 0 &&
+                 !m_video_buffers_cv.Wait(stop, [this] { return m_video_buffers.Size() != 0; })) {
+                 break;
+             }
+@@ -796,23 +816,7 @@
+                 }
+             } else {
+                 auto buffer = m_video_buffers.Pop();
+-                while (!buffer.has_value() && m_use_realtime_clock &&
+-                       !stop.stop_requested()) {
+-                    if (m_video_frames.Size() > 1 &&
+-                        m_video_frames.Front().info.timestamp <= CurrentTime()) {
+-                        auto stale_frame = m_video_frames.Pop();
+-                        buffer.emplace(std::move(stale_frame->buffer));
+-                        break;
+-                    }
+-                    m_video_buffers_cv.WaitFor(std::chrono::milliseconds(2), [this, &stop] {
+-                        return m_video_buffers.Size() != 0 || stop.stop_requested();
+-                    });
+-                    buffer = m_video_buffers.Pop();
+-                }
+                 if (!buffer.has_value()) {
+-                    if (m_use_realtime_clock) {
+-                        continue;
+-                    }
+                     break;
+                 }
+                 if (up_frame->format != AV_PIX_FMT_NV12) {
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -15,6 +15,72 @@
+ #include "core/memory.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#include "core/dreams_host_upload.h"
++
++namespace DreamsHostUpload {
++
++// Uploads opted in by BufferCache hold the affected page tracker locks. The caller also
++// holds MemoryManager's mapping lock, so its read-only Windows views stay readable.
++// Let the original thread handle faults for other views, where emulation may need to wait.
++static bool AreReadOnlyViews(const std::uint8_t* source, std::size_t bytes) {
++    auto address = reinterpret_cast<std::uintptr_t>(source);
++    while (bytes) {
++        MEMORY_BASIC_INFORMATION view{};
++        if (VirtualQuery(reinterpret_cast<const void*>(address), &view, sizeof(view)) != sizeof(view) ||
++            view.State != MEM_COMMIT || view.Protect != PAGE_READONLY) {
++            return false;
++        }
++        const auto begin = reinterpret_cast<std::uintptr_t>(view.BaseAddress);
++        if (address < begin || address - begin >= view.RegionSize) {
++            return false;
++        }
++        const auto remaining = view.RegionSize - (address - begin);
++        if (bytes <= remaining) {
++            return true;
++        }
++        address += remaining;
++        bytes -= remaining;
++    }
++    return true;
++}
++
++struct CopyWork {
++    std::uint8_t* destination;
++    const std::uint8_t* source;
++    std::size_t bytes;
++
++    static void CALLBACK Run(PTP_CALLBACK_INSTANCE, void* context, PTP_WORK) {
++        const auto& copy = *static_cast<const CopyWork*>(context);
++        std::memcpy(copy.destination, copy.source, copy.bytes);
++    }
++};
++
++static bool TryParallelCopy(std::uint8_t* destination, const std::uint8_t* source,
++                            std::size_t size) {
++    if (!allow_parallel_copy || size < 4 * 1024 * 1024) {
++        return false;
++    }
++    if (!AreReadOnlyViews(source, size)) {
++        return false;
++    }
++    const std::size_t first = (size / 2) & ~std::size_t{63};
++    CopyWork second{destination + first, source + first, size - first};
++    const auto work = CreateThreadpoolWork(CopyWork::Run, &second, nullptr);
++    if (!work) {
++        return false;
++    }
++    SubmitThreadpoolWork(work);
++    std::memcpy(destination, source, first);
++    WaitForThreadpoolWorkCallbacks(work, FALSE);
++    CloseThreadpoolWork(work);
++    return true;
++}
++
++} // namespace DreamsHostUpload
++#endif
++
+ namespace Core {
+ 
+ MemoryManager::MemoryManager() {
+@@ -155,7 +221,19 @@
+     while (size) {
+         u64 copy_size = std::min<u64>(vma->second.size - (virtual_addr - vma->first), size);
+         if (vma->second.IsMapped()) {
++#ifdef _WIN32
++            const auto* source = std::bit_cast<const u8*>(virtual_addr);
++            auto* readonly = DreamsStagedUpload::readable_copy;
++            if (readonly && !DreamsHostUpload::AreReadOnlyViews(source, copy_size)) {
++                *readonly = false;
++                return;
++            }
++            if (!DreamsHostUpload::TryParallelCopy(dest, source, copy_size)) {
++                std::memcpy(dest, source, copy_size);
++            }
++#else
+             std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), copy_size);
++#endif
+         } else {
+             std::memset(dest, 0, copy_size);
+         }
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -21,6 +21,7 @@
+ #include "core/platform.h"
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/amdgpu/dreams_display_wait.h"
++#include "video_core/amdgpu/dreams_logo_playback.h"
+ #include "video_core/amdgpu/pm4_cmds.h"
+ #include "video_core/amdgpu/queue_packet_budget.h"
+ #include "video_core/renderdoc.h"
+@@ -1329,6 +1330,9 @@
+ 
+         const PM4ItOpcode opcode = header->type3.opcode;
+         const auto packet_start = std::chrono::steady_clock::now();
++        const bool logo_dispatch =
++            (opcode == PM4ItOpcode::DispatchDirect || opcode == PM4ItOpcode::DispatchIndirect) &&
++            DreamsLogoGraphics::active_decoders.load(std::memory_order_relaxed) != 0;
+ 
+         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+         switch (opcode) {
+@@ -1622,6 +1626,18 @@
+             *queue.read_addr += next_dw_off;
+             *queue.read_addr %= queue.ring_size_dw;
+         }
++        if (logo_dispatch && !acb.empty() && num_submits.load(std::memory_order_relaxed) > 1 &&
++            std::chrono::steady_clock::now() - packet_start >= std::chrono::milliseconds{2}) {
++            auto& graphics = mapped_queues[GfxQueueId];
++            const bool graphics_ready = [&] {
++                std::scoped_lock lock{graphics.m_access};
++                return !graphics.submits.empty() &&
++                       !graphics.submits.front().promise().IsGpuWaitPending();
++            }();
++            if (graphics_ready) {
++                YIELD_ASC(vqid);
++            }
++        }
+     }
+ 
+     FIBER_EXIT;
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -18958,6 +18958,41 @@
+         FinalizeDreamsDynamicReads(pipeline, *this, buffer_cache, buffer_barriers,
+             std::span<const vk::DescriptorBufferInfo>{buffer_infos.data(), buffer_infos.size()});
+     }
++    // UIComp uses CB_CMASK to skip fast-cleared tiles. The host attachment is
++    // already materialized, while the emulated guest mask never sees Vulkan's draws.
++    // Supply fully materialized coverage for the verified attachment and byte layout.
++    if (cs.pgm_hash == 0x5e949cd5 && Common::ElfInfo::Instance().GameSerial() == "CUSA04301" &&
++        cs.buffers.size() == 2 && cs.buffers[0].sharp_idx == 101 && !cs.buffers[0].is_written &&
++        buffer_infos.size() == 2 && cs.images.size() == 7 && cs.images[3].sharp_idx == 67 &&
++        image_bindings.size() == 7 && image_bindings[0].first &&
++        image_bindings[3].first && image_bindings[0].first != image_bindings[3].first) {
++        constexpr u32 MaskBytes = 20 * 1024;
++        const auto mask = cs.buffers[0].GetSharp(cs);
++        const auto& info = texture_cache.GetImage(image_bindings[3].first).info;
++        const auto& flat = cs.flattened_ud_buf;
++        auto& bound = buffer_infos[0];
++        if (flat.size() > 88 && flat[21] == 1920 && flat[22] == 1080 && flat[87] == 240 &&
++            (flat[88] & 0x180) == 0x80 && cs_program.dim_x == 240 && cs_program.dim_y == 135 &&
++            cs_program.dim_z == 1 && !cs_program.start_x && !cs_program.start_y &&
++            !cs_program.start_z && cs_program.num_thread_x.full == 8 &&
++            cs_program.num_thread_y.full == 8 && cs_program.num_thread_z.full == 1 &&
++            mask.base_address && mask.base_address == info.meta_info.cmask_addr &&
++            mask.GetSize() == MaskBytes && bound.buffer && bound.range == MaskBytes &&
++            !push_data.buf_offsets[0] && info.size.width == 1920 && info.size.height == 1080 &&
++            info.num_samples == 1 && info.resources.levels == 1 && info.resources.layers == 1 &&
++            info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
++            static constexpr auto Materialized = [] {
++                std::array<u8, MaskBytes> data{};
++                data.fill(0xff);
++                return data;
++            }();
++            auto& stream = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
++            const u64 offset = stream.Copy(Materialized.data(), MaskBytes,
++                                           instance.StorageMinAlignment());
++            bound = vk::DescriptorBufferInfo{stream.Handle(), offset, MaskBytes};
++        }
++    }
++
+     pipeline->BindResources(set_writes, buffer_barriers, push_data);
+     if (dreams_native_volume_pass && cs.pgm_hash == Shader::DreamsCompat::QueueProducerShader &&
+         Common::ElfInfo::Instance().GameSerial() == "CUSA04301") {
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -14,6 +14,7 @@
+ #include "core/memory.h"
+ #include "video_core/amdgpu/liverpool.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
++#include "video_core/buffer_cache/dreams_readback_wait.h"
+ #include "video_core/buffer_cache/memory_tracker.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+@@ -22,6 +23,10 @@
+ #include "video_core/renderer_vulkan/dreams_readback_gpu_span.h"
+ #include "video_core/texture_cache/texture_cache.h"
+ #include <vk_mem_alloc.h>
++
++#ifdef _WIN32
++#include "video_core/buffer_cache/dreams_staged_upload.h"
++#endif
+ 
+ namespace VideoCore {
+ 
+@@ -176,6 +181,12 @@
+     Vulkan::DreamsWaitProbe::Scope readback_probe{"readback-request", caller};
+     const Vulkan::DreamsReadbackGpuSpan::Request gpu_span_request{device_addr, size, is_write};
+     u64 submitted_tick{};
++    VAddr staged_start{};
++    u64 staged_size{};
++    const auto counter_mode = DreamsGdsCounterWait::mode.load(std::memory_order_relaxed);
++    const auto* rule = DreamsGdsCounterWait::Request(device_addr, size, is_write, counter_mode);
++    const bool check_known_read = rule && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
++    const auto requester = std::this_thread::get_id();
+     const auto read_memory = [&](bool may_defer) {
+         const Vulkan::DreamsReadbackGpuSpan::RequestScope gpu_span_request_scope{gpu_span_request};
+         Vulkan::DreamsWaitProbe::state.request_address = device_addr;
+@@ -196,7 +207,8 @@
+         if (DreamsCpuReadbackPrefetchEnabled() &&
+             (!is_write || DreamsCpuWriteReadbackPrefetchEnabled())) {
+             RememberCpuReadback(window_start, window_end - window_start);
+-            if (may_defer &&
++            const bool use_known_read = check_known_read && requester != std::this_thread::get_id();
++            if ((may_defer || (!submitted_tick && use_known_read)) &&
+                 !IsRegionCpuModified(window_start, window_end - window_start) &&
+                 !texture_cache.HasImageInRange(window_start, window_end - window_start)) {
+                 for (const auto& slot : std::span{cpu_readbacks}.first(DreamsCpuReadbackSlotCount())) {
+@@ -205,6 +217,14 @@
+                         slot.tick < scheduler.CurrentTick() && !scheduler.IsFree(slot.tick)) {
+                         // Return only a submitted timeline value. No staging pointer or cache
+                         // reference escapes this command, and guest pages remain protected.
++                        if (!may_defer) {
++                            if (!DreamsGdsCounterWait::Accept(*rule, counter_mode, slot.address,
++                                    slot.size, slot.tick, scheduler.CurrentTick(), slot.copies)) {
++                                continue;
++                            }
++                            staged_start = slot.address;
++                            staged_size = slot.size;
++                        }
+                         submitted_tick = slot.tick;
+                         return;
+                     }
+@@ -227,9 +247,28 @@
+     if (submitted_tick) {
+         // MasterSemaphore's wait is thread-safe and never submits command buffers. Let the
+         // requesting CPU thread wait while the command processor keeps interpreting work.
+-        scheduler.GetMasterSemaphore()->Wait(submitted_tick);
+-        submitted_tick = 0;
++        const u64 waited_tick = submitted_tick;
++        scheduler.GetMasterSemaphore()->Wait(waited_tick);
+         liverpool->SendCommand<true>([&] {
++            if (staged_size) {
++                const auto slots = std::span{cpu_readbacks}.first(DreamsCpuReadbackSlotCount());
++                const bool same_version = std::ranges::any_of(slots, [&](const auto& slot) {
++                    return slot.valid && slot.address == staged_start && slot.size == staged_size &&
++                           slot.tick == waited_tick && DreamsGdsCounterWait::Accept(*rule, counter_mode,
++                               slot.address, slot.size, slot.tick, scheduler.CurrentTick(), slot.copies);
++                });
++                if (same_version && scheduler.IsFree(waited_tick) &&
++                    TryReadPrefetchedMemory(staged_start, staged_size)) {
++                    return;
++                }
++                if (same_version && IsRegionGpuModifiedExact(device_addr, size) &&
++                    !IsRegionCpuModified(staged_start, staged_size) &&
++                    !texture_cache.HasImageInRange(staged_start, staged_size)) {
++                    const auto fallback = rule == &DreamsGdsCounterWait::SceneList ? 3u :
++                                          counter_mode >= 2 ? 1u : 0u;
++                    DreamsGdsCounterWait::mode.store(fallback, std::memory_order_relaxed);
++                }
++            }
+             // Resolve the buffer and snapshot again on the GPU thread. A newer GPU write,
+             // CPU upload, image alias, eviction or another reader may have invalidated it.
+             // Retry once through the normal path rather than returning stale bytes or
+@@ -1173,6 +1212,51 @@
+     size_t total_size_bytes = 0;
+     VAddr buffer_start = buffer.CpuAddr();
+     vk::Buffer src_buffer = VK_NULL_HANDLE;
++#ifdef _WIN32
++    const bool is_dreams = Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
++    if (is_written && size >= 16_MB && size <= 128_MB &&
++        !(device_addr % TRACKER_BYTES_PER_PAGE) && !(size % TRACKER_BYTES_PER_PAGE) &&
++        is_dreams) {
++        DreamsStagedUpload::CopyBatch batch{*memory, device_addr};
++        u64 staging_offset{};
++        const auto plan = [&](unsigned parts) {
++            if (!batch.Prepare(parts)) return false;
++            const auto [data, offset] = staging_buffer.Map(size, 0, false);
++            if (!data) return false;
++            staging_offset = offset;
++            batch.Start(data);
++            return true;
++        };
++        const auto part_ready = [&](VAddr part_address, u64 bytes) {
++            batch.Enqueue(part_address, bytes);
++        };
++        const auto complete = [&] {
++            batch.Finish();
++            staging_buffer.Commit();
++        };
++        if (memory_tracker->TryStagedWriteUpload(device_addr, size, plan, part_ready, complete)) {
++            copies.emplace_back(staging_offset, device_addr - buffer_start, size);
++            total_size_bytes = size;
++            src_buffer = staging_buffer.Handle();
++        }
++    }
++    if (!src_buffer) {
++        const bool combine = is_dreams && is_written && size >= 4_MB;
++        memory_tracker->ForEachUploadRange(device_addr, size, is_written,
++            [&](VAddr address, u64 bytes) {
++                const u64 destination = address - buffer_start;
++                if (combine && !copies.empty() && copies.back().dstOffset + copies.back().size == destination) {
++                    copies.back().size += bytes;
++                } else {
++                    copies.emplace_back(total_size_bytes, destination, bytes);
++                }
++                total_size_bytes += bytes;
++            }, [&] {
++                const DreamsHostUpload::ParallelScope parallel{combine};
++                src_buffer = UploadCopies(buffer, copies, total_size_bytes);
++            });
++    }
++#else
+     memory_tracker->ForEachUploadRange(
+         device_addr, size, is_written,
+         [&](u64 device_addr_out, u64 range_size) {
+@@ -1180,6 +1264,7 @@
+             total_size_bytes += range_size;
+         },
+         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
++#endif
+ 
+     if (src_buffer) {
+         scheduler.EndRendering();
+--- a/src/video_core/buffer_cache/buffer.cpp
++++ b/src/video_core/buffer_cache/buffer.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
++#include "common/elf_info.h"
+ #include "video_core/buffer_cache/buffer.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+@@ -73,11 +74,18 @@
+     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+     const VmaAllocationCreateFlags bda_flag =
+         with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
++    constexpr VkDeviceSize MinimumSize = 4 * 1024 * 1024;
++    const bool large_upload = usage == MemoryUsage::Upload && buffer_ci.size >= MinimumSize;
++    const bool cached_upload = large_upload && Common::ElfInfo::Instance().GameSerial() == "CUSA04301";
++    const auto host_flags = cached_upload ? MemoryUsageVmaFlags(MemoryUsage::Download)
++                                         : MemoryUsageVmaFlags(usage);
++    const auto preferred = MemoryUsagePreferredVmaFlags(usage) |
++        (cached_upload ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VkMemoryPropertyFlags{});
+     const VmaAllocationCreateInfo alloc_ci = {
+-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(usage),
++        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | host_flags,
+         .usage = MemoryUsageVma(usage),
+         .requiredFlags = 0,
+-        .preferredFlags = MemoryUsagePreferredVmaFlags(usage),
++        .preferredFlags = preferred,
+         .pool = VK_NULL_HANDLE,
+         .pUserData = nullptr,
+     };
+@@ -86,6 +94,13 @@
+     VkBuffer unsafe_buffer{};
+     VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                       &allocation, out_alloc_info);
++    if (cached_upload && result != VK_SUCCESS) {
++        auto ordinary = alloc_ci;
++        ordinary.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(usage);
++        ordinary.preferredFlags = MemoryUsagePreferredVmaFlags(usage);
++        result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &ordinary, &unsafe_buffer,
++                                 &allocation, out_alloc_info);
++    }
+     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
+                vk::to_string(vk::Result{result}));
+     buffer = vk::Buffer{unsafe_buffer};
+--- a/src/video_core/buffer_cache/memory_tracker.h
++++ b/src/video_core/buffer_cache/memory_tracker.h
+@@ -122,6 +122,41 @@
+                                     manager->GetCpuAddr() + offset, size, func);
+                             });
+     }
++
++    // The whole aligned upload is planned under its normal region locks. Once each
++    // region is protected, a worker can read its bytes while later regions are protected.
++    bool TryStagedWriteUpload(VAddr address, u64 size, auto&& plan, auto&& ready, auto&& finish) {
++        ASSERT(address % TRACKER_BYTES_PER_PAGE == 0 && size % TRACKER_BYTES_PER_PAGE == 0);
++        bool fully_dirty = true;
++        unsigned parts = 0;
++        IteratePages<true>(address, size, [&](RegionManager* manager, u64 offset, size_t bytes) {
++            manager->lock.lock();
++            ++parts;
++            u64 covered = 0;
++            manager->template ForEachModifiedRange<Type::CPU, false>(manager->GetCpuAddr() + offset,
++                bytes, [&](VAddr, u64 dirty_bytes) { covered += dirty_bytes; });
++            fully_dirty &= covered == bytes;
++        });
++        if (!fully_dirty || !plan(parts)) {
++            IteratePages<false>(address, size, [](RegionManager* manager, u64, size_t) {
++                manager->lock.unlock();
++            });
++            return false;
++        }
++        IteratePages<false>(address, size, [&](RegionManager* manager, u64 offset, size_t bytes) {
++            const auto start = manager->GetCpuAddr() + offset;
++            manager->template ForEachModifiedRange<Type::CPU, true>(start, bytes, [](VAddr, u64) {});
++            ready(start, bytes);
++        });
++        finish();
++        IteratePages<false>(address, size, [](RegionManager* manager, u64 offset, size_t bytes) {
++            manager->template ChangeRegionState<Type::GPU, true>(manager->GetCpuAddr() + offset,
++                                                                bytes);
++            manager->lock.unlock();
++        });
++        return true;
++    }
++
+ 
+ private:
+     /**
+--- /dev/null
++++ b/src/video_core/buffer_cache/dreams_readback_wait.h
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++
++namespace DreamsGdsCounterWait {
++using Word = std::uint64_t;
++enum class Result { Counter, Contact, SceneList };
++
++struct Rule {
++    Word window;
++    Word window_bytes;
++    Word source;
++    Word bytes;
++    Word alternate_bytes;
++    Result result;
++};
++
++inline constexpr Rule Counters{0x231c00000, 0x10000, 0x231c00600, 180, 180, Result::Counter};
++inline constexpr Rule Model{0x231c00000, 0x10000, 0x231c00700, 100, 100, Result::Counter};
++inline constexpr Rule Contact{0x23d880000, 0x80000, 0x23d8c2600, 256, 272, Result::Contact};
++inline constexpr Rule SceneList{0x23b654000, 0x80000, 0x23b676030, 8, 8, Result::SceneList};
++// Downgrade the optimized wait if a submitted snapshot fails revalidation.
++inline std::atomic<std::uint32_t> mode{4};
++
++constexpr const Rule* Request(Word address, Word bytes, bool write, unsigned setting) {
++    if (setting == 0 || write || bytes != 8) {
++        return nullptr;
++    }
++    if (address == 0x231c00608) {
++        return &Counters;
++    }
++    if (setting < 2) {
++        return nullptr;
++    }
++    switch (address) {
++    case 0x231c0061c: return &Counters;
++    case 0x231c00704:
++    case 0x231c00708: return &Model;
++    case 0x23d8c2600: return &Contact;
++    case 0x23b676030: return setting == 4 ? &SceneList : nullptr;
++    default: return nullptr;
++    }
++}
++
++constexpr bool Accept(const Rule& rule, unsigned setting, Word address, Word bytes, Word tick,
++                      Word current_tick, const auto& copies) {
++    if (address != rule.window || bytes != rule.window_bytes || !tick || tick >= current_tick ||
++        copies.empty() || copies.size() > 2) {
++        return false;
++    }
++    if (rule.result == Result::SceneList) {
++        // Only an already submitted single-range snapshot covering the fault may leave
++        // the command processor. The caller revalidates the version before consuming it.
++        const auto& copy = copies.front();
++        const Word offset = rule.source - address;
++        return setting == 4 && copies.size() == 1 && copy.dstOffset == 0 &&
++               copy.srcOffset % 4 == 0 && copy.size % 4 == 0 && copy.size <= 0x20000 &&
++               copy.srcOffset <= offset && copy.size <= bytes - copy.srcOffset &&
++               offset - copy.srcOffset + rule.bytes <= copy.size;
++    }
++    if (copies.size() == 2 && (setting < 2 || rule.result != Result::Counter)) {
++        return false;
++    }
++    Word source_end = 0;
++    Word staging_offset = 0;
++    bool matching_result = false;
++    for (const auto& copy : copies) {
++        if (!copy.size || copy.size % 4 || copy.srcOffset % 4 ||
++            copy.srcOffset < source_end || copy.srcOffset >= bytes ||
++            copy.size > bytes - copy.srcOffset || copy.dstOffset != staging_offset) {
++            return false;
++        }
++        const bool expected = copy.srcOffset == rule.source - rule.window &&
++                              (copy.size == rule.bytes || copy.size == rule.alternate_bytes);
++        if (!expected && (copies.size() != 2 || copy.size != 4 ||
++                          copy.srcOffset < 0x500 || copy.srcOffset >= 0x800)) {
++            return false;
++        }
++        matching_result |= expected;
++        source_end = copy.srcOffset + copy.size;
++        staging_offset += (copy.size + 63) & ~Word{63};
++    }
++    return matching_result;
++}
++
++namespace Checks {
++struct Copy { Word srcOffset, dstOffset, size; };
++static_assert(Request(SceneList.source, 8, false, 4) == &SceneList);
++static_assert(Request(SceneList.source, 8, false, 3) == nullptr);
++static_assert(Request(SceneList.source, 8, true, 4) == nullptr);
++static_assert(Accept(SceneList, 4, SceneList.window, 0x80000, 19, 20,
++                     std::array{Copy{0x22000, 0, 56}}));
++static_assert(!Accept(SceneList, 4, SceneList.window, 0x80000, 19, 20,
++                      std::array{Copy{0x22000, 0, 52}}));
++static_assert(!Accept(SceneList, 4, SceneList.window, 0x80000, 19, 20,
++                      std::array{Copy{0x22000, 64, 56}}));
++static_assert(!Accept(SceneList, 4, SceneList.window, 0x80000, 20, 20,
++                      std::array{Copy{0x22000, 0, 56}}));
++static_assert(!Accept(SceneList, 4, SceneList.window, 0x80000, 19, 20,
++                      std::array{Copy{0x22000, 0, 56}, Copy{0x23000, 64, 4}}));
++static_assert(Request(0x231c00608, 8, false, 1) == &Counters);
++static_assert(Request(0x231c0061c, 8, false, 1) == nullptr);
++static_assert(Request(0x231c0061c, 8, false, 2) == &Counters);
++static_assert(Request(0x23d8c2600, 8, false, 3) == &Contact);
++static_assert(Request(0x231c0061c, 8, false, 3) == &Counters);
++static_assert(Accept(Counters, 1, Counters.window, 0x10000, 19, 20, std::array{Copy{0x600, 0, 180}}));
++static_assert(Accept(Counters, 2, Counters.window, 0x10000, 19, 20,
++                     std::array{Copy{0x600, 0, 180}, Copy{0x700, 192, 4}}));
++static_assert(!Accept(Counters, 1, Counters.window, 0x10000, 19, 20,
++                      std::array{Copy{0x600, 0, 180}, Copy{0x700, 192, 4}}));
++static_assert(!Accept(Counters, 2, Counters.window, 0x10000, 19, 20,
++                      std::array{Copy{0x600, 0, 180}, Copy{0x680, 192, 4}}));
++static_assert(!Accept(Counters, 2, Counters.window, 0x10000, 19, 20,
++                      std::array{Copy{0x600, 0, 180}, Copy{0x700, 184, 4}}));
++static_assert(!Accept(Counters, 2, Counters.window, 0x10000, 20, 20, std::array{Copy{0x600, 0, 180}}));
++static_assert(Accept(Contact, 2, Contact.window, 0x80000, 19, 20, std::array{Copy{0x42600, 0, 272}}));
++static_assert(!Accept(Contact, 2, Contact.window, 0x80000, 19, 20, std::array{Copy{0x42604, 0, 272}}));
++}
++} // namespace DreamsGdsCounterWait
+--- /dev/null
++++ b/src/video_core/buffer_cache/dreams_staged_upload.h
+@@ -0,0 +1,97 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++
++#include <windows.h>
++
++#include "core/dreams_host_upload.h"
++#include "core/memory.h"
++
++namespace DreamsStagedUpload {
++
++class CopyBatch {
++public:
++    CopyBatch(Core::MemoryManager& memory, VAddr base) : memory{memory}, base{base} {}
++    ~CopyBatch() {
++        for (const auto work : workers) {
++            if (work) CloseThreadpoolWork(work);
++        }
++    }
++
++    CopyBatch(const CopyBatch&) = delete;
++    CopyBatch& operator=(const CopyBatch&) = delete;
++
++    bool Prepare(unsigned parts) {
++        if (!parts || parts > segments.size()) return false;
++        count = parts;
++        for (auto& work : workers) {
++            work = CreateThreadpoolWork(Run, this, nullptr);
++            if (!work) return false;
++        }
++        return true;
++    }
++
++    void Start(u8* staging) {
++        destination = staging;
++        for (const auto work : workers) {
++            SubmitThreadpoolWork(work);
++        }
++    }
++
++    void Enqueue(VAddr address, u64 bytes) {
++        segments[published] = Segment{address, bytes, false};
++        ready.store(++published, std::memory_order_release);
++        ready.notify_all();
++    }
++
++    void Finish() {
++        for (const auto work : workers) {
++            WaitForThreadpoolWorkCallbacks(work, FALSE);
++        }
++        for (unsigned i = 0; i < count; ++i) {
++            const auto& part = segments[i];
++            if (!part.copied) {
++                memory.CopySparseMemory(part.address, destination + (part.address - base), part.bytes);
++            }
++        }
++    }
++
++private:
++    struct Segment {
++        VAddr address{};
++        u64 bytes{};
++        bool copied{};
++    };
++
++    static void CALLBACK Run(PTP_CALLBACK_INSTANCE, void* context, PTP_WORK) {
++        auto& job = *static_cast<CopyBatch*>(context);
++        for (;;) {
++            const auto index = job.next.fetch_add(1, std::memory_order_relaxed);
++            if (index >= job.count) return;
++            auto available = job.ready.load(std::memory_order_acquire);
++            while (available <= index) {
++                job.ready.wait(available, std::memory_order_acquire);
++                available = job.ready.load(std::memory_order_acquire);
++            }
++            auto& part = job.segments[index];
++            part.copied = true;
++            const CopyScope scope{part.copied};
++            job.memory.CopySparseMemory(part.address, job.destination + (part.address - job.base),
++                                        part.bytes);
++        }
++    }
++
++    Core::MemoryManager& memory;
++    VAddr base;
++    u8* destination{};
++    std::array<Segment, 33> segments{}; // 128 MiB can cross 33 four-MiB tracker regions.
++    std::array<PTP_WORK, 2> workers{};
++    unsigned published{}, count{};
++    std::atomic<unsigned> ready{}, next{};
++};
++
++} // namespace DreamsStagedUpload
+--- /dev/null
++++ b/src/video_core/amdgpu/dreams_logo_playback.h
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <atomic>
++
++namespace DreamsLogoGraphics {
++
++inline std::atomic_uint active_decoders{};
++
++class PlaybackScope {
++public:
++    explicit PlaybackScope(bool logo) : active{logo} {
++        if (active) {
++            active_decoders.fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++
++    ~PlaybackScope() {
++        if (active) {
++            active_decoders.fetch_sub(1, std::memory_order_relaxed);
++        }
++    }
++
++    PlaybackScope(const PlaybackScope&) = delete;
++    PlaybackScope& operator=(const PlaybackScope&) = delete;
++
++private:
++    const bool active;
++};
++
++} // namespace DreamsLogoGraphics
+--- /dev/null
++++ b/src/core/dreams_host_upload.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++
++namespace DreamsHostUpload {
++
++inline thread_local bool allow_parallel_copy{};
++
++class ParallelScope {
++public:
++    explicit ParallelScope(bool value) : previous{allow_parallel_copy} {
++        allow_parallel_copy = value;
++    }
++    ~ParallelScope() { allow_parallel_copy = previous; }
++
++    ParallelScope(const ParallelScope&) = delete;
++    ParallelScope& operator=(const ParallelScope&) = delete;
++
++private:
++    bool previous;
++};
++
++} // namespace DreamsHostUpload
++
++namespace DreamsStagedUpload {
++
++inline thread_local bool* readable_copy{};
++
++class CopyScope {
++public:
++    explicit CopyScope(bool& result) : previous{readable_copy} { readable_copy = &result; }
++    ~CopyScope() { readable_copy = previous; }
++
++    CopyScope(const CopyScope&) = delete;
++    CopyScope& operator=(const CopyScope&) = delete;
++
++private:
++    bool* previous;
++};
++
++} // namespace DreamsStagedUpload

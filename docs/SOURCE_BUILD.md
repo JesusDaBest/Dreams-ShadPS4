@@ -1,5 +1,9 @@
 # Build the Dreams source fixes
 
+## November 18 gameplay fixes
+
+Use the base commit and patches in the [source manifest](../builds/cusa04301-gameplay-fixes-20261118/source-manifest.json). The last patch adds the [gameplay fixes](../patches/dreams-gameplay-fixes-20261118.patch). [The Qt launcher uses the same source](../builds/cusa04301-qt-render-mode-20261118/source-manifest.json).
+
 ## November 18 Qt rendering setting
 
 The [source manifest](../builds/cusa04301-qt-render-mode-20261118/source-manifest.json) links the emulator source and identifies the Qt launcher revision. Use the [Qt patch](../builds/cusa04301-qt-render-mode-20261118/qt-force-60hz-rendering.patch) or download the [Qt launcher source](../builds/cusa04301-qt-render-mode-20261118/QtLauncher-source-99e9829.tar.gz). [Update details](updates/QT_RENDER_MODE_20261118.md).
