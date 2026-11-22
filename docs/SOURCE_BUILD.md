@@ -1,5 +1,9 @@
 # Build the Dreams source fixes
 
+## November 21 Quest VR
+
+Apply the ordered patches in the [emulator source manifest](../builds/cusa04301-quest-vr-20261121/source-manifest.json). For the launcher, apply [the VR menu patch](../builds/cusa04301-quest-vr-20261121/qt-dreams-vr.patch) to the November 18 Qt source archive. The Windows adapter finds SteamVR using the registered OpenVR runtime path.
+
 ## November 18 gameplay fixes
 
 Use the base commit and patches in the [source manifest](../builds/cusa04301-gameplay-fixes-20261118/source-manifest.json). The last patch adds the [gameplay fixes](../patches/dreams-gameplay-fixes-20261118.patch). [The Qt launcher uses the same source](../builds/cusa04301-qt-render-mode-20261118/source-manifest.json).

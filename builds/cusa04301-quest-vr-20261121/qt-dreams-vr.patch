@@ -1,0 +1,36 @@
+--- a/src/qt_gui/gui_settings.h
++++ b/src/qt_gui/gui_settings.h
+@@ -75,6 +75,7 @@
+ const gui_value vm_showChangeLog = gui_value(version_manager, "showChangeLog", "");
+ const gui_value vm_checkOnStartup = gui_value(version_manager, "checkOnStartup", "");
+ 
++const gui_value dreams_questVr = gui_value("dreams", "questVr", false);
+ const gui_value dreams_force60HzRendering = gui_value("dreams", "force60HzRendering", false);
+ 
+ inline bool IsDreamsLauncher(const QFileInfo& executable) {
+--- a/src/ipc/ipc_client.cpp
++++ b/src/ipc/ipc_client.cpp
+@@ -36,6 +36,7 @@
+     }
+     if (gui::IsDreamsLauncher(exe)) {
+         const gui_settings settings;
++        env.insert("SHADPS4_QT_DREAMS_OPENVR", settings.GetValue(gui::dreams_questVr).toBool() ? "1" : "0");
+         const bool force60Hz = settings.GetValue(gui::dreams_force60HzRendering).toBool();
+         env.insert("SHADPS4_QT_DREAMS_FORCE_60HZ_RENDERING", force60Hz ? "1" : "0");
+     }
+--- a/src/qt_gui/gui_context_menus.h
++++ b/src/qt_gui/gui_context_menus.h
+@@ -124,6 +124,13 @@
+         if (m_games[itemID].serial == "CUSA04301" && gui::IsDreamsLauncher(selectedVersion)) {
+             gameConfigMenu->addSeparator();
+             gameConfigMenu->setToolTipsVisible(true);
++            auto* questVr = gameConfigMenu->addAction(tr("Play in VR (SteamVR)"));
++            questVr->setCheckable(true);
++            questVr->setChecked(m_gui_settings->GetValue(gui::dreams_questVr).toBool());
++            questVr->setToolTip(tr("Connect your headset to SteamVR before launching Dreams."));
++            connect(questVr, &QAction::toggled, gameConfigMenu, [m_gui_settings](bool enabled) {
++                m_gui_settings->SetValue(gui::dreams_questVr, enabled, true);
++            });
+             auto* force60Hz = gameConfigMenu->addAction(tr("Force 60 Hz Rendering"));
+             force60Hz->setCheckable(true);
+             force60Hz->setChecked(m_gui_settings->GetValue(gui::dreams_force60HzRendering).toBool());

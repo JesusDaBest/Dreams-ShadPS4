@@ -1,0 +1,26 @@
+{
+  "core_sha256": "57caf8694abdb800f69dc729bd79a2ff49e53732a79771d10e6d7ce88f43c397",
+  "qt_sha256": "df0a30d2d8087dca9eca715dea0aea1c21e525078589f6c7229e77eda792b285",
+  "game": "CUSA04301, v2.64",
+  "desktop_game_boot": true,
+  "steamvr_game_boot": true,
+  "steamvr_scene_owner_and_both_eye_textures_verified": true,
+  "steamvr_eye_size": [
+    2212,
+    2368
+  ],
+  "launcher_checks": [
+    "desktop default",
+    "desktop 60 Hz",
+    "Quest VR enabled",
+    "Quest VR retained",
+    "desktop restored",
+    "direct"
+  ],
+  "regressions": {
+    "occupancy": "Captured clear/indirect writer/resolve accepted. Negative cases, overlap boundaries and 22 original guard checks passed.",
+    "recenter": "Quest yaw, horizon, compositor pose and one-shot stick hold passed.",
+    "qt_files_reconstructed": 3
+  },
+  "source_files_reconstructed": 117
+}
