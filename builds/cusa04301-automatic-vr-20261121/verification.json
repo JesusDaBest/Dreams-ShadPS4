@@ -1,0 +1,45 @@
+{
+  "core_sha256": "aba86d87b464987380e76504c6e679f107ecedc8a3b0f272ed899fb5878acbd6",
+  "qt_sha256": "cf2ae8d736c7a415146e4197a7d1a6669d3e58d3be8cfb5d8392d90a6953d73e",
+  "game": "CUSA04301 v2.64",
+  "running_game_headset_on_and_off": {
+    "first_test_core_sha256": "758dc022c6e275b17bf411da3532cd890cb490ba9bcaa2df67660215e5a5bc14",
+    "same_game_process": true,
+    "guest_vr_frames": 1815,
+    "flat_before_and_after": true
+  },
+  "release_boot_with_headset_already_in_use": true,
+  "steamvr_both_eyes": {
+    "left": {
+      "width": 2212,
+      "height": 2368,
+      "contrast": 164
+    },
+    "right": {
+      "width": 2212,
+      "height": 2368,
+      "contrast": 164
+    }
+  },
+  "launcher_persisted_old_vr_setting_ignored": true,
+  "desktop_force_60hz_setting_verified": true,
+  "no_runtime_and_reconnect": {
+    "driver": "Controlled OpenVR test driver",
+    "cases_passed": [
+      "No registered runtime",
+      "Malformed runtime registration",
+      "Stopped SteamVR probed in background",
+      "SteamVR started while game running",
+      "Tracked headset resting on desk",
+      "Worn sensor enters VR",
+      "Removed headset exits despite recent activity",
+      "Rewear in the same scene client",
+      "SteamVR quit clears mounted state",
+      "Recent motion checked again against scene proximity",
+      "Already worn before startup with masked background input",
+      "Runtime disconnect returns desktop"
+    ],
+    "production_host_object_sha256": "48ee98b2531b54c079e25b761f77adc8e03a085b16d6c347ad7c5b0715fb7e8f"
+  },
+  "source_files_reconstructed": 9
+}

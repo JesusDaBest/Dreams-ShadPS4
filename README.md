@@ -2,7 +2,7 @@
 
 A Windows build of shadPS4 with fixes for **Dreams (CUSA04301)**.
 
-**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-quest-vr-20261121/Dreams-graphical-launcher-Quest-VR-20261121.zip)**
+**[Download the latest build (ZIP)](https://github.com/JesusDaBest/Dreams-ShadPS4/raw/refs/heads/main/builds/cusa04301-automatic-vr-20261121/Dreams-graphical-launcher-automatic-VR-20261121.zip)**
 
 [Join the Discord for more](https://discord.gg/7jFj63vND)
 
@@ -16,7 +16,7 @@ Updated November 21, 2026.
 
 The included fixes and settings apply automatically. No commands needed. Keep the extracted folder together; your own game and required system files are needed.
 
-**Quest VR** · Connect your headset to SteamVR. In the launcher, right-click Dreams and enable **Game-specific Settings → Play in VR (SteamVR)** before clicking **Play**.
+**Quest VR** · Connect to SteamVR and put on your headset before or during play. Take it off to continue on the PC.
 
 **FPS display:** press **F10** to show or hide it, including in fullscreen. Your choice is saved.
 
@@ -33,4 +33,4 @@ Owner-reported result from the heaviest tested **Tren** scene: **20 render FPS /
 
 Approximate Intel/NVIDIA performance-tier equivalents at 20 W: **Core i7-12700H-class CPU + GeForce GTX 1650 Laptop-class GPU**. These are workload-dependent estimates, not measured Dreams results on those components. [CPU comparison](https://www.computerbase.de/forum/threads/onexplayer-superx-tablet-mit-amd-395.2264935/) · [GPU comparison](https://www.notebookcheck.net/Intel-Panther-Lake-Arc-B390-performance-and-efficiency-analysis-Intel-s-new-iGPU-trades-blows-with-the-Nvidia-GeForce-RTX-4050.1212582.0.html)
 
-[Latest release details](docs/updates/QUEST_VR_20261121.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)
+[Latest release details](docs/updates/AUTOMATIC_VR_20261121.md) | [Source and build instructions](docs/SOURCE_BUILD.md) | [Previous updates and screenshots](docs/HISTORICAL_README_20261025.md)

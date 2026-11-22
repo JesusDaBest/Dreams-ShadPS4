@@ -1,5 +1,9 @@
 # Build the Dreams source fixes
 
+## Automatic Quest VR
+
+Apply the emulator patches in the [automatic VR source manifest](../builds/cusa04301-automatic-vr-20261121/source-manifest.json). Use the November 18 Qt launcher source archive referenced there. The emulator handles headset discovery and switching during play.
+
 ## November 21 Quest VR
 
 Apply the ordered patches in the [emulator source manifest](../builds/cusa04301-quest-vr-20261121/source-manifest.json). For the launcher, apply [the VR menu patch](../builds/cusa04301-quest-vr-20261121/qt-dreams-vr.patch) to the November 18 Qt source archive. The Windows adapter finds SteamVR using the registered OpenVR runtime path.

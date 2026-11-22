@@ -1,0 +1,545 @@
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -116,7 +116,7 @@
+     LARGE_INTEGER interval{
+         .QuadPart = -1 * (duration.count() / 100u),
+     };
+-    const bool precise = Libraries::Hmd::Host::Enabled();
++    const bool precise = Libraries::Hmd::Host::PresentationReady();
+     HANDLE timer = precise ? CreateWaitableTimerExW(nullptr, nullptr,
+         CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+         TIMER_MODIFY_STATE | SYNCHRONIZE) : nullptr;
+--- a/src/core/libraries/hmd/hmd.cpp
++++ b/src/core/libraries/hmd/hmd.cpp
+@@ -37,7 +37,7 @@
+         ? ORBIS_HMD_DEVICE_STATUS_READY : ORBIS_HMD_DEVICE_STATUS_NOT_READY;
+     // PSVR guest panel geometry. Actual eye images are resampled by SteamVR.
+     info->device_info.panel_resolution={1920,1080};
+-    info->hmu_mount=host.valid ? 1 : 0;
++    info->hmu_mount=host.valid && Host::Mounted() ? 1 : 0;
+ }
+ 
+ s32 PS4_SYSV_ABI sceHmdInitialize(const OrbisHmdInitializeParam* param) {
+@@ -1057,4 +1057,4 @@
+     RegisterReprojection(sym);
+ };
+ 
+-} // namespace Libraries::Hmd
+\ No newline at end of file
++} // namespace Libraries::Hmd
+--- a/src/core/libraries/hmd/openvr_host.cpp
++++ b/src/core/libraries/hmd/openvr_host.cpp
+@@ -3,6 +3,8 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <filesystem>
++#include <fstream>
++#include <nlohmann/json.hpp>
+ #include "openvr.h"
+ #include "hand.h"
+ #include "quest_recenter.h"
+@@ -27,7 +29,8 @@
+ namespace {
+ std::mutex mutex;
+ std::atomic<bool> presentation_ready{};
+-bool attempted{};
++std::atomic<bool> mounted{};
++std::vector<std::string> enabled_instance_extensions, enabled_device_extensions;
+ int last_error{};
+ Pose recenter{};
+ RecenterButton recenter_button;
+@@ -39,6 +42,97 @@
+ using Close = void (VR_CALLTYPE*)();
+ using GetInterface = void* (VR_CALLTYPE*)(const char*, vr::EVRInitError*);
+ Close close_runtime{};
++Init init_runtime{};
++GetInterface get_interface{};
++bool scene_client{};
++
++void DisconnectLocked() {
++    mounted.store(false);
++    if (system && close_runtime) close_runtime();
++    system = nullptr;
++    compositor = nullptr;
++    scene_client = false;
++    recenter = {};
++    recenter_button = {};
++}
++
++bool OpenClient(vr::EVRApplicationType kind) {
++    vr::EVRInitError error{};
++    init_runtime(&error, kind, nullptr);
++    if (error != vr::VRInitError_None) {
++        last_error = error;
++        return false;
++    }
++    system = static_cast<vr::IVRSystem*>(get_interface(vr::IVRSystem_Version, &error));
++    if (system && !error)
++        compositor = static_cast<vr::IVRCompositor*>(get_interface(vr::IVRCompositor_Version, &error));
++    if (!system || !compositor || error) {
++        close_runtime();
++        system = nullptr;
++        compositor = nullptr;
++        last_error = error;
++        return false;
++    }
++    scene_client = kind == vr::VRApplication_Scene;
++    if (scene_client) compositor->SetTrackingSpace(vr::TrackingUniverseSeated);
++    last_error = 0;
++    return true;
++}
++
++bool LoadRuntime() {
++    if (library) return true;
++    wchar_t path[32768]{};
++    const DWORD n = GetEnvironmentVariableW(L"SHADPS4_OPENVR_API_PATH", path, 32768);
++    std::filesystem::path dll;
++    if (n && n < 32768 && std::filesystem::path(path).is_absolute()) {
++        dll = path;
++    } else {
++        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA",path,32768);
++        if (!length || length >= 32768) return false;
++        std::ifstream file(std::filesystem::path(path)/L"openvr"/L"openvrpaths.vrpath");
++        if (!file) return false;
++        const auto paths = nlohmann::json::parse(file,nullptr,false);
++        if (!paths.is_object() || !paths.contains("runtime") || !paths["runtime"].is_array()) return false;
++        for (const auto& root : paths["runtime"]) {
++            if (!root.is_string()) continue;
++            auto candidate = std::filesystem::u8path(root.get<std::string>()) / L"bin/win64/openvr_api.dll";
++            std::error_code error;
++            if (candidate.is_absolute() && std::filesystem::is_regular_file(candidate,error)) {
++                dll = std::move(candidate);
++                break;
++            }
++        }
++    }
++    if (dll.empty()) return false;
++    library = LoadLibraryExW(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
++    if (!library) return false;
++    init_runtime = reinterpret_cast<Init>(GetProcAddress(library, "VR_InitInternal2"));
++    get_interface = reinterpret_cast<GetInterface>(GetProcAddress(library, "VR_GetGenericInterface"));
++    close_runtime = reinterpret_cast<Close>(GetProcAddress(library, "VR_ShutdownInternal"));
++    if (init_runtime && get_interface && close_runtime) return true;
++    FreeLibrary(library);
++    library = nullptr;
++    return false;
++}
++
++bool HeadsetWorn() {
++    if (!system->IsTrackedDeviceConnected(vr::k_unTrackedDeviceIndex_Hmd)) return false;
++    vr::ETrackedPropertyError error{};
++    if (system->GetBoolTrackedDeviceProperty(0, vr::Prop_ContainsProximitySensor_Bool, &error) &&
++        error == vr::TrackedProp_Success) {
++        vr::VRControllerState_t input{};
++        if (system->GetControllerState(0, &input, sizeof(input))) {
++            if (input.ulButtonPressed & vr::ButtonMaskFromId(vr::k_EButton_ProximitySensor)) return true;
++            // SteamVR can mask legacy buttons for a background client, even when
++            // the wearer is interacting. Confirm the sensor again after acquiring the scene.
++            if (scene_client && system->IsInputAvailable()) return false;
++        }
++    }
++    // Drivers without a readable proximity button expose in-use/standby here.
++    const auto activity = system->GetTrackedDeviceActivityLevel(0);
++    return activity == vr::k_EDeviceActivityLevel_UserInteraction ||
++           activity == vr::k_EDeviceActivityLevel_UserInteraction_Timeout;
++}
+ #endif
+ 
+ Snapshot ReadLocked(float seconds, bool relative) {
+@@ -87,52 +181,46 @@
+     }();
+     return enabled;
+ }
+-bool Initialize() {
+-    if(!Enabled()) return false;
+-    std::lock_guard lock(mutex);
+-    if(attempted) return system!=nullptr;
+-    attempted=true;
++bool Mounted() { return mounted.load(std::memory_order_acquire); }
++
++WearState PollHeadset() {
+ #ifdef _WIN32
+-    // Exact, absolute runtime path comes from the VR launcher. No current-directory search.
+-    wchar_t path[32768]{};
+-    const DWORD n=GetEnvironmentVariableW(L"SHADPS4_OPENVR_API_PATH",path,32768);
+-    if(n<4 || n>=32768 || !(path[1]==L':' && (path[2]==L'/' || path[2]==L'\\'))) {
+-        last_error=-1; return false;
+-    }
+-    library=LoadLibraryExW(path,nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
+-    if(!library) { last_error=-2; return false; }
+-    const auto init=reinterpret_cast<Init>(GetProcAddress(library,"VR_InitInternal2"));
+-    const auto get=reinterpret_cast<GetInterface>(GetProcAddress(library,"VR_GetGenericInterface"));
+-    close_runtime=reinterpret_cast<Close>(GetProcAddress(library,"VR_ShutdownInternal"));
+-    if(!init || !get || !close_runtime) {
+-        FreeLibrary(library); library=nullptr; close_runtime=nullptr; last_error=-3; return false;
+-    }
+-    vr::EVRInitError error=vr::VRInitError_None;
+-    init(&error,vr::VRApplication_Scene,nullptr);
+-    if(error==vr::VRInitError_None) {
+-        system=static_cast<vr::IVRSystem*>(get(vr::IVRSystem_Version,&error));
+-        if(system && error==vr::VRInitError_None)
+-            compositor=static_cast<vr::IVRCompositor*>(get(vr::IVRCompositor_Version,&error));
+-        if(!system || !compositor || error!=vr::VRInitError_None) close_runtime();
+-    }
+-    if(!system || !compositor || error!=vr::VRInitError_None) {
+-        system=nullptr; compositor=nullptr; last_error=static_cast<int>(error);
+-        FreeLibrary(library); library=nullptr; close_runtime=nullptr; return false;
+-    }
+-    last_error=0;
+-    compositor->SetTrackingSpace(vr::TrackingUniverseSeated);
+-    return true;
+-#else
+-    last_error=-4; return false;
+-#endif
++    std::lock_guard lock(mutex);
++    if (!LoadRuntime() || (!system && !OpenClient(vr::VRApplication_Background)))
++        return WearState::Unavailable;
++    vr::VREvent_t event{};
++    while (system->PollNextEvent(&event, sizeof(event))) {
++        if (event.eventType == vr::VREvent_Quit || event.eventType == vr::VREvent_DriverRequestedQuit) {
++            system->AcknowledgeQuit_Exiting();
++            DisconnectLocked();
++            return WearState::Unavailable;
++        }
++    }
++    if (!system->IsTrackedDeviceConnected(0)) {
++        DisconnectLocked();
++        return WearState::Unavailable;
++    }
++    if (!HeadsetWorn()) {
++        if (mounted.exchange(false) && scene_client) compositor->ClearLastSubmittedFrame();
++        return WearState::Off;
++    }
++    if (!scene_client) {
++        DisconnectLocked();
++        if (!OpenClient(vr::VRApplication_Scene)) return WearState::Unavailable;
++        if (!HeadsetWorn()) return WearState::Off;
++    }
++    mounted.store(true, std::memory_order_release);
++    return WearState::On;
++#endif
++    return WearState::Unavailable;
+ }
+ Snapshot Read(float seconds,bool relative) {
+-    if(!Initialize()) return {};
++    if(!Mounted()) return {};
+     std::lock_guard lock(mutex);
+     return ReadLocked(seconds,relative);
+ }
+ Snapshot ReadForPresentation(Pose& absolute) {
+-    if (!Initialize()) return {};
++    if (!Mounted()) return {};
+     std::lock_guard lock(mutex);
+     const auto sample = ReadLocked(0.f, true);
+     if (sample.valid) absolute = Compose(Inverse(recenter), sample.head);
+@@ -140,7 +228,7 @@
+ }
+ Pose ToAbsolute(const Pose& relative){std::lock_guard lock(mutex);return Compose(Inverse(recenter),relative);}
+ bool Recenter(bool reset_position) {
+-    if(!Initialize()) return false;
++    if(!Mounted()) return false;
+     std::lock_guard lock(mutex);
+     const auto sample=ReadLocked(0,false);
+     if(!sample.valid) return false;
+@@ -157,7 +245,7 @@
+     }
+     return true;
+ }
+-bool PresentationReady() { return presentation_ready.load(std::memory_order_acquire); }
++bool PresentationReady() { return mounted.load(std::memory_order_acquire) && presentation_ready.load(std::memory_order_acquire); }
+ void SetPresentationReady(bool ready) { presentation_ready.store(ready,std::memory_order_release); }
+ int LastError() { std::lock_guard lock(mutex); return last_error; }
+ static std::vector<std::string> ExtensionsLocked(void* physical) {
+@@ -176,18 +264,33 @@
+     return result;
+ }
+ std::vector<std::string> InstanceExtensions() {
+-    if(!Initialize()) return {};
+-    std::lock_guard lock(mutex);
+-    return ExtensionsLocked(nullptr);
++    return {"VK_KHR_external_memory_capabilities", "VK_KHR_get_physical_device_properties2",
++            "VK_KHR_external_fence_capabilities", "VK_KHR_external_semaphore_capabilities"};
+ }
+ std::vector<std::string> DeviceExtensions(void* physical) {
+-    if(!physical || !Initialize()) return {};
+-    std::lock_guard lock(mutex);
+-    return ExtensionsLocked(physical);
++    return {"VK_KHR_external_memory", "VK_KHR_external_semaphore", "VK_KHR_external_fence",
++            "VK_KHR_timeline_semaphore", "VK_KHR_dedicated_allocation", "VK_KHR_get_memory_requirements2",
++            "VK_KHR_external_memory_win32", "VK_KHR_external_semaphore_win32",
++            "VK_KHR_external_fence_win32", "VK_KHR_win32_keyed_mutex"};
++}
++void RememberVulkanExtensions(bool device, const char* const* names, std::size_t count) {
++    std::lock_guard lock(mutex);
++    auto& extensions = device ? enabled_device_extensions : enabled_instance_extensions;
++    extensions.assign(names, names + count);
+ }
+ bool SupportsDevice(void* instance,void* physical) {
+-    if(!instance || !physical || !Initialize()) return false;
+-    std::lock_guard lock(mutex);
++    if(!instance || !physical || !Mounted()) return false;
++    std::lock_guard lock(mutex);
++    if (!system || !compositor) return false;
++    const auto available = [&](void* gpu, const std::vector<std::string>& enabled) {
++        last_error = 0;
++        const auto required = ExtensionsLocked(gpu);
++        return last_error == 0 && std::all_of(required.begin(), required.end(), [&](const auto& extension) {
++            return std::find(enabled.begin(), enabled.end(), extension) != enabled.end();
++        });
++    };
++    if (!available(nullptr, enabled_instance_extensions) || !available(physical, enabled_device_extensions))
++        return false;
+     uint64_t output{};
+     system->GetOutputDevice(&output,vr::TextureType_Vulkan,static_cast<VkInstance_T*>(instance));
+     return output==reinterpret_cast<uintptr_t>(physical);
+@@ -243,14 +346,12 @@
+     presentation_ready=false;
+     { std::lock_guard clear(hands_mutex); hand_frame={}; }
+ #ifdef _WIN32
+-    if(compositor) compositor->ClearLastSubmittedFrame();
+-    if(system && close_runtime) close_runtime();
+-    compositor=nullptr;
+-    system=nullptr;
++    if(compositor && scene_client) compositor->ClearLastSubmittedFrame();
++    DisconnectLocked();
+     if(library) FreeLibrary(library);
+     library=nullptr; close_runtime=nullptr;
+ #endif
+-    attempted=false; recenter={}; recenter_button={};
++    recenter={}; recenter_button={};
+ }
+ } // namespace Libraries::Hmd::Host
+ 
+@@ -336,7 +437,7 @@
+ }
+ bool ReadHand(int side,bool relative,Hand& out) {
+     out={};
+-    if(side<0 || side>1) return false;
++    if(side<0 || side>1 || !PresentationReady()) return false;
+     std::lock_guard lock(hands_mutex);
+     if(!hand_frame.connected[side] ||
+        std::chrono::steady_clock::now()-hand_frame.time > std::chrono::milliseconds(500)) return false;
+--- a/src/core/libraries/hmd/openvr_host.h
++++ b/src/core/libraries/hmd/openvr_host.h
+@@ -22,9 +22,11 @@
+     Pose eye_to_head[2]{};
+ };
+ 
+-// The prototype stays opt-in. Merely installing SteamVR never changes ordinary Dreams.
++// The launcher enables headset discovery for supported Dreams versions.
+ bool Enabled();
+-bool Initialize();
++enum class WearState { Unavailable, Off, On };
++WearState PollHeadset();
++bool Mounted();
+ void Shutdown();
+ Snapshot Read(float prediction_seconds = 0.0f, bool relative = false);
+ Pose ToAbsolute(const Pose& relative);
+@@ -44,6 +46,7 @@
+ };
+ std::vector<std::string> InstanceExtensions();
+ std::vector<std::string> DeviceExtensions(void* physical_device);
++void RememberVulkanExtensions(bool device, const char* const* names, std::size_t count);
+ bool SupportsDevice(void* instance,void* physical_device);
+ // Caller must externally synchronize every operation on the Vulkan queue.
+ bool SubmitEyes(const VulkanContext& context,const EyeImage (&eyes)[2],const Pose* render_pose=nullptr);
+--- a/src/core/libraries/hmd/openvr_present.cpp
++++ b/src/core/libraries/hmd/openvr_present.cpp
+@@ -10,6 +10,8 @@
+ #include "video_core/texture_cache/texture_cache.h"
+ #include <algorithm>
+ #include <chrono>
++#include <condition_variable>
++#include <thread>
+ #include <cstdio>
+ #include <deque>
+ #include <memory>
+@@ -179,13 +181,16 @@
+ };
+ std::shared_ptr<State> state;
+ std::mutex state_mutex;
++std::mutex lifecycle_mutex;
++std::jthread headset_monitor;
++std::atomic<bool> has_pending{};
+ std::shared_ptr<State> Current(){std::lock_guard lock(state_mutex);return state;}
+ void Service(const void* address,bool idle){
+     auto s=Current();if(!s)return;
+     for(;;){
+         VrFrame::Frame frame;
+         {std::lock_guard lock(s->mutex);auto at=std::find_if(s->pending.begin(),s->pending.end(),[&](const auto& f){return idle||f.completion==address;});
+-         if(at==s->pending.end())return;frame=*at;s->pending.erase(at);}
++         if(at==s->pending.end())return;frame=*at;s->pending.erase(at);has_pending.store(!s->pending.empty());}
+         const bool ok=s->Draw(frame);VrFrame::Complete(frame.completion);
+         static u64 count{};if(++count<=8||(!ok&&count%120==0))LOG_INFO(Lib_Hmd,"Dreams VR frame {}: layers={} flat={} delivered={} compositor={}",frame.sequence,frame.count,frame.flat,ok,Host::LastError());
+     }
+@@ -193,9 +198,40 @@
+ }
+ bool Install(const Vulkan::Instance& i,Vulkan::Scheduler& s,VideoCore::TextureCache& c,AmdGpu::Liverpool& g,Mirror mirror){
+     if(!Host::Enabled())return false;
+-    auto created=std::make_shared<State>(i,s,c,g,std::move(mirror));if(!created->Initialize())return false;
+-    {std::lock_guard lock(state_mutex);if(state)return false;state=std::move(created);}
+-    Host::SetPresentationReady(true);LOG_INFO(Lib_Hmd,"Dreams OpenVR eye presenter ready");return true;
++    std::lock_guard lifecycle(lifecycle_mutex);
++    if (headset_monitor.joinable()) return false;
++    headset_monitor = std::jthread([&i,&s,&c,&g,mirror=std::move(mirror)](std::stop_token stop) {
++        using namespace std::chrono_literals;
++        std::mutex sleep_mutex;
++        std::condition_variable_any wake;
++        std::unique_lock sleep_lock(sleep_mutex);
++        bool ready = false;
++        while (!stop.stop_requested()) {
++            const auto wear = Host::PollHeadset();
++            bool next = false;
++            if (wear == Host::WearState::On) {
++                auto current = Current();
++                if (!current) {
++                    auto created = std::make_shared<State>(i,s,c,g,mirror);
++                    if (created->Initialize()) {
++                        std::lock_guard lock(state_mutex);
++                        current = state = std::move(created);
++                    }
++                }
++                next = current && (ready || (Host::Read().valid &&
++                    Host::SupportsDevice(static_cast<VkInstance>(i.GetInstance()),
++                                         static_cast<VkPhysicalDevice>(i.GetPhysicalDevice()))));
++            }
++            if (next != ready) {
++                Host::SetPresentationReady(next);
++                LOG_INFO(Lib_Hmd,"Dreams headset mode: {}",next ? "VR" : "desktop");
++                ready = next;
++            }
++            wake.wait_for(sleep_lock,stop,wear == Host::WearState::Unavailable ? 1500ms :
++                (wear == Host::WearState::On && !ready ? 500ms : 100ms),[] { return false; });
++        }
++    });
++    return true;
+ }
+ Vulkan::Frame* TakeMirror(){
+     auto s=Current();if(!s)return nullptr;
+@@ -204,14 +240,19 @@
+ bool Enqueue(VrFrame::Frame frame){
+     auto s=Current();if(!s||!Host::PresentationReady())return false;
+     {std::lock_guard lock(s->mutex);if(s->stopping||s->pending.size()>=2)return false;
+-     for(const auto& f:s->pending)if(f.completion==frame.completion)return false;s->pending.push_back(std::move(frame));}
++     for(const auto& f:s->pending)if(f.completion==frame.completion)return false;s->pending.push_back(std::move(frame));has_pending.store(true);}
+     s->gpu.SendCommand([s]{if(s->gpu.IsGpuIdle())ServiceIdle();});return true;
+ }
+-void ServiceWait(const void* address){if(Host::Enabled())Service(address,false);}
+-void ServiceIdle(){if(Host::Enabled())Service(nullptr,true);}
+-void Cancel(){auto s=Current();if(!s)return;std::lock_guard lock(s->mutex);for(const auto& f:s->pending)VrFrame::Complete(f.completion);s->pending.clear();}
++void ServiceWait(const void* address){if(has_pending.load(std::memory_order_acquire))Service(address,false);}
++void ServiceIdle(){if(has_pending.load(std::memory_order_acquire))Service(nullptr,true);}
++void Cancel(){auto s=Current();if(!s)return;std::lock_guard lock(s->mutex);for(const auto& f:s->pending)VrFrame::Complete(f.completion);s->pending.clear();has_pending.store(false);}
+ void Uninstall(){
+-    Host::SetPresentationReady(false);auto s=Current();if(!s)return;
++    std::lock_guard lifecycle(lifecycle_mutex);
++    if (headset_monitor.joinable()) {
++        headset_monitor.request_stop();
++        headset_monitor.join();
++    }
++    Host::SetPresentationReady(false);auto s=Current();if(!s){Host::Shutdown();return;}
+     {std::lock_guard lock(s->mutex);s->stopping=true;}
+     // Liverpool invokes this before stopping its command thread; Presenter sees an empty state.
+     s->gpu.SendCommand<true>([]{Cancel();});s->scheduler.Finish();
+--- a/src/core/libraries/videoout/video_out.cpp
++++ b/src/core/libraries/videoout/video_out.cpp
+@@ -365,7 +365,7 @@
+     pDeviceCapabilityInfo->capability = 0;
+     // Dreams checks VR_VIEW (bit 5) before entering its native headset path.
+     // HMD device status separately reports whether tracking is connected/valid.
+-    if (Libraries::Hmd::Host::Enabled() && Libraries::Hmd::Host::PresentationReady()) {
++    if (Libraries::Hmd::Host::Enabled()) {
+         pDeviceCapabilityInfo->capability |= 0x20;
+     }
+     if (presenter->IsHDRSupported()) {
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -383,9 +383,11 @@
+ 
+     const auto vr_extensions=Libraries::Hmd::Host::Enabled() ? Libraries::Hmd::Host::DeviceExtensions(static_cast<VkPhysicalDevice>(physical_device)) : std::vector<std::string>{};
+     for(const auto& extension:vr_extensions) {
+-        if(std::none_of(enabled_extensions.begin(),enabled_extensions.end(),[&](const char* name){return extension==name;}) && !add_extension(extension))
+-            return false;
+-    }
++        if(std::none_of(enabled_extensions.begin(),enabled_extensions.end(),[&](const char* name){return extension==name;}))
++            add_extension(extension);
++    }
++    if (Libraries::Hmd::Host::Enabled())
++        Libraries::Hmd::Host::RememberVulkanExtensions(true, enabled_extensions.data(), enabled_extensions.size());
+     const auto family_properties = physical_device.getQueueFamilyProperties();
+     if (family_properties.empty()) {
+         LOG_CRITICAL(Render_Vulkan, "Physical device reported no queues.");
+--- a/src/video_core/renderer_vulkan/vk_platform.cpp
++++ b/src/video_core/renderer_vulkan/vk_platform.cpp
+@@ -205,6 +205,12 @@
+         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+     }
+ 
++    // Vulkan extensions are chosen before the player may put the headset on.
++    static const auto vr_extensions = Libraries::Hmd::Host::InstanceExtensions();
++    if (Libraries::Hmd::Host::Enabled()) {
++        for (const auto& name : vr_extensions) extensions.push_back(name.c_str());
++    }
++
+     // Sanitize extension list
+     std::erase_if(extensions, [&](const char* extension) -> bool {
+         const auto it =
+@@ -288,11 +294,8 @@
+ 
+     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
+     auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+-    const auto vr_extensions=Libraries::Hmd::Host::Enabled() ? Libraries::Hmd::Host::InstanceExtensions() : std::vector<std::string>{};
+-    for(const auto& extension:vr_extensions) {
+-        if(std::none_of(extensions.begin(),extensions.end(),[&](const char* name){return extension==name;}))
+-            extensions.push_back(extension.c_str());
+-    }
++    if (Libraries::Hmd::Host::Enabled())
++        Libraries::Hmd::Host::RememberVulkanExtensions(false, extensions.data(), extensions.size());
+ 
+     const vk::ApplicationInfo application_info = {
+         .pApplicationName = "shadPS4",
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -7965,7 +7965,7 @@
+         }
+     }
+     const auto state = BeginRendering(pipeline);
+-    if (Libraries::Hmd::Host::Enabled()) {
++    if (Libraries::Hmd::Host::PresentationReady()) {
+         for (const auto* stage : pipeline->GetStages()) {
+             if (stage && stage->pgm_hash == 0x20674f06) {
+                 GetDreamsStereoDepth().SawMaterialDecode();
+@@ -11343,7 +11343,7 @@
+         }
+     }
+     auto state = BeginRendering(pipeline);
+-    if (Libraries::Hmd::Host::Enabled() && cb_descs[0].first && db_desc.first) {
++    if (Libraries::Hmd::Host::PresentationReady() && cb_descs[0].first && db_desc.first) {
+         for (const auto* stage : pipeline->GetStages()) {
+             if (stage && stage->pgm_hash == 0x2b6d3647) {
+                 GetDreamsStereoDepth().BeforeVisibilityDraw(stage->pgm_hash, regs,
+@@ -21438,13 +21438,13 @@
+         }
+         cmdbuf.dispatch(dispatch_x, cs_program.dim_y, cs_program.dim_z);
+     }
+-    if (Libraries::Hmd::Host::Enabled()) DreamsVrStencil::AfterDispatch(instance, scheduler, cs,
++    if (Libraries::Hmd::Host::PresentationReady()) DreamsVrStencil::AfterDispatch(instance, scheduler, cs,
+         {cs_program.num_thread_x.full, cs_program.num_thread_y.full, cs_program.num_thread_z.full},
+         {dispatch_x, cs_program.dim_y, cs_program.dim_z}, dispatch_base_x, buffer_infos, &cs_program);
+     if (cs.pgm_hash == 0x2fa79a88) {
+         vr_occupancy = {};
+         if (VideoCore::DreamsOcclusionClear::Matches(cs) && dispatch_base_x == 0 &&
+-            Common::ElfInfo::Instance().GameSerial() == "CUSA04301" && Libraries::Hmd::Host::Enabled()) {
++            Common::ElfInfo::Instance().GameSerial() == "CUSA04301" && Libraries::Hmd::Host::PresentationReady()) {
+             const auto sharp = cs.buffers[0].GetSharp(cs);
+             if (VideoCore::DreamsVrOcclusion::IsPartialClear(sharp,
+                     {cs_program.num_thread_x.full, cs_program.num_thread_y.full, cs_program.num_thread_z.full},
+@@ -30408,7 +30408,7 @@
+     // slice used to decide the load operation. Retire those pending clears so
+     // later per-slice fast-clear elimination cannot erase freshly drawn views.
+     // The existing metadata mask represents only slices 0..31.
+-    if (state.num_layers > 1 && Libraries::Hmd::Host::Enabled()) {
++    if (state.num_layers > 1 && Libraries::Hmd::Host::PresentationReady()) {
+         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+             if (!state.color_attachments[cb].is_clear) {
+                 continue;
